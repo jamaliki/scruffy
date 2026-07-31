@@ -1,0 +1,362 @@
+from __future__ import annotations
+
+import multiprocessing
+import os
+import signal
+import sys
+import tempfile
+import time
+import traceback
+import unittest
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from scruffy.client import cancel_job, drain_queue, status, submit_job, wait_for_job
+from scruffy.controller import run_controller
+from scruffy.models import NodeInventory, ResourceRequest
+from scruffy.storage import read_events
+
+
+TIMEOUT = 12.0
+REQUEST = ResourceRequest(
+    nodes=1,
+    gpus_per_node=1,
+    cpus_per_node=1,
+    memory_gb_per_node=1,
+)
+
+
+def _controller_worker(
+    root_dir: str,
+    inventory_documents: list[dict[str, object]],
+    cancel_grace: float,
+) -> None:
+    try:
+        run_controller(
+            root=Path(root_dir),
+            inventory=tuple(
+                NodeInventory.from_dict(document) for document in inventory_documents
+            ),
+            launcher="local",
+            allocation_id="test-allocation",
+            poll_interval=0.01,
+            cancel_grace=cancel_grace,
+        )
+    except Exception:  # pragma: no cover - reported through the process exit
+        traceback.print_exc()
+        raise
+
+
+class ControllerIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace = Path(temporary.name)
+        self.root = self.workspace / "queue"
+        self.controller: multiprocessing.Process | None = None
+
+    def _start_controller(
+        self, gpu_ids: tuple[int, ...], *, cancel_grace: float = 0.2
+    ) -> None:
+        inventory = [
+            {
+                "name": "local-node",
+                "gpu_ids": list(gpu_ids),
+                "cpus": 8,
+                "memory_gb": 32,
+            }
+        ]
+        context = multiprocessing.get_context("spawn")
+        self.controller = context.Process(
+            target=_controller_worker,
+            args=(str(self.root), inventory, cancel_grace),
+        )
+        self.controller.start()
+        self.addCleanup(self._stop_controller)
+        self._wait_until(
+            lambda: (
+                snapshot
+                if (snapshot := status(self.root)).get("allocation")
+                and snapshot["allocation"]["state"] == "running"
+                else None
+            ),
+            "controller startup",
+        )
+
+    def _stop_controller(self) -> None:
+        process, self.controller = self.controller, None
+        if process is None:
+            return
+        if process.is_alive():
+            os.kill(process.pid, signal.SIGTERM)
+            process.join(TIMEOUT)
+        if process.is_alive():
+            process.kill()
+            process.join()
+            self.fail("controller did not stop")
+        self.assertEqual(0, process.exitcode, "controller exited unexpectedly")
+
+    def _wait_until(self, predicate: Callable[[], Any], description: str) -> Any:
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            process = self.controller
+            if process is not None and not process.is_alive():
+                self.fail(f"controller exited while waiting for {description}")
+            try:
+                result = predicate()
+            except (FileNotFoundError, KeyError):
+                result = None
+            if result:
+                return result
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for {description}")
+
+    def _wait_for_state(self, job_id: str, *states: str) -> dict[str, Any]:
+        def matching_job() -> dict[str, Any] | None:
+            try:
+                job = status(self.root, job_id)
+            except KeyError:
+                return None
+            return job if job["state"] in states else None
+
+        return self._wait_until(matching_job, f"{job_id} to enter {states}")
+
+    def _submit(
+        self,
+        name: str,
+        code: str,
+        *,
+        environment: dict[str, str] | None = None,
+    ) -> str:
+        response = submit_job(
+            self.root,
+            argv=[sys.executable, "-c", code],
+            name=name,
+            cwd=self.workspace,
+            environment=environment or {},
+            request=REQUEST,
+            request_id=f"test/{name}",
+        )
+        self.assertEqual("submitted", response["state"])
+        self.assertFalse(response["deduplicated"])
+        return str(response["job_id"])
+
+    def test_async_success_and_failure_emit_output_before_terminal(self) -> None:
+        self._start_controller((0, 1))
+        succeeded_id = self._submit(
+            "succeeds",
+            "import sys; print('success-out', flush=True); "
+            "print('success-err', file=sys.stderr, flush=True)",
+        )
+        failed_id = self._submit(
+            "fails",
+            "import sys; print('failure-out', flush=True); "
+            "print('failure-err', file=sys.stderr, flush=True); raise SystemExit(7)",
+        )
+
+        succeeded = wait_for_job(self.root, succeeded_id, timeout=TIMEOUT)
+        failed = wait_for_job(self.root, failed_id, timeout=TIMEOUT)
+
+        self.assertEqual(("succeeded", 0), (succeeded["state"], succeeded["exit_code"]))
+        self.assertEqual(("failed", 7), (failed["state"], failed["exit_code"]))
+        self.assertIn("success-out", (self.root / succeeded["stdout"]).read_text())
+        self.assertIn("failure-err", (self.root / failed["stderr"]).read_text())
+
+        events = read_events(self.root)
+        for job_id, terminal_kind in (
+            (succeeded_id, "job.succeeded"),
+            (failed_id, "job.failed"),
+        ):
+            job_events = [event for event in events if event.get("job_id") == job_id]
+            output_events = [
+                event for event in job_events if event["kind"] == "job.output"
+            ]
+            terminal = [event for event in job_events if event["kind"] == terminal_kind]
+            self.assertEqual({"stdout", "stderr"}, {e["data"]["stream"] for e in output_events})
+            self.assertEqual(1, len(terminal))
+            self.assertTrue(all(e["seq"] < terminal[0]["seq"] for e in output_events))
+
+    def test_queued_and_running_cancellation_release_resources(self) -> None:
+        self._start_controller((0,), cancel_grace=0.5)
+        ready_file = self.workspace / "holder-ready"
+        holder_id = self._submit(
+            "holder",
+            "import os, signal; from pathlib import Path; "
+            "signal.signal(signal.SIGTERM, lambda *_: None); "
+            "Path(os.environ['READY_FILE']).write_text('ready'); "
+            "exec('while True:\\n signal.pause()')",
+            environment={"READY_FILE": str(ready_file)},
+        )
+        self._wait_for_state(holder_id, "running")
+        self._wait_until(ready_file.exists, "holder signal handler")
+
+        queued_id = self._submit("queued-cancel", "print('must not run')")
+        self._wait_for_state(queued_id, "queued")
+        queued_cancel = cancel_job(self.root, queued_id)
+        queued = self._wait_for_state(queued_id, "cancelled")
+        self.assertEqual("cancelled_before_start", queued["reason"])
+        self.assertNotIn(
+            "job.starting",
+            {
+                event["kind"]
+                for event in read_events(self.root)
+                if event.get("job_id") == queued_id
+            },
+        )
+
+        running_cancel = cancel_job(self.root, holder_id)
+        cancelling = self._wait_for_state(holder_id, "cancelling")
+        self.assertIsNotNone(cancelling["assignment"])
+        successor_id = self._submit("successor", "print('after cancel')")
+        self._wait_for_state(successor_id, "queued")
+        occupied = status(self.root)["nodes"]["local-node"]
+        self.assertEqual([holder_id], list(occupied["assignments"]))
+        self.assertEqual([], occupied["free"]["gpu_ids"])
+
+        cancelled = wait_for_job(self.root, holder_id, timeout=TIMEOUT)
+        successor = wait_for_job(self.root, successor_id, timeout=TIMEOUT)
+        self.assertEqual("cancelled", cancelled["state"])
+        self.assertEqual("succeeded", successor["state"])
+        free = status(self.root)["nodes"]["local-node"]
+        self.assertEqual({}, free["assignments"])
+        self.assertEqual([0], free["free"]["gpu_ids"])
+        events = read_events(self.root)
+        self.assertTrue(
+            any(
+                event["kind"] == "job.cancelled"
+                and event.get("data", {}).get("request_id")
+                == queued_cancel["request_id"]
+                for event in events
+            )
+        )
+        self.assertTrue(
+            any(
+                event["kind"] == "job.cancelling"
+                and event.get("data", {}).get("request_id")
+                == running_cancel["request_id"]
+                for event in events
+            )
+        )
+
+    def test_two_running_jobs_receive_disjoint_gpu_ids(self) -> None:
+        self._start_controller((0, 1))
+        release_file = self.workspace / "release"
+        ready_files = [self.workspace / "ready-a", self.workspace / "ready-b"]
+        code = (
+            "import os, time; from pathlib import Path; "
+            "Path(os.environ['READY_FILE']).write_text(os.environ['CUDA_VISIBLE_DEVICES']); "
+            "release = Path(os.environ['RELEASE_FILE']); "
+            "exec(\"while not release.exists():\\n time.sleep(0.01)\")"
+        )
+        job_ids = [
+            self._submit(
+                f"parallel-{index}",
+                code,
+                environment={
+                    "READY_FILE": str(ready_file),
+                    "RELEASE_FILE": str(release_file),
+                },
+            )
+            for index, ready_file in enumerate(ready_files)
+        ]
+
+        for job_id in job_ids:
+            self._wait_for_state(job_id, "running")
+        self._wait_until(
+            lambda: all(ready_file.exists() for ready_file in ready_files),
+            "both local workers",
+        )
+        jobs = status(self.root)["jobs"]
+        gpu_ids = [
+            jobs[job_id]["assignment"]["reservations"][0]["gpu_ids"][0]
+            for job_id in job_ids
+        ]
+        self.assertEqual({0, 1}, set(gpu_ids))
+        self.assertEqual(
+            {str(gpu_id) for gpu_id in gpu_ids},
+            {ready_file.read_text() for ready_file in ready_files},
+        )
+        node = status(self.root)["nodes"]["local-node"]
+        self.assertEqual(set(job_ids), set(node["assignments"]))
+
+        release_file.write_text("go")
+        for job_id in job_ids:
+            self.assertEqual(
+                "succeeded", wait_for_job(self.root, job_id, timeout=TIMEOUT)["state"]
+            )
+        self.assertEqual([0, 1], status(self.root)["nodes"]["local-node"]["free"]["gpu_ids"])
+
+    def test_cancel_commands_always_receive_an_observable_outcome(self) -> None:
+        self._start_controller((0,))
+        job_id = self._submit("already-done", "print('done')")
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, job_id, timeout=TIMEOUT)["state"]
+        )
+
+        terminal = cancel_job(self.root, job_id)
+        unknown = cancel_job(self.root, "missing-job")
+
+        def outcomes() -> tuple[dict[str, Any], dict[str, Any]] | None:
+            events = read_events(self.root)
+            ignored = next(
+                (
+                    event
+                    for event in events
+                    if event["kind"] == "job.cancel_ignored"
+                    and event["data"]["request_id"] == terminal["request_id"]
+                ),
+                None,
+            )
+            rejected = next(
+                (
+                    event
+                    for event in events
+                    if event["kind"] == "command.rejected"
+                    and event["data"]["request_id"] == unknown["request_id"]
+                ),
+                None,
+            )
+            return (ignored, rejected) if ignored and rejected else None
+
+        ignored, rejected = self._wait_until(outcomes, "cancel acknowledgements")
+        self.assertEqual("job_is_succeeded", ignored["data"]["reason"])
+        self.assertEqual("unknown_job", rejected["data"]["reason"])
+        self.assertEqual("succeeded", status(self.root, job_id)["state"])
+
+    def test_drain_commands_are_correlated_and_idempotent(self) -> None:
+        self._start_controller((0,))
+        first = drain_queue(self.root)
+        second = drain_queue(self.root)
+
+        def outcomes() -> tuple[dict[str, Any], dict[str, Any]] | None:
+            events = read_events(self.root)
+            accepted = next(
+                (
+                    event
+                    for event in events
+                    if event["kind"] == "allocation.draining"
+                ),
+                None,
+            )
+            ignored = next(
+                (
+                    event
+                    for event in events
+                    if event["kind"] == "allocation.drain_ignored"
+                ),
+                None,
+            )
+            return (accepted, ignored) if accepted and ignored else None
+
+        accepted, ignored = self._wait_until(outcomes, "drain acknowledgements")
+        self.assertEqual(
+            {first["request_id"], second["request_id"]},
+            {accepted["data"]["request_id"], ignored["data"]["request_id"]},
+        )
+        self.assertEqual("already_draining", ignored["data"]["reason"])
+        self.assertTrue(status(self.root)["draining"])
+
+
+if __name__ == "__main__":
+    unittest.main()

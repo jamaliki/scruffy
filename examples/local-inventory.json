@@ -1,0 +1,9 @@
+{
+  "nodes": {
+    "local": {
+      "gpu_ids": [0, 1],
+      "cpus": 8,
+      "memory_gb": 32
+    }
+  }
+}
