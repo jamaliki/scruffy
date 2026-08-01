@@ -71,6 +71,20 @@ class ModelTests(unittest.TestCase):
                 with self.assertRaises(ModelError):
                     ResourceRequest(value, 1, 1, 1)  # type: ignore[arg-type]
 
+    def test_resource_request_allows_only_gpu_count_to_be_zero(self) -> None:
+        request = ResourceRequest(1, 0, 1, 1)
+
+        self.assertEqual(ResourceRequest.from_dict(request.to_dict()), request)
+        for field_values in ((0, 0, 1, 1), (1, 0, 0, 1), (1, 0, 1, 0)):
+            with self.subTest(field_values=field_values):
+                with self.assertRaises(ModelError):
+                    ResourceRequest(*field_values)
+
+        for invalid_gpu_count in (-1, True, 1.0, "0"):
+            with self.subTest(invalid_gpu_count=invalid_gpu_count):
+                with self.assertRaises(ModelError):
+                    ResourceRequest(1, invalid_gpu_count, 1, 1)  # type: ignore[arg-type]
+
     def test_gpu_ids_must_be_unique_nonnegative_integers(self) -> None:
         invalid_gpu_ids = ((), (0, 0), (-1,), (True,), ("0",))
 

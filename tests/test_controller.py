@@ -128,6 +128,7 @@ class ControllerIntegrationTests(unittest.TestCase):
         code: str,
         *,
         environment: dict[str, str] | None = None,
+        request: ResourceRequest = REQUEST,
     ) -> str:
         response = submit_job(
             self.root,
@@ -135,7 +136,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             name=name,
             cwd=self.workspace,
             environment=environment or {},
-            request=REQUEST,
+            request=request,
             request_id=f"test/{name}",
         )
         self.assertEqual("submitted", response["state"])
@@ -286,6 +287,34 @@ class ControllerIntegrationTests(unittest.TestCase):
                 "succeeded", wait_for_job(self.root, job_id, timeout=TIMEOUT)["state"]
             )
         self.assertEqual([0, 1], status(self.root)["nodes"]["local-node"]["free"]["gpu_ids"])
+
+    def test_cpu_only_job_status_and_events_preserve_empty_gpu_reservation(self) -> None:
+        self._start_controller((0,))
+        job_id = self._submit(
+            "cpu-only",
+            "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])",
+            environment={"CUDA_VISIBLE_DEVICES": "0"},
+            request=ResourceRequest(1, 0, 2, 4),
+        )
+
+        completed = wait_for_job(self.root, job_id, timeout=TIMEOUT)
+
+        self.assertEqual("succeeded", completed["state"])
+        reservation = completed["last_assignment"]["reservations"][0]
+        self.assertEqual([], reservation["gpu_ids"])
+        self.assertEqual((2, 4), (reservation["cpus"], reservation["memory_gb"]))
+        self.assertEqual("\n", (self.root / completed["stdout"]).read_text())
+        node = status(self.root)["nodes"]["local-node"]
+        self.assertEqual([0], node["free"]["gpu_ids"])
+        starting = next(
+            event
+            for event in read_events(self.root)
+            if event.get("job_id") == job_id and event["kind"] == "job.starting"
+        )
+        self.assertEqual(
+            [],
+            starting["job"]["assignment"]["reservations"][0]["gpu_ids"],
+        )
 
     def test_cancel_commands_always_receive_an_observable_outcome(self) -> None:
         self._start_controller((0,))

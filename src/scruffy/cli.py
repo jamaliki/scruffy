@@ -105,14 +105,17 @@ def _serve(arguments: argparse.Namespace) -> int:
 def _submit(arguments: argparse.Namespace) -> int:
     command = _command(arguments)
     gpus = arguments.gpus_per_node
+    default_units = max(1, gpus)
     request = ResourceRequest(
         nodes=arguments.nodes,
         gpus_per_node=gpus,
         cpus_per_node=(
-            14 * gpus if arguments.cpus_per_node is None else arguments.cpus_per_node
+            14 * default_units
+            if arguments.cpus_per_node is None
+            else arguments.cpus_per_node
         ),
         memory_gb_per_node=(
-            128 * gpus
+            128 * default_units
             if arguments.memory_gb_per_node is None
             else arguments.memory_gb_per_node
         ),

@@ -50,6 +50,7 @@ def _launch_arguments(
                 name=job["launch_token"],
                 assignment_file=assignment_file,
                 node_names=[item.node for item in assignment.reservations],
+                gpus_per_node=assignment.request.gpus_per_node,
                 cpus_per_node=assignment.request.cpus_per_node,
                 memory_gb_per_node=assignment.request.memory_gb_per_node,
             ),

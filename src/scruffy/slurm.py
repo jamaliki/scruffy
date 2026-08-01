@@ -82,6 +82,7 @@ def build_srun_argv(
     name: str,
     assignment_file: Path,
     node_names: list[str],
+    gpus_per_node: int,
     cpus_per_node: int,
     memory_gb_per_node: int,
     wait_seconds: int = 0,
@@ -96,7 +97,7 @@ def build_srun_argv(
     if not slurm_job_id:
         raise ValueError("a Slurm job ID is required for the Slurm launcher")
     nodes = len(node_names)
-    return [
+    argv = [
         "srun",
         f"--jobid={slurm_job_id}",
         f"--job-name={name}",
@@ -112,11 +113,22 @@ def build_srun_argv(
         f"--wait={wait_seconds}",
         "--wait-for-children",
         "--label",
-        sys.executable,
-        "-m",
-        "scruffy.worker",
-        str(assignment_file),
     ]
+    # A Slurm step inherits every GRES in the outer allocation by default.
+    # CPU-only work must opt out so that Slurm does not attach any GPU devices
+    # to the step. GPU jobs continue to use Scruffy's persisted per-node GPU-ID
+    # ledger, which may not match device IDs independently selected by Slurm.
+    if gpus_per_node == 0:
+        argv.append("--gres=none")
+    argv.extend(
+        [
+            sys.executable,
+            "-m",
+            "scruffy.worker",
+            str(assignment_file),
+        ]
+    )
+    return argv
 
 
 def live_steps(slurm_job_id: str) -> tuple[SlurmStep, ...]:

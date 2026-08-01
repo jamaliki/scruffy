@@ -77,6 +77,24 @@ class SubmitCliTests(unittest.TestCase):
         self.assertIn("submit requires a command", stderr.getvalue())
         submit.assert_not_called()
 
+    def test_cpu_only_submit_keeps_positive_cpu_and_memory_defaults(self) -> None:
+        with mock.patch("scruffy.cli.submit_job", return_value={}) as submit:
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "submit",
+                    "--gpus-per-node",
+                    "0",
+                    "--",
+                    "true",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        request = submit.call_args.kwargs["request"]
+        self.assertEqual(ResourceRequest(1, 0, 14, 128), request)
+
     def test_submit_rejects_malformed_environment_override(self) -> None:
         stderr = io.StringIO()
         with (

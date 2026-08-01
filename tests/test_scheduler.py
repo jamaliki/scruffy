@@ -61,6 +61,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(assignment.reservations[0].node, "gpu-b")
         self.assertEqual(assignment.reservations[0].gpu_ids, (0,))
 
+    def test_cpu_only_job_reserves_cpu_and_memory_but_no_gpu(self) -> None:
+        job = QueuedJob("cpu-only", request(gpus=0, cpus=20, memory_gb=64))
+
+        assignment = choose_assignment(self.inventory, (), job)
+
+        self.assertIsNotNone(assignment)
+        assert assignment is not None
+        reservation = assignment.reservations[0]
+        self.assertEqual((), reservation.gpu_ids)
+        free = {node.name: node for node in available_resources(self.inventory, (assignment,))}
+        self.assertEqual(self.inventory[1].gpu_ids, free["gpu-b"].gpu_ids)
+        self.assertEqual(36, free["gpu-b"].cpus)
+        self.assertEqual(448, free["gpu-b"].memory_gb)
+
+    def test_cpu_only_and_gpu_jobs_can_share_a_node_within_cpu_memory_budgets(self) -> None:
+        cpu_assignment = choose_assignment(
+            self.inventory,
+            (),
+            QueuedJob("cpu-only", request(gpus=0, cpus=20, memory_gb=64)),
+        )
+        assert cpu_assignment is not None
+
+        gpu_assignment = choose_assignment(
+            self.inventory,
+            (cpu_assignment,),
+            QueuedJob("gpu", request(gpus=4, cpus=20, memory_gb=64)),
+        )
+
+        self.assertIsNotNone(gpu_assignment)
+        assert gpu_assignment is not None
+        self.assertEqual("gpu-b", gpu_assignment.reservations[0].node)
+        self.assertEqual((0, 1, 2, 3), gpu_assignment.reservations[0].gpu_ids)
+
     def test_multi_node_placement_is_atomic(self) -> None:
         active = (
             self.assignment_for(

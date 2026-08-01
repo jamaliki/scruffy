@@ -100,6 +100,23 @@ for the controller, free GPUs, earlier jobs, or job startup. Concurrent callers
 are safe. Retrying the same request ID and specification returns the original
 job ID; changing the specification produces a conflict.
 
+CPU-only stages use the same queue with an explicit zero GPU count. They still
+reserve positive CPU and memory budgets, receive an empty
+`CUDA_VISIBLE_DEVICES`, and launch under Slurm with `--gres=none` so the step
+does not inherit the outer allocation's GPUs:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" submit \
+  --name preprocess \
+  --gpus-per-node 0 \
+  --cpus-per-node 14 \
+  --memory-gb-per-node 128 \
+  -- python -m my_project.preprocess
+```
+
+When CPU or memory is omitted, submission defaults remain 14 CPUs and 128 GiB
+for a zero-GPU request. The default GPU count remains one.
+
 The same operations are small Python functions for agent integrations:
 
 ```python

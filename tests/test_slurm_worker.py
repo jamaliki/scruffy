@@ -21,6 +21,7 @@ class SlurmArgumentTests(unittest.TestCase):
             name="scruffy-launch-token",
             assignment_file=assignment_file,
             node_names=["gpu-3", "gpu-5"],
+            gpus_per_node=2,
             cpus_per_node=28,
             memory_gb_per_node=256,
             wait_seconds=45,
@@ -58,6 +59,7 @@ class SlurmArgumentTests(unittest.TestCase):
                 name="scruffy-launch-token",
                 assignment_file=Path("assignment.json"),
                 node_names=["gpu-3"],
+                gpus_per_node=1,
                 cpus_per_node=1,
                 memory_gb_per_node=1,
             )
@@ -68,12 +70,39 @@ class SlurmArgumentTests(unittest.TestCase):
             name="scruffy-token",
             assignment_file=Path("assignment.json"),
             node_names=["gpu-3"],
+            gpus_per_node=1,
             cpus_per_node=1,
             memory_gb_per_node=1,
         )
 
         self.assertIn("--wait=0", argv)
         self.assertIn("--wait-for-children", argv)
+
+    def test_cpu_only_srun_step_explicitly_requests_no_gres(self) -> None:
+        argv = build_srun_argv(
+            slurm_job_id="240292",
+            name="scruffy-token",
+            assignment_file=Path("assignment.json"),
+            node_names=["gpu-3"],
+            gpus_per_node=0,
+            cpus_per_node=8,
+            memory_gb_per_node=32,
+        )
+
+        self.assertIn("--gres=none", argv)
+
+    def test_gpu_srun_step_leaves_device_selection_to_scruffy(self) -> None:
+        argv = build_srun_argv(
+            slurm_job_id="240292",
+            name="scruffy-token",
+            assignment_file=Path("assignment.json"),
+            node_names=["gpu-3"],
+            gpus_per_node=2,
+            cpus_per_node=8,
+            memory_gb_per_node=32,
+        )
+
+        self.assertFalse(any(argument.startswith("--gres=") for argument in argv))
 
 
 class InventoryTests(unittest.TestCase):
@@ -245,6 +274,28 @@ class WorkerPlacementTests(unittest.TestCase):
         self.assertEqual("gpu-5.cluster", environment["SCRUFFY_NODE"])
         self.assertEqual("PCI_BUS_ID", environment["CUDA_DEVICE_ORDER"])
         self.assertEqual("4,6", environment["CUDA_VISIBLE_DEVICES"])
+
+    def test_cpu_only_worker_hides_all_cuda_devices(self) -> None:
+        document = {
+            "job_id": "job-cpu",
+            "argv": ["python", "stage.py"],
+            "cwd": "/work/job-cpu",
+            "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3"},
+            "assignment": [{"node": "gpu-3.cluster", "gpu_ids": []}],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "assignment.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("scruffy.worker.current_node", return_value="gpu-3.cluster"),
+                mock.patch("scruffy.worker.os.chdir"),
+                mock.patch("scruffy.worker.os.execvpe") as execvpe,
+            ):
+                execute_assignment(source)
+
+        environment = execvpe.call_args.args[2]
+        self.assertEqual("", environment["CUDA_VISIBLE_DEVICES"])
 
 
 if __name__ == "__main__":
