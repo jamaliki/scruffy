@@ -8,11 +8,71 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy.slurm import build_srun_argv, cancel_step, live_steps, load_inventory
+from scruffy.slurm import (
+    build_srun_argv,
+    cancel_step,
+    child_srun_environment,
+    live_steps,
+    load_inventory,
+)
 from scruffy.worker import execute_assignment, find_node_assignment
 
 
 class SlurmArgumentTests(unittest.TestCase):
+    def test_child_srun_environment_drops_step_and_task_context(self) -> None:
+        source = {
+            "PATH": "/usr/bin",
+            "SLURM_JOB_ID": "240292",
+            "SLURM_JOB_NODELIST": "gpu-[3,5]",
+            "SLURM_JOB_CPUS_PER_NODE": "112(x2)",
+            "SLURM_CLUSTER_NAME": "tokyo",
+            "SLURM_SUBMIT_DIR": "/shared/run",
+            "SLURM_CPUS_PER_TASK": "1",
+            "SLURM_CPUS_PER_GPU": "4",
+            "SLURM_CPUS_ON_NODE": "1",
+            "SLURM_GPUS": "1",
+            "SLURM_GPUS_PER_TASK": "1",
+            "SLURM_MEM_PER_CPU": "1024",
+            "SLURM_MEM_PER_GPU": "128G",
+            "SLURM_MEM_PER_NODE": "4G",
+            "SLURM_STEP_ID": "3",
+            "SLURM_STEP_NODELIST": "gpu-3",
+            "SLURM_STEP_NUM_TASKS": "1",
+            "SLURM_STEPID": "3",
+            "SLURM_PROCID": "0",
+            "SLURM_LOCALID": "0",
+            "SLURM_NODEID": "0",
+            "SLURM_NTASKS": "1",
+            "SLURM_NTASKS_PER_NODE": "1",
+            "SLURM_NPROCS": "1",
+            "SLURM_TASKS_PER_NODE": "1",
+            "SLURM_THREADS_PER_CORE": "1",
+            "SLURM_CPU_BIND": "verbose,mask_cpu:0x1",
+            "SLURM_CPU_BIND_TYPE": "mask_cpu",
+            "SLURM_MEM_BIND": "local",
+            "SLURM_GPU_BIND": "closest",
+            "SLURM_TRES_BIND": "gres/gpu:per_task:1",
+            "SLURM_TRES_PER_TASK": "cpu=1",
+            "SLURM_TRES_FREQ": "gpu=high",
+            "SLURM_DISTRIBUTION": "block",
+            "SLURM_GTIDS": "0",
+            "SLURM_SRUN_COMM_HOST": "10.0.0.1",
+        }
+
+        environment = child_srun_environment(source)
+
+        self.assertEqual(
+            {
+                "PATH": "/usr/bin",
+                "SLURM_JOB_ID": "240292",
+                "SLURM_JOB_NODELIST": "gpu-[3,5]",
+                "SLURM_JOB_CPUS_PER_NODE": "112(x2)",
+                "SLURM_CLUSTER_NAME": "tokyo",
+                "SLURM_SUBMIT_DIR": "/shared/run",
+            },
+            environment,
+        )
+
     def test_multi_node_srun_argv_is_exact(self) -> None:
         assignment_file = Path("/shared/scruffy/jobs/job-1/assignment.json")
 

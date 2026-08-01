@@ -9,9 +9,64 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .models import NodeInventory, validate_inventory
+
+
+_STEP_ENVIRONMENT_KEYS = frozenset(
+    {
+        "SLURM_CPUS_ON_NODE",
+        "SLURM_CPUS_PER_GPU",
+        "SLURM_CPUS_PER_TASK",
+        "SLURM_DISTRIBUTION",
+        "SLURM_GPUS",
+        "SLURM_GPU_BIND",
+        "SLURM_GTIDS",
+        "SLURM_LOCALID",
+        "SLURM_MEM_PER_CPU",
+        "SLURM_MEM_PER_GPU",
+        "SLURM_MEM_PER_NODE",
+        "SLURM_NODEID",
+        "SLURM_NPROCS",
+        "SLURM_PROCID",
+        "SLURM_STEPID",  # Legacy spelling of SLURM_STEP_ID.
+        "SLURM_TASKS_PER_NODE",
+        "SLURM_THREADS_PER_CORE",
+        "SLURM_TRES_BIND",
+        "SLURM_TRES_FREQ",
+        "SLURM_TRES_PER_TASK",
+    }
+)
+_STEP_ENVIRONMENT_PREFIXES = (
+    "SLURM_CPU_BIND",
+    "SLURM_GPUS_PER_",
+    "SLURM_MEM_BIND",
+    "SLURM_NTASKS",
+    "SLURM_SRUN_COMM_",
+    "SLURM_STEP_",
+)
+
+
+def child_srun_environment(
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return an allocation-level environment safe for a nested ``srun``.
+
+    The controller itself may run as a small Slurm step. Slurm exposes that
+    step's CPU, memory, rank, binding, and task shape as environment variables,
+    and a child ``srun`` interprets several of them as request defaults. Keep
+    allocation identity such as ``SLURM_JOB_ID`` and ``SLURM_JOB_NODELIST``, but
+    never let the controller step constrain a job launched by Scruffy.
+    """
+
+    environment = dict(os.environ if source is None else source)
+    for key in tuple(environment):
+        if key in _STEP_ENVIRONMENT_KEYS or key.startswith(
+            _STEP_ENVIRONMENT_PREFIXES
+        ):
+            del environment[key]
+    return environment
 
 
 @dataclass(frozen=True, slots=True)

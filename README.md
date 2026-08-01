@@ -100,6 +100,11 @@ for the controller, free GPUs, earlier jobs, or job startup. Concurrent callers
 are safe. Retrying the same request ID and specification returns the original
 job ID; changing the specification produces a conflict.
 
+The controller may itself run inside an `srun` step. Child job steps retain the
+outer allocation identity but Scruffy removes the controller step's CPU,
+memory, binding, task-count, and rank variables before launching them, so those
+values cannot silently override a submitted resource request.
+
 CPU-only stages use the same queue with an explicit zero GPU count. They still
 reserve positive CPU and memory budgets, receive an empty
 `CUDA_VISIBLE_DEVICES`, and launch under Slurm with `--gres=none` so the step
