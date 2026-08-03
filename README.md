@@ -17,7 +17,9 @@ GPU processes against its configured inventory.
 
 - Python 3.11 or newer, with no Python package dependencies.
 - A POSIX shared filesystem visible at the same absolute `SCRUFFY_ROOT` on every
-  client and compute node. Scruffy relies on atomic rename and `flock`.
+  client and compute node. Atomic rename and cluster-coherent `flock` are hard
+  requirements. On Lustre, verify that distributed `flock` is enabled;
+  `localflock` is insufficient. Scruffy cannot detect silently local-only locks.
 - Slurm mode requires `srun`, `scancel`, and `scontrol --json` on the controller.
 - Submitted working directories, executables, and referenced files must exist on
   every selected worker node.
@@ -151,9 +153,12 @@ scruffy --root "$SCRUFFY_ROOT" submit \
 
 `succeeded` requires a successful upstream result. `terminal` accepts any
 terminal result. Missing or unfinished dependencies leave a job `blocked`; an
-unsatisfied `succeeded` edge makes it terminal `skipped`. Duplicate task IDs,
-self-dependencies, and cycles are rejected. Use `scruffy explain JOB_ID` for the
-resolved dependency state.
+unsatisfied `succeeded` edge makes it terminal `skipped`. Task IDs cannot contain
+`:`, which keeps `--needs TASK[:CONDITION]` unambiguous. A succeeded task ID is
+final. A failed, cancelled, lost, rejected, or skipped task ID may be reclaimed
+by a new job with a new `request_id`; retry skipped dependants the same way.
+Active duplicate task IDs, self-dependencies, and cycles are rejected. Use
+`scruffy explain JOB_ID` for the resolved dependency state.
 
 ## Workload progress and output
 
@@ -186,6 +191,9 @@ diagnosis:
 scruffy logs JOB_ID --stream stderr --tail 200 --follow
 ```
 
+`--tail` reads at most the final 1 MiB per stream, including for newline-free or
+carriage-return progress output.
+
 ## Lifecycle and operations
 
 The snapshot is authoritative. Never infer success or failure from log text.
@@ -202,8 +210,8 @@ scruffy drain
 
 Cancellation and drain requests are asynchronous and return a `request_id` that
 appears on their journal outcome. `drain` disables new launches for the current
-controller; running jobs continue and queued jobs remain durable. Restart the
-controller to resume scheduling.
+allocation; running jobs continue and queued jobs remain durable. The drain
+survives controller restarts and clears when a replacement allocation starts.
 
 The hot snapshot keeps every nonterminal job and, after compaction, the newest
 1,000 terminal jobs. Older terminal jobs remain addressable by job ID with

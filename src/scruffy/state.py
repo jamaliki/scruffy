@@ -120,7 +120,11 @@ def apply_workload_event(
         }
         _remember_event(workload, "milestone", event)
     elif kind == "workload.artifact":
-        artifacts = list(workload.get("latest_artifacts") or [])
+        artifacts = [
+            item
+            for item in list(workload.get("latest_artifacts") or [])
+            if item.get("event_id") != event["event_id"]
+        ]
         artifacts.append(
             {
                 **data,
@@ -400,6 +404,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "archived_jobs": 0,
                 "archived_counts": {},
                 "draining": False,
+                "drain_requested": False,
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -444,6 +449,12 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
             state.setdefault("report_acks", {})[report_id] = (
                 digest if isinstance(digest, str) else None
             )
+        if event.get("kind") == "allocation.started":
+            state["draining"] = False
+            state["drain_requested"] = False
+        elif event.get("kind") == "allocation.draining":
+            state["draining"] = True
+            state["drain_requested"] = True
         state["last_seq"] = max(int(state.get("last_seq", 0)), int(event["seq"]))
     state["journal_offset"] = journal_offset
     state.setdefault("report_acks", {})
@@ -456,4 +467,5 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     )
     state.setdefault("archived_jobs", 0)
     state.setdefault("archived_counts", {})
+    state.setdefault("drain_requested", False)
     return state

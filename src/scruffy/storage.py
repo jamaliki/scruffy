@@ -24,6 +24,8 @@ from .protocol import MAX_EVENT_BYTES, validate_event
 
 LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports")
 LOCK_SHARDS = 64
+MAX_TAIL_BYTES = 1024 * 1024
+INVALID_REQUEST_DIGEST = "-"
 
 
 class StorageError(RuntimeError):
@@ -147,7 +149,10 @@ def _existing_request(root: Path, job_id: str) -> dict[str, Any] | None:
     source = root / "requests" / job_id / "spec.json"
     if not source.exists():
         return None
-    return read_json(source)
+    document = read_json(source)
+    if not isinstance(document, dict):
+        raise StorageError(f"request {job_id!r} must contain a JSON object")
+    return document
 
 
 def _key_lock(storage_root: Path, key: str) -> BinaryIO:
@@ -219,9 +224,11 @@ def submit_request(root: Path, spec: dict[str, Any]) -> tuple[str, bool]:
 
 def list_requests(
     root: Path, exclude: AbstractSet[str] = frozenset()
-) -> list[dict[str, Any]]:
+) -> list[tuple[str, dict[str, Any] | None]]:
+    """List request directories without letting one corrupt spec abort readers."""
+
     request_root = ensure_layout(root) / "requests"
-    requests: list[dict[str, Any]] = []
+    requests: list[tuple[str, dict[str, Any] | None]] = []
     for directory in sorted(request_root.iterdir()):
         if (
             directory.name in exclude
@@ -230,8 +237,13 @@ def list_requests(
         ):
             continue
         spec_file = directory / "spec.json"
-        if spec_file.exists():
-            requests.append(read_json(spec_file))
+        try:
+            document = read_json(spec_file)
+        except StorageError:
+            document = None
+        requests.append(
+            (directory.name, document if isinstance(document, dict) else None)
+        )
     return requests
 
 
@@ -239,18 +251,19 @@ def find_request(root: Path, job_id: str) -> dict[str, Any] | None:
     return _existing_request(ensure_layout(root), job_id)
 
 
-def accept_request(root: Path, job_id: str) -> bool:
-    """Replace one admitted request spec with a compact idempotency receipt."""
+def request_pending(root: Path, job_id: str) -> bool:
+    """Return whether the named request directory is still awaiting admission."""
 
+    return (ensure_layout(root) / "requests" / job_id).is_dir()
+
+
+def _finish_request(root: Path, job_id: str, digest: str | None) -> bool:
     request_root = ensure_layout(root) / "requests"
     with _key_lock(request_root, job_id) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         source = request_root / job_id
-        spec_file = source / "spec.json"
-        if not spec_file.exists():
+        if not source.is_dir():
             return False
-        spec = read_json(spec_file)
-        digest = job_identity_digest(spec)
         receipt = _request_receipt(request_root, job_id)
         existing = _read_request_receipt(request_root, job_id)
         if existing is not None and existing.get("digest") != digest:
@@ -270,13 +283,38 @@ def accept_request(root: Path, job_id: str) -> bool:
         return True
 
 
+def accept_request(
+    root: Path, job_id: str, *, identity_digest: str | None = None
+) -> bool:
+    """Replace one admitted request spec with a compact idempotency receipt."""
+
+    if identity_digest is None:
+        spec = _existing_request(ensure_layout(root), job_id)
+        if spec is None:
+            return False
+        identity_digest = job_identity_digest(spec)
+    return _finish_request(root, job_id, identity_digest)
+
+
+def reject_request(root: Path, job_id: str) -> bool:
+    """Remove an unreadable or identity-mismatched request and burn its ID."""
+
+    return _finish_request(root, job_id, INVALID_REQUEST_DIGEST)
+
+
 def accept_known_requests(root: Path, known_job_ids: AbstractSet[str]) -> int:
     """Archive legacy request specs already represented in controller state."""
 
     accepted = 0
-    for spec in list_requests(root):
-        job_id = str(spec.get("job_id", ""))
-        if job_id in known_job_ids and accept_request(root, job_id):
+    for job_id, spec in list_requests(root):
+        if job_id not in known_job_ids:
+            continue
+        accepted_request = (
+            accept_request(root, job_id)
+            if spec is not None and spec.get("job_id") == job_id
+            else reject_request(root, job_id)
+        )
+        if accepted_request:
             accepted += 1
     return accepted
 
@@ -899,6 +937,11 @@ def read_event_page(
     next_offset = offset
     more = False
     with journal.open("rb") as handle:
+        if offset:
+            handle.seek(offset - 1)
+            if handle.read(1) != b"\n":
+                offset = 0
+                next_offset = 0
         handle.seek(offset)
         while end_offset is None or handle.tell() < end_offset:
             line = handle.readline()
@@ -946,27 +989,30 @@ def read_output(root: Path, relative_name: str, offset: int, length: int) -> str
         return ""
 
 
-def tail_bytes(source: Path, lines: int = 200) -> bytes:
-    """Return the final lines without loading an unbounded log into memory."""
+def tail_window(source: Path, lines: int = 200) -> tuple[bytes, int]:
+    """Return bounded final lines and the atomically observed end offset."""
 
-    if lines <= 0 or not source.exists():
-        return b""
-    block_size = 8192
-    chunks: list[bytes] = []
-    with source.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        position = handle.tell()
-        newline_count = 0
-        while position > 0 and newline_count <= lines:
-            size = min(block_size, position)
-            position -= size
-            handle.seek(position)
-            chunk = handle.read(size)
-            chunks.append(chunk)
-            newline_count += chunk.count(b"\n")
-    return b"".join(
-        b"".join(reversed(chunks)).splitlines(keepends=True)[-lines:]
-    )
+    if lines <= 0:
+        try:
+            return b"", source.stat().st_size
+        except FileNotFoundError:
+            return b"", 0
+    try:
+        with source.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - MAX_TAIL_BYTES)
+            handle.seek(start)
+            data = handle.read(size - start)
+    except FileNotFoundError:
+        return b"", 0
+    return b"".join(data.splitlines(keepends=True)[-lines:]), size
+
+
+def tail_bytes(source: Path, lines: int = 200) -> bytes:
+    """Return final lines while reading at most one MiB from the log."""
+
+    return tail_window(source, lines)[0]
 
 
 @contextmanager

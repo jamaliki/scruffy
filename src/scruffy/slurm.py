@@ -157,7 +157,12 @@ def cancel_step(slurm_job_id: str, step_id: str) -> None:
     """Cancel exactly one numeric step, never its outer allocation."""
 
     prefix = f"{slurm_job_id}."
-    if not step_id.startswith(prefix) or not step_id.removeprefix(prefix).isdigit():
+    suffix = step_id.removeprefix(prefix)
+    if (
+        not step_id.startswith(prefix)
+        or not suffix.isascii()
+        or not suffix.isdecimal()
+    ):
         raise ValueError(f"refusing unsafe Slurm step ID {step_id!r}")
 
     subprocess.run(

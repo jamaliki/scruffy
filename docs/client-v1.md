@@ -99,6 +99,13 @@ compact archive even after detailed job state expires.
 CLI resource defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per
 GPU. Python callers provide an explicit `ResourceRequest`.
 
+Workflow task IDs cannot contain `:`. A succeeded task identity remains unique
+for the workflow. A terminal non-success attempt (`failed`, `cancelled`, `lost`,
+`rejected`, or `skipped`) may be replaced by a new job using the same
+`workflow_id` and `task_id` with a new `request_id`. Resolution and explanation
+use the newest valid attempt. Scruffy does not retry skipped dependants
+automatically; submit their next attempts explicitly.
+
 ## Observation and cursors
 
 One-shot `observe` returns:
@@ -197,8 +204,9 @@ The corresponding outcome event repeats `request_id`. Cancellation retains its
 assignment until launcher exit, output closure, and Slurm reconciliation prove
 release safe.
 
-Drain disables new launches for the lifetime of the current controller. Running
-jobs continue and queued jobs remain durable; restart the controller to resume.
+Drain disables new launches for the current allocation. Running jobs continue,
+queued jobs remain durable, and controller restarts preserve the drain. A
+replacement allocation clears it.
 
 CLI exit conventions are:
 
@@ -217,8 +225,12 @@ timed-out `wait_for_job`.
 
 Clients only create immutable requests, commands, and workload reports. The
 controller alone assigns resources and appends globally sequenced events. Queue
-contents, argv, environment overrides, output, and annotations are plaintext;
-protect filesystem access and pass secret-file paths rather than secret values.
+contents, argv, environment overrides, output, and annotations are plaintext.
+Protect filesystem access and pass secret-file paths rather than secret values.
+
+The shared filesystem must provide atomic rename and cluster-coherent `flock`
+across all nodes. Lustre `localflock` is not sufficient, and Scruffy cannot
+detect a filesystem that silently treats these locks as node-local.
 
 The controller deliberately executes submitted jobs; it does not invent
 retries, dynamically fan out workflow tasks, or store artifact bytes. Clients

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -27,7 +28,7 @@ from .controller import run_controller
 from .models import ResourceRequest, TERMINAL_JOB_STATES
 from .protocol import EVENT_KINDS
 from .slurm import discover_slurm_inventory, load_inventory
-from .storage import StorageError, tail_bytes
+from .storage import StorageError, tail_window
 
 
 def _json(value: Any) -> None:
@@ -236,30 +237,36 @@ def _logs(arguments: argparse.Namespace) -> int:
     job = status(root, arguments.job_id)
     streams = [arguments.stream] if arguments.stream else ["stdout", "stderr"]
     positions: dict[str, int] = {}
+    sources: dict[str, Path] = {}
     for stream_name in streams:
         relative_name = job.get(stream_name, f"jobs/{arguments.job_id}/{stream_name}.log")
         source = root.expanduser().resolve() / relative_name
-        data = tail_bytes(source, arguments.tail)
+        sources[stream_name] = source
+        data, positions[stream_name] = tail_window(source, arguments.tail)
         if data:
             sys.stdout.buffer.write(data)
             sys.stdout.buffer.flush()
-        positions[stream_name] = source.stat().st_size if source.exists() else 0
     if not arguments.follow:
         return 0
-    while True:
-        for stream_name in streams:
-            source = root.expanduser().resolve() / f"jobs/{arguments.job_id}/{stream_name}.log"
-            if not source.exists():
+
+    def flush_new_output() -> None:
+        for stream_name, source in sources.items():
+            try:
+                with source.open("rb") as handle:
+                    handle.seek(positions[stream_name])
+                    data = handle.read()
+            except FileNotFoundError:
                 continue
-            with source.open("rb") as handle:
-                handle.seek(positions[stream_name])
-                data = handle.read()
             positions[stream_name] += len(data)
             if data:
                 sys.stdout.buffer.write(data)
                 sys.stdout.buffer.flush()
+
+    while True:
+        flush_new_output()
         job = status(root, arguments.job_id)
         if job["state"] in TERMINAL_JOB_STATES:
+            flush_new_output()
             return 0
         time.sleep(0.2)
 
@@ -378,7 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument("--request-id", help="global idempotency key for this queue")
     submit.add_argument("--workflow-id", help="workflow namespace for this task")
-    submit.add_argument("--task-id", help="task name, unique within its workflow")
+    submit.add_argument("--task-id", help="task name without ':'")
     submit.add_argument(
         "--needs",
         action="append",
@@ -482,10 +489,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     drain = commands.add_parser(
         "drain",
-        help="disable launches until controller restart",
+        help="disable launches for the current allocation",
         description=(
-            "Disable new launches until this controller is restarted; "
-            "running jobs continue."
+            "Disable new launches until the allocation is replaced; running "
+            "jobs continue and controller restarts preserve the drain."
         ),
     )
     drain.set_defaults(handler=_drain)
@@ -501,6 +508,14 @@ def main(argv: list[str] | None = None) -> int:
         return int(arguments.handler(arguments))
     except KeyboardInterrupt:
         return 130
-    except (KeyError, StorageError, TimeoutError, ValueError) as exc:
+    except (
+        KeyError,
+        OSError,
+        StorageError,
+        subprocess.SubprocessError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as exc:
         print(f"scruffy: {exc}", file=sys.stderr)
         return 2

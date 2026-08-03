@@ -14,7 +14,6 @@ from .protocol import validate_event
 from .storage import (
     create_job_id,
     find_archived_job,
-    find_request,
     list_archived_workflow,
     list_requests,
     load_state,
@@ -134,27 +133,50 @@ def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
 
 
 def drain_queue(root: Path) -> dict[str, Any]:
-    """Disable new launches until controller restart; running jobs continue."""
+    """Disable launches for this allocation; running jobs continue."""
 
     request_id = submit_command(root, {"kind": "drain", "submitted_at": utc_now()})
     return {"request_id": request_id, "state": "drain_requested"}
 
 
-def _submitted_from_spec(job_id: str, spec: dict[str, Any]) -> dict[str, Any]:
+def _submitted_from_spec(
+    job_id: str, spec: dict[str, Any] | None
+) -> dict[str, Any]:
     """Build the small state view used before controller admission."""
 
+    document = spec or {}
+    valid = spec is not None and spec.get("job_id") == job_id
+    valid = valid and all(
+        key in document for key in ("name", "submitted_at", "resources")
+    )
+    workflow: dict[str, Any] = {}
+    workflow_id, task_id = document.get("workflow_id"), document.get("task_id")
+    needs = document.get("needs", [])
+    if workflow_id is not None or task_id is not None or needs:
+        if (
+            isinstance(workflow_id, str)
+            and isinstance(task_id, str)
+            and isinstance(needs, list)
+            and all(isinstance(need, dict) for need in needs)
+        ):
+            workflow = {
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+                "needs": copy.deepcopy(needs),
+            }
+        else:
+            valid = False
     submitted = {
         "id": job_id,
-        "name": spec["name"],
+        "name": str(document.get("name", "invalid")),
         "state": "submitted",
-        "submitted_at": spec["submitted_at"],
-        "request": copy.deepcopy(spec["resources"]),
+        "submitted_at": document.get("submitted_at"),
+        "request": copy.deepcopy(document.get("resources")),
         "assignment": None,
-        "reason": None,
+        "reason": None if valid else "invalid_request",
+        "error": None if valid else "request awaits controller rejection",
+        **workflow,
     }
-    for key in ("workflow_id", "task_id", "needs"):
-        if key in spec:
-            submitted[key] = copy.deepcopy(spec[key])
     return submitted
 
 
@@ -178,21 +200,22 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
             "archived_jobs": 0,
             "archived_counts": {},
             "draining": False,
+            "drain_requested": False,
         }
     state.pop("report_acks", None)
     state.pop("report_ack_v", None)
+    state.pop("drain_requested", None)
     if job_id is None:
         jobs = state["jobs"]
-        for spec in list_requests(root, exclude=set(jobs)):
-            submitted_id = str(spec["job_id"])
-            jobs[submitted_id] = _submitted_from_spec(submitted_id, spec)
+        for request_id, spec in list_requests(root, exclude=set(jobs)):
+            jobs[request_id] = _submitted_from_spec(request_id, spec)
         return state
     job = state.get("jobs", {}).get(job_id)
     if job is not None:
         return job
-    spec = find_request(root, job_id)
-    if spec is not None:
-        return _submitted_from_spec(job_id, spec)
+    pending = dict(list_requests(root))
+    if job_id in pending:
+        return _submitted_from_spec(job_id, pending[job_id])
     archived = find_archived_job(root, job_id)
     if archived is not None:
         return archived
@@ -332,9 +355,20 @@ def wait_for_job(
 ) -> dict[str, Any]:
     """Block until one job is terminal, or raise ``TimeoutError``."""
 
-    deadline = None if timeout is None else time.monotonic() + timeout
+    now = time.monotonic()
+    deadline = None if timeout is None else now + timeout
+    missing_deadline = now + 1
     while True:
-        job = status(root, job_id)
+        try:
+            job = status(root, job_id)
+        except KeyError:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                raise TimeoutError(f"timed out waiting for {job_id}") from None
+            if now >= missing_deadline:
+                raise
+            time.sleep(0.2)
+            continue
         if job["state"] in TERMINAL_JOB_STATES:
             return job
         if deadline is not None and time.monotonic() >= deadline:

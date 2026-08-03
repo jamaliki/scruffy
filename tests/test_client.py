@@ -14,6 +14,7 @@ from scruffy.client import (
     status,
     submit_job,
     summary,
+    wait_for_job,
 )
 from scruffy.models import ResourceRequest
 from scruffy.protocol import ProtocolError
@@ -130,6 +131,18 @@ class ObserveTests(unittest.TestCase):
             observe(self.root)["snapshot"]["jobs"][response["job_id"]]["state"],
         )
 
+    def test_wait_tolerates_a_transient_unknown_job_view(self) -> None:
+        with (
+            mock.patch(
+                "scruffy.client.status",
+                side_effect=[KeyError("not visible yet"), {"state": "succeeded"}],
+            ),
+            mock.patch("scruffy.client.time.sleep"),
+        ):
+            job = wait_for_job(self.root, "job-delayed", timeout=2)
+
+        self.assertEqual("succeeded", job["state"])
+
     def test_submit_persists_validated_workflow_metadata(self) -> None:
         response = submit_job(
             self.root,
@@ -197,6 +210,43 @@ class ObserveTests(unittest.TestCase):
         explanation = explain(self.root, child["job_id"])
         self.assertEqual(parent["job_id"], explanation["dependencies"][0]["job_id"])
         self.assertEqual("submitted", explanation["dependencies"][0]["state"])
+
+    def test_corrupt_requests_do_not_break_client_views(self) -> None:
+        child = submit_job(
+            self.root,
+            argv=["true"],
+            name="child",
+            cwd=Path.cwd(),
+            environment={},
+            request=ResourceRequest(1, 1, 1, 1),
+            request_id="corrupt-view/child",
+            workflow_id="corrupt-view",
+            task_id="child",
+            needs=({"task_id": "parent", "condition": "succeeded"},),
+        )
+        request_root = self.root / "requests"
+        broken = request_root / "job-broken"
+        broken.mkdir()
+        (broken / "spec.json").write_text("[]", encoding="utf-8")
+        mismatch = request_root / "job-parent-directory"
+        mismatch.mkdir()
+        (mismatch / "spec.json").write_text(
+            '{"job_id":"job-phantom","name":"parent",'
+            '"workflow_id":"corrupt-view","task_id":"parent","needs":[]}',
+            encoding="utf-8",
+        )
+
+        allocation = summary(self.root)
+        broken_view = status(self.root, "job-broken")
+        explanation = explain(self.root, child["job_id"])
+
+        self.assertEqual("submitted", broken_view["state"])
+        self.assertEqual("invalid_request", broken_view["reason"])
+        self.assertNotIn("job-phantom", status(self.root)["jobs"])
+        self.assertEqual(3, allocation["counts"]["submitted"])
+        self.assertEqual(
+            "job-parent-directory", explanation["dependencies"][0]["job_id"]
+        )
 
     def test_publish_event_is_public_durable_and_retryable(self) -> None:
         self.assertIs(public_publish_event, publish_event)

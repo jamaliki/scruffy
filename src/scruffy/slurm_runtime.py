@@ -88,7 +88,12 @@ def _matching_step(controller: Controller, job: dict[str, Any]):
         return None
     step = matches[0]
     prefix = f"{controller.slurm_job_id}."
-    if not step.step_id.startswith(prefix) or not step.step_id.removeprefix(prefix).isdigit():
+    suffix = step.step_id.removeprefix(prefix)
+    if (
+        not step.step_id.startswith(prefix)
+        or not suffix.isascii()
+        or not suffix.isdecimal()
+    ):
         raise RuntimeError(f"invalid live step ID {step.step_id!r}")
     if not step.nodes:
         raise RuntimeError(f"step {step.step_id} has no node set")

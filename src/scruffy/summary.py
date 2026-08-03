@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .models import ACTIVE_JOB_STATES, TERMINAL_JOB_STATES
+from .workflows import select_task_attempts
 
 ATTENTION_STATES = {"failed", "lost", "rejected", "skipped"}
 
@@ -155,19 +156,11 @@ def explain_job(state: dict[str, Any], job_id: str) -> dict[str, Any]:
     job = jobs.get(job_id)
     if job is None:
         raise KeyError(f"unknown job {job_id}")
-    by_task: dict[tuple[object, object], dict[str, Any]] = {}
-    for candidate in jobs.values():
-        key = (candidate.get("workflow_id"), candidate.get("task_id"))
-        if not all(isinstance(item, str) and item for item in key):
-            continue
-        # Match controller resolution: a rejected duplicate never shadows the
-        # original valid task identity.
-        if candidate.get("workflow_invalid"):
-            by_task.setdefault(key, candidate)
-        else:
-            by_task[key] = candidate
+    by_task = select_task_attempts(jobs.values())
     dependencies = []
     for need in job.get("needs") or []:
+        if not isinstance(need, dict):
+            continue
         upstream = by_task.get((job.get("workflow_id"), need.get("task_id")))
         dependencies.append(
             {

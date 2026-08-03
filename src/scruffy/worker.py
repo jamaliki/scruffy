@@ -12,8 +12,8 @@ from typing import Any
 
 def current_node() -> str:
     return (
-        os.environ.get("SLURMD_NODENAME")
-        or os.environ.get("SCRUFFY_NODE")
+        os.environ.get("SCRUFFY_NODE")
+        or os.environ.get("SLURMD_NODENAME")
         or socket.gethostname().split(".", 1)[0]
     )
 

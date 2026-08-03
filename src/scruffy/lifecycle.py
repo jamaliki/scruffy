@@ -237,7 +237,11 @@ def _finish_job(
         relative_name = job.get(stream_name)
         if relative_name:
             source = controller.root / relative_name
-            job[f"{stream_name}_bytes"] = source.stat().st_size if source.exists() else 0
+            try:
+                size = source.stat().st_size
+            except FileNotFoundError:
+                size = 0
+            job[f"{stream_name}_bytes"] = size
     emit(controller, f"job.{state}", job=job)
 
 

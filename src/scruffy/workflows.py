@@ -33,6 +33,13 @@ def _identifier(value: object, label: str) -> str:
     return value
 
 
+def _task_id(value: object, label: str) -> str:
+    identifier = _identifier(value, label)
+    if ":" in identifier:
+        raise WorkflowError(f"{label} must not contain ':'")
+    return identifier
+
+
 def _identity(job: Job, label: str) -> TaskKey | None:
     has_workflow = "workflow_id" in job
     has_task = "task_id" in job
@@ -44,7 +51,7 @@ def _identity(job: Job, label: str) -> TaskKey | None:
         return None
     return (
         _identifier(job["workflow_id"], f"{label}.workflow_id"),
-        _identifier(job["task_id"], f"{label}.task_id"),
+        _task_id(job["task_id"], f"{label}.task_id"),
     )
 
 
@@ -64,7 +71,7 @@ def _dependencies(job: Job, label: str) -> tuple[Need, ...]:
             raise WorkflowError(
                 f"{need_label} must contain exactly task_id and condition"
             )
-        task_id = _identifier(raw_need["task_id"], f"{need_label}.task_id")
+        task_id = _task_id(raw_need["task_id"], f"{need_label}.task_id")
         condition = raw_need["condition"]
         if not isinstance(condition, str) or condition not in DEPENDENCY_CONDITIONS:
             choices = ", ".join(sorted(DEPENDENCY_CONDITIONS))
@@ -160,7 +167,12 @@ def _validated_graph(
                 f"duplicate task_id {task_id!r} in workflow {workflow_id!r}"
             )
         by_key[key] = job
-        needs[key] = dependencies
+        # Completed attempts no longer wait on their historical dependencies.
+        # Keeping the node but removing its outgoing edges preserves its result
+        # for dependants without letting a stale failed attempt form a cycle.
+        needs[key] = (
+            () if job.get("state") in TERMINAL_JOB_STATES else dependencies
+        )
 
     _validate_self_dependencies(needs)
     order = _validate_cycles(needs)
@@ -177,6 +189,46 @@ def validate_workflows(jobs: Iterable[Job]) -> None:
     """
 
     _validated_graph(jobs)
+
+
+def select_task_attempts(jobs: Iterable[Job]) -> dict[TaskKey, Job]:
+    """Return the newest valid attempt for each workflow task identity.
+
+    Invalid attempts remain a fallback so dependants can see that a submitted
+    upstream task was rejected, but they never shadow a valid attempt.
+    """
+
+    ordered = sorted(
+        enumerate(_materialize(jobs)),
+        key=lambda item: (
+            item[1].get("queue_order")
+            if type(item[1].get("queue_order")) is int
+            else -1,
+            item[0],
+        ),
+    )
+    selected: dict[TaskKey, Job] = {}
+    valid: set[TaskKey] = set()
+    for _, job in ordered:
+        workflow_id, task_id = job.get("workflow_id"), job.get("task_id")
+        if not isinstance(workflow_id, str) or not isinstance(task_id, str):
+            continue
+        if (
+            not workflow_id
+            or workflow_id != workflow_id.strip()
+            or not task_id
+            or task_id != task_id.strip()
+            or ":" in task_id
+        ):
+            continue
+        key = (workflow_id, task_id)
+        if job.get("workflow_invalid"):
+            if key not in valid:
+                selected[key] = job
+        else:
+            selected[key] = job
+            valid.add(key)
+    return selected
 
 
 def _blockers(

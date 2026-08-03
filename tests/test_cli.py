@@ -103,6 +103,26 @@ class SubmitCliTests(unittest.TestCase):
             submit.call_args.kwargs["needs"],
         )
 
+    def test_submit_rejects_ambiguous_colons_in_task_ids(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "submit",
+                    "--workflow-id",
+                    "run-7",
+                    "--task-id",
+                    "eval:terminal",
+                    "--",
+                    "true",
+                ]
+            )
+
+        self.assertEqual(2, result)
+        self.assertIn("must not contain ':'", stderr.getvalue())
+
     def test_report_uses_worker_identity_and_parses_json(self) -> None:
         response = {"event_id": "event-1", "state": "spooled"}
         with (
@@ -232,6 +252,25 @@ class ServeCliTests(unittest.TestCase):
             cancel_grace=2.5,
         )
 
+    def test_missing_inventory_is_reported_without_a_traceback(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("scruffy.cli.load_inventory", side_effect=FileNotFoundError("gone")),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "serve",
+                    "--inventory",
+                    str(self.workspace / "missing.json"),
+                ]
+            )
+
+        self.assertEqual(2, result)
+        self.assertEqual("scruffy: gone\n", stderr.getvalue())
+
     def test_automatic_inventory_requires_an_explicit_gpu_count(self) -> None:
         stderr = io.StringIO()
         with (
@@ -298,6 +337,46 @@ class ServeCliTests(unittest.TestCase):
 
         self.assertEqual(2, result)
         self.assertEqual("scruffy: unsafe active jobs\n", stderr.getvalue())
+
+
+class LogsCliTests(unittest.TestCase):
+    def test_follow_reads_once_more_after_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            output_file = root / "jobs" / "job-1" / "stdout.log"
+            output_file.parent.mkdir(parents=True)
+            output_file.write_bytes(b"")
+            calls = 0
+
+            def job_status(_root: Path, _job_id: str) -> dict[str, object]:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return {"id": "job-1", "state": "running"}
+                output_file.write_bytes(b"final bytes\n")
+                return {"id": "job-1", "state": "succeeded"}
+
+            output = mock.Mock(buffer=io.BytesIO())
+            with (
+                mock.patch("scruffy.cli.status", side_effect=job_status),
+                mock.patch("scruffy.cli.sys.stdout", output),
+            ):
+                result = main(
+                    [
+                        "--root",
+                        str(root),
+                        "logs",
+                        "job-1",
+                        "--stream",
+                        "stdout",
+                        "--tail",
+                        "0",
+                        "--follow",
+                    ]
+                )
+
+        self.assertEqual(0, result)
+        self.assertEqual(b"final bytes\n", output.buffer.getvalue())
 
 
 class ObserveFollowCliTests(unittest.TestCase):

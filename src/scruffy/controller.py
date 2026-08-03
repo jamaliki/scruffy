@@ -18,6 +18,7 @@ from .lifecycle import (
 )
 from .models import (
     ACTIVE_JOB_STATES,
+    TERMINAL_JOB_STATES,
     NodeInventory,
     ResourceRequest,
     validate_inventory,
@@ -41,16 +42,17 @@ from .storage import (
     compact_report_receipts,
     controller_lock,
     ensure_layout,
-    find_request,
     list_commands,
     list_archived_workflow,
     list_reports,
     list_requests,
     open_journal,
     read_events,
+    reject_request,
     report_identity_digest,
     report_was_accepted,
     report_streams,
+    request_pending,
     remove_command,
     remove_cold_job_directories,
     UnsafeRecovery,
@@ -61,6 +63,7 @@ from .workflows import (
     WorkflowError,
     resolve_blocked_jobs,
     resolve_dependencies,
+    select_task_attempts,
     validate_workflows,
 )
 
@@ -134,8 +137,18 @@ def _initialize_controller(
     )
     if slurm_job_id:
         metadata["slurm_job_id"] = slurm_job_id
+    drain_requested = bool(
+        state.get(
+            "drain_requested",
+            state.get("draining") and previous.get("state") == "draining",
+        )
+    )
+    preserve_drain = drain_requested and previous.get("id") == allocation_id
+    if preserve_drain:
+        metadata["state"] = "draining"
     state["allocation"] = metadata
-    state["draining"] = False
+    state["draining"] = preserve_drain
+    state["drain_requested"] = preserve_drain
     emit(
         controller,
         "allocation.started",
@@ -158,7 +171,7 @@ def _initialize_controller(
 def _rejected_job(
     spec: dict[str, Any], queue_order: int, job_id: str, exc: Exception
 ) -> dict[str, Any]:
-    return {
+    job = {
         "id": job_id or f"invalid-{queue_order}",
         "name": str(spec.get("name", "invalid")),
         "state": "rejected",
@@ -171,10 +184,23 @@ def _rejected_job(
         "error": str(exc),
         "reason": "invalid_spec",
     }
+    workflow_id, task_id = spec.get("workflow_id"), spec.get("task_id")
+    if isinstance(workflow_id, str) and isinstance(task_id, str):
+        job.update(
+            {
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+                "needs": [],
+                "blockers": [],
+                "workflow_invalid": True,
+            }
+        )
+    return job
 
 
 def _mark_workflow_rejected(job: dict[str, Any], exc: Exception) -> None:
     job["workflow_invalid"] = True
+    job["needs"] = []
     job["state"] = "rejected"
     job["finished_at"] = utc_now()
     job["reason"] = "invalid_workflow"
@@ -186,18 +212,15 @@ def _resolution_workflow_jobs(
 ) -> list[dict[str, Any]]:
     """Select one workflow, removing invalid edges from rejected task records."""
 
-    selected: dict[str, dict[str, Any]] = {}
-    for candidate in jobs:
-        if candidate.get("workflow_id") != workflow_id:
-            continue
-        task_id = candidate.get("task_id")
-        if not isinstance(task_id, str):
+    selected = select_task_attempts(jobs)
+    resolution_jobs = []
+    for (candidate_workflow, _), candidate in selected.items():
+        if candidate_workflow != workflow_id:
             continue
         if candidate.get("workflow_invalid"):
-            selected.setdefault(task_id, {**candidate, "needs": []})
-        else:
-            selected[task_id] = candidate
-    return list(selected.values())
+            candidate = {**candidate, "needs": []}
+        resolution_jobs.append(candidate)
+    return resolution_jobs
 
 
 def _stage_job(
@@ -222,17 +245,21 @@ def _stage_job(
         return job
 
     workflow_id = job.get("workflow_id")
-    duplicate = next(
-        (
-            candidate
-            for candidate in prospective.values()
-            if workflow_id is not None
-            and candidate.get("workflow_id") == workflow_id
-            and candidate.get("task_id") == job.get("task_id")
-        ),
-        None,
+    task_id = job.get("task_id")
+    duplicate = (
+        select_task_attempts(prospective.values()).get((workflow_id, task_id))
+        if isinstance(workflow_id, str) and isinstance(task_id, str)
+        else None
     )
-    if duplicate is not None:
+    duplicate_state = duplicate.get("state") if duplicate is not None else None
+    if (
+        duplicate is not None
+        and not duplicate.get("workflow_invalid")
+        and (
+            duplicate_state not in TERMINAL_JOB_STATES
+            or duplicate_state == "succeeded"
+        )
+    ):
         _mark_workflow_rejected(
             job,
             WorkflowError(
@@ -245,9 +272,10 @@ def _stage_job(
     if workflow_id is not None:
         candidates = [
             candidate
-            for candidate in prospective.values()
-            if candidate.get("workflow_id") == workflow_id
-            and not candidate.get("workflow_invalid")
+            for candidate in _resolution_workflow_jobs(
+                prospective.values(), workflow_id
+            )
+            if candidate.get("task_id") != task_id
         ]
         try:
             validate_workflows([*candidates, job])
@@ -298,6 +326,34 @@ def _admit_job(
         emit(controller, "job.skipped", job=job)
 
 
+def _stage_request(
+    request_id: str,
+    spec: dict[str, Any] | None,
+    queue_order: int,
+    prospective: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Stage one directory-keyed request and flag unusable identities."""
+
+    if spec is None:
+        return (
+            _rejected_job(
+                {}, queue_order, request_id, ValueError("unreadable request spec")
+            ),
+            True,
+        )
+    if spec.get("job_id") != request_id:
+        return (
+            _rejected_job(
+                spec,
+                queue_order,
+                request_id,
+                ValueError("job_id does not match request directory"),
+            ),
+            True,
+        )
+    return _stage_job(spec, queue_order, prospective), False
+
+
 def _ingest_requests(controller: Controller) -> None:
     known = controller.state["jobs"]
     next_order = max(
@@ -309,19 +365,16 @@ def _ingest_requests(controller: Controller) -> None:
     )
     # Directory timestamps are not a safe admission signal on every shared
     # filesystem. Listing names each poll is cheap; only unknown specs are read.
-    specs = sorted(
-        list_requests(controller.root, exclude=known.keys()),
-        key=lambda spec: (str(spec.get("submitted_at", "")), str(spec.get("job_id", ""))),
-    )
+    requests = list_requests(controller.root, exclude=known.keys())
     # Keep every new request outside public state until its admission event.
     # Otherwise an earlier emit could snapshot a later task before its
     # dependency decision, and a crash could make that task runnable.
-    staged: list[dict[str, Any]] = []
+    staged: list[tuple[dict[str, Any], bool]] = []
     prospective: dict[str, dict[str, Any]] = {}
     workflow_ids = {
         str(spec["workflow_id"])
-        for spec in specs
-        if isinstance(spec.get("workflow_id"), str)
+        for _, spec in requests
+        if spec is not None and isinstance(spec.get("workflow_id"), str)
     }
     for workflow_id in workflow_ids:
         prospective.update(
@@ -331,19 +384,27 @@ def _ingest_requests(controller: Controller) -> None:
             }
         )
     prospective.update(known)
-    for spec in specs:
-        job_id = str(spec.get("job_id", ""))
-        if job_id in prospective:
+    for request_id, spec in requests:
+        if request_id in prospective:
             continue
         next_order += 1
-        job = _stage_job(spec, next_order, prospective)
-        staged.append(job)
-        prospective[job_id] = job
+        job, malformed_identity = _stage_request(
+            request_id, spec, next_order, prospective
+        )
+        staged.append((job, malformed_identity))
+        prospective[request_id] = job
 
     controller.state["next_queue_order"] = next_order
-    for job in staged:
+    for job, malformed_identity in staged:
         _admit_job(controller, job, prospective)
-        accept_request(controller.root, job["id"])
+        if malformed_identity:
+            reject_request(controller.root, job["id"])
+        else:
+            accept_request(
+                controller.root,
+                job["id"],
+                identity_digest=job["request_digest"],
+            )
 
 
 def _workflow_groups(
@@ -438,7 +499,6 @@ def _refresh_dependencies(controller: Controller) -> None:
                 emit(controller, "job.skipped", job=job)
             elif blockers != job.get("blockers"):
                 job["blockers"] = blockers
-                emit(controller, "job.blocked", job=job)
 
     # Cache each workflow independently: an unrelated job transition must not
     # revalidate every blocked graph in the allocation.
@@ -460,7 +520,7 @@ def _ingest_commands(controller: Controller) -> None:
             if job is None:
                 # Submit returns only after its request is durable. If command
                 # ingestion won a polling race, retain the cancel for next tick.
-                if find_request(controller.root, job_id) is not None:
+                if request_pending(controller.root, job_id):
                     deferred = True
                 else:
                     emit(
@@ -494,6 +554,7 @@ def _ingest_commands(controller: Controller) -> None:
                 )
             else:
                 controller.state["draining"] = True
+                controller.state["drain_requested"] = True
                 controller.state["allocation"]["state"] = "draining"
                 emit(controller, "allocation.draining", data=data)
         if not deferred:
@@ -698,7 +759,7 @@ def _ingest_reports(
         if job is None:
             # A worker cannot start before its job is known, but an external
             # publisher may win the controller's request-ingestion poll.
-            if find_request(controller.root, job_id) is not None:
+            if request_pending(controller.root, job_id):
                 continue
             _reject_report(
                 controller,

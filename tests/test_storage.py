@@ -31,6 +31,7 @@ from scruffy.storage import (
     next_journal_generation,
     read_event_page,
     read_events,
+    reject_request,
     report_identity_digest,
     report_was_accepted,
     prune_report_receipts,
@@ -196,8 +197,10 @@ class SubmitRequestTests(StorageTestCase):
         self.assertEqual(1, sum(not duplicate for *_, duplicate in results))
         requests = list_requests(self.root)
         self.assertEqual(1, len(requests))
+        _, request = requests[0]
+        assert request is not None
         self.assertIn(
-            requests[0]["submitted_at"], {spec["submitted_at"] for spec in specs}
+            request["submitted_at"], {spec["submitted_at"] for spec in specs}
         )
 
     def test_concurrent_conflicting_retries_have_one_winner(self) -> None:
@@ -232,10 +235,49 @@ class SubmitRequestTests(StorageTestCase):
         self.assertTrue(all(not duplicate for *_, duplicate in results))
         expected_ids = {spec["job_id"] for spec in specs}
         self.assertEqual(expected_ids, {job_id for _, _, job_id, _ in results})
-        stored = {request["job_id"]: request for request in list_requests(self.root)}
+        stored = {
+            request_id: request
+            for request_id, request in list_requests(self.root)
+            if request is not None
+        }
         self.assertEqual(expected_ids, set(stored))
         for spec in specs:
             self.assertEqual(spec, stored[spec["job_id"]])
+
+    def test_corrupt_requests_are_returned_as_individual_sentinels(self) -> None:
+        valid = _job_spec("job-valid")
+        submit_request(self.root, valid)
+        corrupt = self.root / "requests" / "job-corrupt"
+        corrupt.mkdir()
+        (corrupt / "spec.json").write_text("{broken", encoding="utf-8")
+        non_object = self.root / "requests" / "job-list"
+        non_object.mkdir()
+        (non_object / "spec.json").write_text("[]", encoding="utf-8")
+
+        requests = dict(list_requests(self.root))
+
+        self.assertEqual(valid, requests["job-valid"])
+        self.assertIsNone(requests["job-corrupt"])
+        self.assertIsNone(requests["job-list"])
+
+        self.assertTrue(reject_request(self.root, "job-corrupt"))
+        with self.assertRaises(RequestConflict):
+            submit_request(self.root, _job_spec("job-corrupt"))
+
+    def test_request_listing_does_not_trust_client_timestamps(self) -> None:
+        submit_request(
+            self.root,
+            _job_spec("job-z", submitted_at="1900-01-01T00:00:00.000Z"),
+        )
+        submit_request(
+            self.root,
+            _job_spec("job-a", submitted_at="2100-01-01T00:00:00.000Z"),
+        )
+
+        self.assertEqual(
+            ["job-a", "job-z"],
+            [request_id for request_id, _ in list_requests(self.root)],
+        )
 
     def test_admitted_request_keeps_exact_compact_idempotency(self) -> None:
         spec = _job_spec("job-admitted")
@@ -476,6 +518,19 @@ class EventJournalTests(StorageTestCase):
         self.assertFalse(final_more)
         self.assertEqual((self.root / "events.jsonl").stat().st_size, final_offset)
 
+    def test_mid_record_cursor_restarts_from_a_safe_boundary(self) -> None:
+        with open_journal(self.root) as journal:
+            for event in self.EVENTS:
+                append_event(journal, event, sync=True)
+        with (self.root / "events.jsonl").open("rb") as journal:
+            middle_of_second = len(journal.readline()) + 5
+
+        events, _, _ = read_event_page(
+            self.root, after=1, offset=middle_of_second
+        )
+
+        self.assertEqual([2, 3], [event["seq"] for event in events])
+
     def test_orphan_rotation_never_supersedes_the_active_checkpoint(self) -> None:
         active = {"queue_id": "queue-test", "journal_generation": 1, "jobs": {}}
         orphan = {"queue_id": "queue-test", "journal_generation": 2, "jobs": {}}
@@ -508,6 +563,16 @@ class TailBytesTests(StorageTestCase):
         source.write_bytes(b"".join(records))
         self.assertGreater(source.stat().st_size, 2 * 8192)
         self.assertEqual(b"".join(records[-9:]), tail_bytes(source, lines=9))
+
+    def test_newline_free_log_is_bounded(self) -> None:
+        source = self.root / "large-progress.log"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"x" * (2 * 1024 * 1024))
+
+        result = tail_bytes(source, lines=200)
+
+        self.assertEqual(1024 * 1024, len(result))
+        self.assertEqual(b"x" * (1024 * 1024), result)
 
 
 if __name__ == "__main__":

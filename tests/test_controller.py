@@ -22,7 +22,7 @@ from scruffy.client import (
 )
 from scruffy.controller import run_controller
 from scruffy.models import NodeInventory, ResourceRequest
-from scruffy.storage import read_events
+from scruffy.storage import read_events, submit_request, utc_now
 
 
 TIMEOUT = 12.0
@@ -85,7 +85,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             lambda: (
                 snapshot
                 if (snapshot := status(self.root)).get("allocation")
-                and snapshot["allocation"]["state"] == "running"
+                and snapshot["allocation"]["state"] in {"running", "draining"}
                 else None
             ),
             "controller startup",
@@ -220,6 +220,159 @@ class ControllerIntegrationTests(unittest.TestCase):
         self.assertEqual(
             "succeeded", wait_for_job(self.root, cleanup_id, timeout=TIMEOUT)["state"]
         )
+
+    def test_failed_workflow_attempts_can_be_repaired_in_place(self) -> None:
+        self._start_controller((0,))
+        first_a = self._submit(
+            "repair-a-1",
+            "print('old a')",
+            workflow_id="repair",
+            task_id="a",
+            needs=({"task_id": "b", "condition": "succeeded"},),
+        )
+        self._wait_for_state(first_a, "blocked")
+        invalid_b = self._submit(
+            "repair-b-invalid",
+            "print('invalid b')",
+            workflow_id="repair",
+            task_id="b",
+            needs=({"task_id": "a", "condition": "succeeded"},),
+        )
+        self._wait_for_state(invalid_b, "rejected")
+        self._wait_for_state(first_a, "skipped")
+
+        retry_b = self._submit(
+            "repair-b-2",
+            "print('new b')",
+            workflow_id="repair",
+            task_id="b",
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, retry_b, timeout=TIMEOUT)["state"]
+        )
+        duplicate_b = self._submit(
+            "repair-b-after-success",
+            "print('must not rerun')",
+            workflow_id="repair",
+            task_id="b",
+        )
+        self._wait_for_state(duplicate_b, "rejected")
+        retry_a = self._submit(
+            "repair-a-2",
+            "print('new a')",
+            workflow_id="repair",
+            task_id="a",
+            needs=({"task_id": "b", "condition": "succeeded"},),
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, retry_a, timeout=TIMEOUT)["state"]
+        )
+
+    def test_lost_workflow_tasks_can_be_resubmitted_after_restart(self) -> None:
+        self._start_controller((0,))
+        first_a = self._submit(
+            "lost-a-1",
+            "import time; time.sleep(60)",
+            workflow_id="lost-repair",
+            task_id="a",
+        )
+        first_b = self._submit(
+            "lost-b-1",
+            "print('old b')",
+            workflow_id="lost-repair",
+            task_id="b",
+            needs=({"task_id": "a", "condition": "succeeded"},),
+        )
+        self._wait_for_state(first_a, "running")
+        self._wait_for_state(first_b, "blocked")
+        self._stop_controller()
+        self.assertEqual("lost", status(self.root, first_a)["state"])
+        self.assertEqual("skipped", status(self.root, first_b)["state"])
+
+        self._start_controller((0,))
+        retry_a = self._submit(
+            "lost-a-2",
+            "print('new a')",
+            workflow_id="lost-repair",
+            task_id="a",
+        )
+        retry_b = self._submit(
+            "lost-b-2",
+            "print('new b')",
+            workflow_id="lost-repair",
+            task_id="b",
+            needs=({"task_id": "a", "condition": "succeeded"},),
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, retry_a, timeout=TIMEOUT)["state"]
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, retry_b, timeout=TIMEOUT)["state"]
+        )
+
+    def test_invalid_request_inbox_entries_are_rejected_individually(self) -> None:
+        request_root = self.root / "requests"
+        for request_id, document in {
+            "job-broken": "{broken",
+            "job-list": "[]",
+            "job-missing-id": '{"name":"missing"}',
+            "job-directory-id": '{"job_id":"job-phantom","name":"mismatch"}',
+        }.items():
+            directory = request_root / request_id
+            directory.mkdir(parents=True)
+            (directory / "spec.json").write_text(document, encoding="utf-8")
+
+        self._start_controller((0,))
+        for request_id in (
+            "job-broken",
+            "job-list",
+            "job-missing-id",
+            "job-directory-id",
+        ):
+            self._wait_for_state(request_id, "rejected")
+        snapshot = status(self.root)
+        self.assertNotIn("job-phantom", snapshot["jobs"])
+        self.assertFalse(
+            any(job_id.startswith("invalid-") for job_id in snapshot["jobs"])
+        )
+        self.assertEqual([], list((self.root / "requests").glob("job-*")))
+        valid = self._submit("after-corrupt", "print('still alive')")
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, valid, timeout=TIMEOUT)["state"]
+        )
+
+    def test_spec_invalid_upstream_keeps_workflow_identity(self) -> None:
+        parent_id = "job-invalid-parent"
+        submit_request(
+            self.root,
+            {
+                "v": 1,
+                "job_id": parent_id,
+                "request_id": "invalid-parent",
+                "name": "invalid-parent",
+                "submitted_at": utc_now(),
+                "argv": ["true"],
+                "cwd": str(self.workspace),
+                "env": {},
+                "resources": [],
+                "workflow_id": "invalid-upstream",
+                "task_id": "parent",
+                "needs": [],
+            },
+        )
+        self._start_controller((0,))
+        self._wait_for_state(parent_id, "rejected")
+        child_id = self._submit(
+            "invalid-upstream-child",
+            "print('must not run')",
+            workflow_id="invalid-upstream",
+            task_id="child",
+            needs=({"task_id": "parent", "condition": "succeeded"},),
+        )
+
+        child = self._wait_for_state(child_id, "skipped")
+
+        self.assertEqual("rejected", child["blockers"][0]["state"])
 
     def test_workload_reports_are_projected_and_broadcast_once(self) -> None:
         self._start_controller((0,))
@@ -522,6 +675,20 @@ class ControllerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("already_draining", ignored["data"]["reason"])
         self.assertTrue(status(self.root)["draining"])
+
+    def test_drain_survives_same_allocation_controller_restart(self) -> None:
+        self._start_controller((0,))
+        drain_queue(self.root)
+        self._wait_until(
+            lambda: status(self.root)["draining"], "controller to drain"
+        )
+        self._stop_controller()
+
+        self._start_controller((0,))
+        self.assertTrue(status(self.root)["draining"])
+        queued = self._submit("drained-restart", "print('must stay queued')")
+        time.sleep(0.1)
+        self.assertEqual("queued", status(self.root, queued)["state"])
 
 
 if __name__ == "__main__":

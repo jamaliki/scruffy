@@ -6,6 +6,7 @@ from scruffy.workflows import (
     WorkflowError,
     resolve_blocked_jobs,
     resolve_dependencies,
+    select_task_attempts,
     validate_workflows,
 )
 
@@ -55,6 +56,9 @@ class WorkflowValidationTests(unittest.TestCase):
         for job in invalid_jobs:
             with self.subTest(job=job), self.assertRaises(WorkflowError):
                 validate_workflows([job])
+
+        with self.assertRaisesRegex(WorkflowError, "must not contain ':'"):
+            validate_workflows([task("eval:terminal")])
 
     def test_standalone_job_cannot_have_dependencies(self) -> None:
         with self.assertRaisesRegex(WorkflowError, "cannot declare needs"):
@@ -124,8 +128,34 @@ class WorkflowValidationTests(unittest.TestCase):
             ):
                 validate_workflows(jobs)
 
+    def test_terminal_task_edges_do_not_keep_a_repaired_graph_cyclic(self) -> None:
+        cancelled = task("a", state="cancelled", needs=[need("b")])
+        replacement = task("b", needs=[need("a")])
+
+        validate_workflows([cancelled, replacement])
+
+        self.assertEqual(
+            "skipped",
+            resolve_dependencies(replacement, [cancelled, replacement])["decision"],
+        )
+
 
 class WorkflowResolutionTests(unittest.TestCase):
+    def test_newest_valid_retry_shadows_failed_and_invalid_attempts(self) -> None:
+        attempts = [
+            {**task("train", state="failed"), "queue_order": 1},
+            {
+                **task("train", state="rejected"),
+                "queue_order": 2,
+                "workflow_invalid": True,
+            },
+            {**task("train", state="running"), "queue_order": 3},
+        ]
+
+        selected = select_task_attempts(attempts)
+
+        self.assertIs(attempts[2], selected[("pipeline", "train")])
+
     def test_batch_resolver_reaches_a_fixed_point_in_topological_order(self) -> None:
         jobs = [
             task("consumer", state="blocked", needs=[need("cleanup")]),

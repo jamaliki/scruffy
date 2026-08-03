@@ -44,7 +44,9 @@ agents; reading does not consume events for anyone else. Use
   selected worker nodes.
 - Workflow tasks use `--workflow-id`, `--task-id`, and repeated
   `--needs TASK[:succeeded|terminal]`. Dependencies may be submitted later by
-  another agent.
+  another agent. Task IDs cannot contain `:`. A succeeded task identity is
+  final; after any other terminal result, retry it with a new `request_id` in
+  the same workflow.
 - Prefer `summary` for bounded orientation, `explain` for one dependency chain,
   and `observe` for incremental monitoring.
 - Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000
@@ -59,11 +61,14 @@ agents; reading does not consume events for anyone else. Use
 - `blocked` means an upstream task is missing or unfinished. `skipped` is
   terminal and means a required successful dependency ended unsuccessfully.
 - Match asynchronous cancel and drain outcomes using the returned `request_id`.
-  `drain` disables new launches until the controller is restarted.
+  `drain` survives controller restarts and disables launches until the outer
+  allocation is replaced.
 - GPU identity is `(node, gpu_id)`, never a bare global ordinal.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
 - CPU and memory are cooperative budgets. GPU exclusivity covers only work
   submitted through Scruffy; do not launch out-of-band work on its inventory.
+- `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
+  every node. Lustre `localflock` is not sufficient for a multi-node queue.
 - `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE` are
   controller-owned inside a worker.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep

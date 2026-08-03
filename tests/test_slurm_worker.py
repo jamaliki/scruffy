@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from scruffy.slurm import build_srun_argv, cancel_step, live_steps, load_inventory
-from scruffy.worker import execute_assignment, find_node_assignment
+from scruffy.worker import current_node, execute_assignment, find_node_assignment
 
 
 class SlurmArgumentTests(unittest.TestCase):
@@ -165,12 +165,20 @@ class SlurmReconciliationTests(unittest.TestCase):
             text=True,
             timeout=10,
         )
-        for unsafe in ("240292", "240292.batch", "999.17", ""):
+        for unsafe in ("240292", "240292.batch", "240292.١٧", "999.17", ""):
             with self.assertRaisesRegex(ValueError, "unsafe Slurm step ID"):
                 cancel_step("240292", unsafe)
 
 
 class WorkerPlacementTests(unittest.TestCase):
+    def test_controller_node_identity_wins_inside_an_existing_slurm_step(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SCRUFFY_NODE": "inventory-node", "SLURMD_NODENAME": "outer-node"},
+            clear=True,
+        ):
+            self.assertEqual("inventory-node", current_node())
+
     def test_multi_node_worker_selects_its_own_reservation(self) -> None:
         document = {
             "assignment": [

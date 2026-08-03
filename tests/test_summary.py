@@ -8,6 +8,20 @@ from scruffy.summary import build_summary, explain_job
 
 
 class SummaryTests(unittest.TestCase):
+    def test_artifact_projection_replaces_a_replayed_event_id(self) -> None:
+        job: dict[str, object] = {"id": "job-1", "state": "running"}
+        event = {
+            "event_id": "checkpoint-7",
+            "occurred_at": "2026-08-03T12:02:00+00:00",
+            "kind": "workload.artifact",
+            "data": {"name": "latest.pt"},
+        }
+
+        apply_workload_event(job, event, recorded_at=event["occurred_at"])
+        apply_workload_event(job, event, recorded_at=event["occurred_at"])
+
+        self.assertEqual(1, len(job["workload"]["latest_artifacts"]))
+
     def test_late_reports_are_journaled_without_regressing_current_progress(self) -> None:
         job: dict[str, object] = {"id": "job-1", "state": "running"}
         newer = {
