@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,115 @@ from .storage import (
 
 
 ACTIVE_STATES = {"starting", "running", "cancelling", "finishing"}
-TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost", "rejected"}
+TERMINAL_STATES = {
+    "succeeded",
+    "failed",
+    "cancelled",
+    "lost",
+    "rejected",
+    "skipped",
+}
+
+
+def _event_key(occurred_at: str, event_id: str) -> tuple[datetime, str]:
+    return datetime.fromisoformat(occurred_at.replace("Z", "+00:00")), event_id
+
+
+def _is_newer(
+    event: dict[str, Any], workload: dict[str, Any], field: str
+) -> bool:
+    previous_at = workload.get(f"{field}_at")
+    previous_id = workload.get(f"{field}_event_id")
+    if not isinstance(previous_at, str) or not isinstance(previous_id, str):
+        return True
+    return _event_key(event["occurred_at"], event["event_id"]) >= _event_key(
+        previous_at, previous_id
+    )
+
+
+def _remember_event(
+    workload: dict[str, Any], field: str, event: dict[str, Any]
+) -> None:
+    workload[f"{field}_at"] = event["occurred_at"]
+    workload[f"{field}_event_id"] = event["event_id"]
+
+
+def apply_workload_event(
+    job: dict[str, Any], event: dict[str, Any], *, recorded_at: str
+) -> None:
+    """Project one validated producer event onto a job's current workload view.
+
+    Producer reports are deliberately unable to alter lifecycle or placement
+    fields.  The complete event remains in the journal; this projection only
+    keeps the bounded latest values agents need for a quick status check.
+    """
+
+    data = copy.deepcopy(event["data"])
+    workload = job.setdefault(
+        "workload",
+        {
+            "phase": None,
+            "status": None,
+            "phase_at": None,
+            "phase_event_id": None,
+            "progress": None,
+            "progress_at": None,
+            "progress_event_id": None,
+            "last_update_at": None,
+            "last_update_event_id": None,
+            "last_recorded_at": None,
+            "last_milestone": None,
+            "latest_artifacts": [],
+            "last_notice": None,
+        },
+    )
+    kind = event["kind"]
+    if kind == "workload.phase" and _is_newer(event, workload, "phase"):
+        workload["phase"] = data.get("phase")
+        workload["status"] = data.get("status")
+        _remember_event(workload, "phase", event)
+    elif kind == "workload.progress":
+        if _is_newer(event, workload, "progress"):
+            workload["progress"] = data
+            _remember_event(workload, "progress", event)
+        if _is_newer(event, workload, "phase"):
+            if isinstance(data.get("phase"), str):
+                workload["phase"] = data["phase"]
+            workload["status"] = "active"
+            _remember_event(workload, "phase", event)
+    elif kind == "workload.milestone" and _is_newer(
+        event, workload, "milestone"
+    ):
+        workload["last_milestone"] = {
+            **data,
+            "occurred_at": event["occurred_at"],
+            "event_id": event["event_id"],
+        }
+        _remember_event(workload, "milestone", event)
+    elif kind == "workload.artifact":
+        artifacts = list(workload.get("latest_artifacts") or [])
+        artifacts.append(
+            {
+                **data,
+                "occurred_at": event["occurred_at"],
+                "event_id": event["event_id"],
+            }
+        )
+        artifacts.sort(
+            key=lambda item: _event_key(item["occurred_at"], item["event_id"])
+        )
+        workload["latest_artifacts"] = artifacts[-8:]
+    elif kind == "workload.notice" and _is_newer(event, workload, "notice"):
+        workload["last_notice"] = {
+            **data,
+            "occurred_at": event["occurred_at"],
+            "event_id": event["event_id"],
+        }
+        _remember_event(workload, "notice", event)
+    if _is_newer(event, workload, "last_update"):
+        workload["last_update_at"] = event["occurred_at"]
+        workload["last_update_event_id"] = event["event_id"]
+    workload["last_recorded_at"] = recorded_at
 
 
 def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
@@ -42,7 +151,7 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
     cwd = Path(str(spec["cwd"]))
     if not cwd.is_absolute():
         raise ValueError("cwd must be absolute")
-    return {
+    job = {
         "id": str(spec["job_id"]),
         "name": str(spec["name"]),
         "state": "queued",
@@ -60,6 +169,21 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
         "reason": None,
         "error": None,
     }
+    workflow_id = spec.get("workflow_id")
+    task_id = spec.get("task_id")
+    needs = spec.get("needs", [])
+    if workflow_id is not None or task_id is not None or needs:
+        if not isinstance(needs, list):
+            raise ValueError("needs must be a JSON array")
+        job.update(
+            {
+                "workflow_id": workflow_id,
+                "task_id": task_id,
+                "needs": copy.deepcopy(needs),
+                "blockers": [],
+            }
+        )
+    return job
 
 
 def active_assignments(state: dict[str, Any]) -> tuple[Assignment, ...]:
@@ -115,24 +239,36 @@ def emit(
     data: dict[str, Any] | None = None,
     durable: bool = True,
     snapshot: bool = True,
+    occurred_at: str | None = None,
+    source_event_id: str | None = None,
+    source: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Append one ordered event, then atomically publish the new snapshot."""
 
     state = controller.state
     state["last_seq"] += 1
+    recorded_at = utc_now()
     event: dict[str, Any] = {
         "v": 1,
         "queue_id": state["queue_id"],
         "seq": state["last_seq"],
-        "at": utc_now(),
+        "event_id": f"{state['queue_id']}:{state['last_seq']}",
+        "at": recorded_at,
+        "recorded_at": recorded_at,
         "kind": kind,
         "allocation_id": controller.allocation_id,
     }
+    if occurred_at is not None:
+        event["occurred_at"] = occurred_at
+    if source_event_id is not None:
+        event["source_event_id"] = source_event_id
+    if source is not None:
+        event["source"] = dict(source)
     if job is not None:
         event["job_id"] = job["id"]
         # Complete images let a missing or stale snapshot be rebuilt.
         event["job"] = copy.deepcopy(job)
-    if data:
+    if data is not None:
         event["data"] = data
         if "job_id" in data and "job_id" not in event:
             event["job_id"] = data["job_id"]

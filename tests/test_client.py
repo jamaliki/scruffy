@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy.client import observe, status, submit_job
+from scruffy import publish_event as public_publish_event
+from scruffy.client import explain, observe, publish_event, status, submit_job, summary
 from scruffy.models import ResourceRequest
+from scruffy.protocol import ProtocolError
 from scruffy.storage import (
     append_event,
     job_directory,
+    list_reports,
     open_journal,
     queue_id,
     read_events,
@@ -109,6 +112,137 @@ class ObserveTests(unittest.TestCase):
 
         self.assertEqual("submitted", response["state"])
         self.assertEqual("submitted", status(self.root, response["job_id"])["state"])
+
+    def test_submit_persists_validated_workflow_metadata(self) -> None:
+        response = submit_job(
+            self.root,
+            argv=["true"],
+            name="infer",
+            cwd=Path.cwd(),
+            environment={},
+            request=ResourceRequest(1, 1, 1, 1),
+            request_id="workflow/infer",
+            workflow_id="experiment-7",
+            task_id="infer",
+            needs=({"task_id": "train", "condition": "succeeded"},),
+        )
+
+        submitted = status(self.root, response["job_id"])
+        self.assertEqual("experiment-7", submitted["workflow_id"])
+        self.assertEqual("infer", submitted["task_id"])
+        self.assertEqual(
+            [{"task_id": "train", "condition": "succeeded"}],
+            submitted["needs"],
+        )
+        with self.assertRaisesRegex(ValueError, "provided together"):
+            submit_job(
+                self.root,
+                argv=["true"],
+                name="bad",
+                cwd=Path.cwd(),
+                environment={},
+                request=ResourceRequest(1, 1, 1, 1),
+                request_id=None,
+                workflow_id="experiment-7",
+            )
+
+    def test_summary_and_explain_include_requests_before_admission(self) -> None:
+        child = submit_job(
+            self.root,
+            argv=["true"],
+            name="infer",
+            cwd=Path.cwd(),
+            environment={},
+            request=ResourceRequest(1, 1, 1, 1),
+            request_id="workflow/infer",
+            workflow_id="experiment-7",
+            task_id="infer",
+            needs=({"task_id": "train", "condition": "succeeded"},),
+        )
+        parent = submit_job(
+            self.root,
+            argv=["true"],
+            name="train",
+            cwd=Path.cwd(),
+            environment={},
+            request=ResourceRequest(1, 1, 1, 1),
+            request_id="workflow/train",
+            workflow_id="experiment-7",
+            task_id="train",
+        )
+
+        allocation = summary(self.root)
+        self.assertEqual({"submitted": 2}, allocation["counts"])
+        self.assertEqual(
+            {child["job_id"], parent["job_id"]},
+            {job["id"] for job in allocation["submitted"]},
+        )
+        explanation = explain(self.root, child["job_id"])
+        self.assertEqual(parent["job_id"], explanation["dependencies"][0]["job_id"])
+        self.assertEqual("submitted", explanation["dependencies"][0]["state"])
+
+    def test_publish_event_is_public_durable_and_retryable(self) -> None:
+        self.assertIs(public_publish_event, publish_event)
+        response = publish_event(
+            self.root,
+            job_id="job-reporter",
+            event_id="koochak/step-7",
+            occurred_at="2026-08-03T12:00:00.000+00:00",
+            kind="workload.progress",
+            source={"name": "koochak", "node": "gpu-3"},
+            data={"step": 7, "loss": 0.5},
+        )
+
+        self.assertEqual(
+            {
+                "event_id": "koochak/step-7",
+                "job_id": "job-reporter",
+                "state": "spooled",
+                "deduplicated": False,
+            },
+            response,
+        )
+        pending = list_reports(self.root)
+        self.assertEqual(1, len(pending))
+        self.assertEqual({"name": "koochak", "node": "gpu-3"}, pending[0][1]["source"])
+
+        retried = publish_event(
+            self.root,
+            job_id="job-reporter",
+            event_id="koochak/step-7",
+            kind="workload.progress",
+            data={"step": 7, "loss": 0.5},
+            source={"name": "koochak", "node": "gpu-3"},
+        )
+        self.assertTrue(retried["deduplicated"])
+        self.assertEqual(1, len(list_reports(self.root)))
+
+    def test_publish_event_defaults_source_and_validates_before_writing(self) -> None:
+        response = publish_event(
+            self.root,
+            job_id="job-reporter",
+            kind="workload.notice",
+            data={"message": "warming up"},
+        )
+        self.assertTrue(str(response["event_id"]).startswith("event-"))
+        self.assertEqual({}, list_reports(self.root)[0][1]["source"])
+
+        with self.assertRaises(ProtocolError):
+            publish_event(
+                self.root,
+                job_id="job-reporter",
+                kind="job.succeeded",
+                data={},
+            )
+        with self.assertRaises(ProtocolError):
+            publish_event(
+                self.root,
+                job_id="job-reporter",
+                event_id="",
+                kind="workload.notice",
+                data={},
+            )
+        self.assertEqual(1, len(list_reports(self.root)))
 
     def test_observe_closes_append_between_size_check_and_first_read(self) -> None:
         event = {"seq": 1, "kind": "job.queued"}

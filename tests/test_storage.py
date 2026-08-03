@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 import tempfile
 import traceback
@@ -9,16 +10,20 @@ from typing import Any
 
 from scruffy.storage import (
     ControllerAlreadyRunning,
+    ReportConflict,
     RequestConflict,
     append_event,
     controller_lock,
     find_request,
     journal_tail,
     last_event_sequence,
+    list_reports,
     list_requests,
     open_journal,
     read_event_page,
     read_events,
+    remove_report,
+    submit_report,
     submit_request,
     tail_bytes,
 )
@@ -47,6 +52,24 @@ def _job_spec(
     }
 
 
+def _workload_report(
+    event_id: str,
+    *,
+    job_id: str = "job-reporter",
+    value: int = 1,
+    occurred_at: str = "2026-08-03T12:00:00.000+00:00",
+) -> dict[str, Any]:
+    return {
+        "v": 1,
+        "event_id": event_id,
+        "job_id": job_id,
+        "occurred_at": occurred_at,
+        "kind": "workload.progress",
+        "source": {"name": "test-worker"},
+        "data": {"step": value},
+    }
+
+
 def _storage_worker(
     root_dir: str,
     worker_id: int,
@@ -66,6 +89,9 @@ def _storage_worker(
         if operation == "submit":
             job_id, duplicate = submit_request(Path(root_dir), value)
             result_queue.put((worker_id, "ok", job_id, duplicate))
+        elif operation == "report":
+            event_id, duplicate = submit_report(Path(root_dir), value)
+            result_queue.put((worker_id, "ok", event_id, duplicate))
         elif operation == "read_events":
             result_queue.put(
                 (worker_id, "ok", read_events(Path(root_dir), after=value), None)
@@ -73,6 +99,8 @@ def _storage_worker(
         else:  # pragma: no cover - test helper misuse
             raise ValueError(f"unknown operation {operation!r}")
     except RequestConflict as exc:
+        result_queue.put((worker_id, "conflict", str(exc), None))
+    except ReportConflict as exc:
         result_queue.put((worker_id, "conflict", str(exc), None))
     except Exception:
         result_queue.put((worker_id, "error", traceback.format_exc(), None))
@@ -197,6 +225,61 @@ class SubmitRequestTests(StorageTestCase):
         self.assertEqual(expected_ids, set(stored))
         for spec in specs:
             self.assertEqual(spec, stored[spec["job_id"]])
+
+
+class SubmitReportTests(StorageTestCase):
+    def test_concurrent_retries_create_one_durable_report(self) -> None:
+        reports = [
+            _workload_report(
+                "shared-event",
+                occurred_at=f"2026-08-03T12:00:{index:02d}.000+00:00",
+            )
+            for index in range(12)
+        ]
+
+        results = self.run_workers("report", reports)
+
+        self.assertEqual({"ok"}, {status for _, status, _, _ in results})
+        self.assertEqual({"shared-event"}, {event_id for _, _, event_id, _ in results})
+        self.assertEqual(1, sum(not duplicate for *_, duplicate in results))
+        pending = list_reports(self.root)
+        self.assertEqual(1, len(pending))
+        self.assertIsInstance(pending[0][1], dict)
+
+    def test_consumed_retry_uses_hidden_receipt_and_conflicts_stay_visible(self) -> None:
+        report = _workload_report("stable/event-id")
+        event_id, duplicate = submit_report(self.root, report)
+        self.assertEqual("stable/event-id", event_id)
+        self.assertFalse(duplicate)
+        source, document = list_reports(self.root)[0]
+        self.assertEqual(report, document)
+        expected_name = hashlib.sha256(event_id.encode()).hexdigest() + ".json"
+        self.assertEqual(expected_name, source.name)
+
+        remove_report(source)
+
+        self.assertEqual([], list_reports(self.root))
+        receipt = self.root / "reports" / ".accepted" / report["job_id"] / expected_name
+        self.assertTrue(receipt.exists())
+        retried = {**report, "occurred_at": "2026-08-03T12:05:00.000+00:00"}
+        self.assertEqual((event_id, True), submit_report(self.root, retried))
+        self.assertEqual([], list_reports(self.root))
+        with self.assertRaises(ReportConflict):
+            submit_report(self.root, {**report, "data": {"step": 2}})
+
+    def test_one_corrupt_or_oversized_report_does_not_hide_valid_reports(self) -> None:
+        submit_report(self.root, _workload_report("valid-event"))
+        bad_directory = self.root / "reports" / "job-bad"
+        bad_directory.mkdir()
+        (bad_directory / "bad.json").write_text("{broken", encoding="utf-8")
+        (bad_directory / "huge.json").write_bytes(b"x" * (64 * 1024 + 1))
+
+        reports = list_reports(self.root)
+
+        self.assertEqual(3, len(reports))
+        self.assertEqual(2, sum(document is None for _, document in reports))
+        valid = [document for _, document in reports if isinstance(document, dict)]
+        self.assertEqual(["valid-event"], [document["event_id"] for document in valid])
 
 
 class ControllerLockTests(StorageTestCase):

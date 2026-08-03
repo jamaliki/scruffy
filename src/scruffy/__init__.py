@@ -2,7 +2,17 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .client import cancel_job, drain_queue, observe, status, submit_job, wait_for_job
+from .client import (
+    cancel_job,
+    drain_queue,
+    explain,
+    observe,
+    publish_event,
+    status,
+    submit_job,
+    summary,
+    wait_for_job,
+)
 from .models import NodeInventory, ResourceRequest
 
 try:
@@ -16,8 +26,11 @@ __all__ = [
     "__version__",
     "cancel_job",
     "drain_queue",
+    "explain",
     "observe",
+    "publish_event",
     "status",
     "submit_job",
+    "summary",
     "wait_for_job",
 ]

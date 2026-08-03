@@ -107,6 +107,7 @@ class Controller:
     slurm_snapshot_at: float = 0.0
     last_slurm_query: float = 0.0
     slurm_query_error: str | None = None
+    report_cursor: str | None = None
 
 
 def copy_stream(

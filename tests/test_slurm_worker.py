@@ -209,6 +209,7 @@ class WorkerPlacementTests(unittest.TestCase):
 
     def test_worker_overrides_submitted_gpu_visibility(self) -> None:
         document = {
+            "root": "/shared/scruffy",
             "job_id": "job-1",
             "argv": ["python", "train.py"],
             "cwd": "/work/job-1",
@@ -216,6 +217,8 @@ class WorkerPlacementTests(unittest.TestCase):
                 "CUDA_VISIBLE_DEVICES": "99",
                 "CUDA_DEVICE_ORDER": "FASTEST_FIRST",
                 "SCRUFFY_JOB_ID": "spoofed-job",
+                "SCRUFFY_ROOT": "/spoofed/root",
+                "SCRUFFY_EVENT_DIR": "/spoofed/events",
                 "SCRUFFY_NODE": "spoofed-node",
                 "USER_SETTING": "kept",
             },
@@ -241,7 +244,11 @@ class WorkerPlacementTests(unittest.TestCase):
         self.assertEqual(["python", "train.py"], argv)
         self.assertEqual("base", environment["BASE_SETTING"])
         self.assertEqual("kept", environment["USER_SETTING"])
+        self.assertEqual("/shared/scruffy", environment["SCRUFFY_ROOT"])
         self.assertEqual("job-1", environment["SCRUFFY_JOB_ID"])
+        self.assertEqual(
+            "/shared/scruffy/reports/job-1", environment["SCRUFFY_EVENT_DIR"]
+        )
         self.assertEqual("gpu-5.cluster", environment["SCRUFFY_NODE"])
         self.assertEqual("PCI_BUS_ID", environment["CUDA_DEVICE_ORDER"])
         self.assertEqual("4,6", environment["CUDA_VISIBLE_DEVICES"])

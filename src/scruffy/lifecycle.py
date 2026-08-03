@@ -73,6 +73,7 @@ def start_job(
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
     worker_document = {
+        "root": str(controller.root),
         "job_id": job["id"],
         "argv": job["argv"],
         "cwd": job["cwd"],
@@ -151,7 +152,7 @@ def request_cancellation(
     controller: Controller, job: dict[str, Any], request_id: str | None = None
 ) -> bool:
     data = {"request_id": request_id} if request_id else None
-    if job["state"] == "queued":
+    if job["state"] in {"queued", "blocked"}:
         job["state"] = "cancelled"
         job["finished_at"] = utc_now()
         job["reason"] = "cancelled_before_start"

@@ -16,9 +16,12 @@ from .client import (
     TERMINAL_STATES,
     cancel_job,
     drain_queue,
+    explain,
     observe,
+    publish_event,
     status,
     submit_job,
+    summary,
     wait_for_job,
 )
 from .controller import run_controller
@@ -57,6 +60,30 @@ def _command(arguments: argparse.Namespace) -> list[str]:
     if not command:
         raise ValueError("submit requires a command after --")
     return command
+
+
+def _needs(values: list[str]) -> list[dict[str, str]]:
+    dependencies: list[dict[str, str]] = []
+    for value in values:
+        task_id, separator, condition = value.rpartition(":")
+        if not separator:
+            task_id, condition = value, "succeeded"
+        elif condition not in {"succeeded", "terminal"}:
+            raise ValueError(
+                "dependency must be TASK_ID, TASK_ID:succeeded, or TASK_ID:terminal"
+            )
+        dependencies.append({"task_id": task_id, "condition": condition})
+    return dependencies
+
+
+def _json_object(value: str, label: str) -> dict[str, Any]:
+    try:
+        result = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return result
 
 
 def _serve(arguments: argparse.Namespace) -> int:
@@ -125,6 +152,9 @@ def _submit(arguments: argparse.Namespace) -> int:
         environment=_environment(arguments.env),
         request=request,
         request_id=arguments.request_id,
+        workflow_id=arguments.workflow_id,
+        task_id=arguments.task_id,
+        needs=_needs(arguments.needs),
     )
     _json(result)
     return 0
@@ -132,6 +162,34 @@ def _submit(arguments: argparse.Namespace) -> int:
 
 def _status(arguments: argparse.Namespace) -> int:
     _json(status(_root(arguments), arguments.job_id))
+    return 0
+
+
+def _summary(arguments: argparse.Namespace) -> int:
+    _json(summary(_root(arguments), limit=arguments.limit))
+    return 0
+
+
+def _explain(arguments: argparse.Namespace) -> int:
+    _json(explain(_root(arguments), arguments.job_id))
+    return 0
+
+
+def _report(arguments: argparse.Namespace) -> int:
+    job_id = arguments.job_id or os.environ.get("SCRUFFY_JOB_ID")
+    if not job_id:
+        raise ValueError("set --job-id or SCRUFFY_JOB_ID")
+    _json(
+        publish_event(
+            _root(arguments),
+            job_id=job_id,
+            kind=arguments.kind,
+            data=_json_object(arguments.data_json, "--data-json"),
+            event_id=arguments.event_id,
+            occurred_at=arguments.occurred_at,
+            source=_environment(arguments.source),
+        )
+    )
     return 0
 
 
@@ -265,12 +323,42 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--cwd")
     submit.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     submit.add_argument("--request-id", help="global idempotency key for this queue")
+    submit.add_argument("--workflow-id", help="workflow namespace for this task")
+    submit.add_argument("--task-id", help="task name, unique within its workflow")
+    submit.add_argument(
+        "--needs",
+        action="append",
+        default=[],
+        metavar="TASK[:CONDITION]",
+        help="dependency condition: succeeded (default) or terminal",
+    )
     submit.add_argument("command", nargs=argparse.REMAINDER)
     submit.set_defaults(handler=_submit)
 
     show = commands.add_parser("status", help="show the queue or one job")
     show.add_argument("job_id", nargs="?")
     show.set_defaults(handler=_status)
+
+    summary_parser = commands.add_parser(
+        "summary", help="show a bounded allocation view for humans and agents"
+    )
+    summary_parser.add_argument("--limit", type=int, default=20)
+    summary_parser.set_defaults(handler=_summary)
+
+    explain_parser = commands.add_parser(
+        "explain", help="explain one job and its dependency states"
+    )
+    explain_parser.add_argument("job_id")
+    explain_parser.set_defaults(handler=_explain)
+
+    report = commands.add_parser("report", help="publish a semantic workload event")
+    report.add_argument("kind")
+    report.add_argument("--job-id", help="defaults to SCRUFFY_JOB_ID")
+    report.add_argument("--event-id", help="stable producer idempotency key")
+    report.add_argument("--occurred-at", help="ISO 8601 producer timestamp")
+    report.add_argument("--source", action="append", default=[], metavar="KEY=VALUE")
+    report.add_argument("--data-json", default="{}", metavar="OBJECT")
+    report.set_defaults(handler=_report)
 
     observe_parser = commands.add_parser("observe", help="snapshot plus events after a cursor")
     observe_parser.add_argument("--after")

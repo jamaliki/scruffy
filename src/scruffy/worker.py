@@ -49,7 +49,13 @@ def execute_assignment(source: Path) -> None:
 
     environment = os.environ.copy()
     environment.update({str(key): str(value) for key, value in document["env"].items()})
-    environment["SCRUFFY_JOB_ID"] = str(document["job_id"])
+    root = str(Path(document["root"]).expanduser().resolve())
+    job_id = str(document["job_id"])
+    # Queue identity is controller-owned. Apply these after submitted values so
+    # a workload cannot redirect reports or impersonate another job.
+    environment["SCRUFFY_ROOT"] = root
+    environment["SCRUFFY_JOB_ID"] = job_id
+    environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
     # Apply this last: jobs submitted through the API cannot choose another slot.
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

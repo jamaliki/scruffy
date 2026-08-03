@@ -1,8 +1,8 @@
 """Durable, shared-filesystem storage primitives.
 
-Clients only create immutable request or command files. The controller is the
-single writer for state and events, which keeps coordination understandable and
-avoids relying on a database on a network filesystem.
+Clients only create immutable request, command, or workload-report files. The
+controller is the single writer for state and events, which keeps coordination
+understandable and avoids relying on a database on a network filesystem.
 """
 
 from __future__ import annotations
@@ -19,8 +19,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import AbstractSet, Any, BinaryIO, Iterator, TextIO
 
+from .protocol import MAX_EVENT_BYTES, validate_event
 
-LAYOUT_DIRECTORIES = ("requests", "commands", "jobs")
+
+LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports")
 
 
 class StorageError(RuntimeError):
@@ -29,6 +31,10 @@ class StorageError(RuntimeError):
 
 class RequestConflict(StorageError):
     """Raised when an idempotency key is reused for a different job."""
+
+
+class ReportConflict(StorageError):
+    """Raised when an event ID is reused for a different workload report."""
 
 
 class ControllerAlreadyRunning(StorageError):
@@ -98,7 +104,7 @@ def read_json(source: Path) -> Any:
     try:
         with source.open(encoding="utf-8") as handle:
             return json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StorageError(f"cannot read {source}: {exc}") from exc
 
 
@@ -187,6 +193,143 @@ def list_requests(
 
 def find_request(root: Path, job_id: str) -> dict[str, Any] | None:
     return _existing_request(ensure_layout(root), job_id)
+
+
+def _canonical_report_identity(report: dict[str, Any]) -> bytes:
+    """Ignore retry time while detecting reuse of one producer event ID."""
+
+    identity = {key: value for key, value in report.items() if key != "occurred_at"}
+    return json.dumps(
+        identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+
+
+def _report_directory(root: Path, job_id: str) -> Path:
+    report_root = ensure_layout(root) / "reports"
+    directory = report_root / job_id
+    try:
+        directory.mkdir()
+    except FileExistsError:
+        if not directory.is_dir():
+            raise StorageError(f"report inbox {directory} is not a directory")
+    else:
+        _fsync_directory(report_root)
+    return directory
+
+
+def submit_report(root: Path, report: dict[str, Any]) -> tuple[str, bool]:
+    """Durably spool one validated producer event, idempotently by event ID."""
+
+    document = validate_event(report)
+    event_id = document["event_id"]
+    directory = _report_directory(root, document["job_id"])
+    digest = hashlib.sha256(event_id.encode()).hexdigest()
+    destination = directory / f"{digest}.json"
+    accepted = directory.parent / ".accepted" / document["job_id"] / destination.name
+
+    # A short per-job lock lets us use the existing write+replace primitive
+    # without a check/replace race between concurrent publishers. Different
+    # jobs never contend with one another.
+    with (directory / ".inbox.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        existing_source = destination if destination.exists() else accepted
+        if existing_source.exists():
+            existing = read_json(existing_source)
+            try:
+                previous = validate_event(existing)
+            except ValueError as exc:
+                raise StorageError(
+                    f"existing report for event {event_id!r} is invalid: {exc}"
+                ) from exc
+            if _canonical_report_identity(previous) != _canonical_report_identity(
+                document
+            ):
+                raise ReportConflict(
+                    f"event ID {event_id!r} was already used for a different report"
+                )
+            return event_id, True
+        atomic_write_json(destination, document)
+        return event_id, False
+
+
+def list_reports(root: Path) -> list[tuple[Path, object | None]]:
+    """List report files without allowing one corrupt file to abort a batch.
+
+    ``None`` is an explicit unreadable/oversized sentinel. The controller can
+    journal a rejection notice and remove that individual file while continuing
+    with the rest of the inbox.
+    """
+
+    return [
+        item
+        for _, reports in report_streams(root)
+        for item in reports
+    ]
+
+
+def _report_stream(directory: Path) -> Iterator[tuple[Path, object | None]]:
+    """Lazily decode one job's inbox so controller work can stay bounded."""
+
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.name.startswith(".") or not entry.name.endswith(".json"):
+                continue
+            source = Path(entry.path)
+            try:
+                if not entry.is_file():
+                    continue
+                document = (
+                    read_json(source)
+                    if entry.stat().st_size <= MAX_EVENT_BYTES
+                    else None
+                )
+            except (OSError, StorageError):
+                document = None
+            yield source, document
+
+
+def report_streams(
+    root: Path,
+) -> list[tuple[str, Iterator[tuple[Path, object | None]]]]:
+    """Return one lazy report iterator per visible job inbox."""
+
+    report_root = ensure_layout(root) / "reports"
+    return [
+        (directory.name, _report_stream(directory))
+        for directory in sorted(report_root.iterdir())
+        if not directory.name.startswith(".") and directory.is_dir()
+    ]
+
+
+def remove_report(source: Path) -> None:
+    """Acknowledge a report while retaining its durable idempotency receipt."""
+
+    directory = source.parent
+    accepted_root = directory.parent / ".accepted"
+    accepted_directory = accepted_root / directory.name
+    with (directory / ".inbox.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not source.exists():
+            return
+        try:
+            accepted_root.mkdir()
+        except FileExistsError:
+            pass
+        else:
+            _fsync_directory(accepted_root.parent)
+        try:
+            accepted_directory.mkdir()
+        except FileExistsError:
+            pass
+        else:
+            _fsync_directory(accepted_root)
+        destination = accepted_directory / source.name
+        if destination.exists():
+            source.unlink()
+        else:
+            os.replace(source, destination)
+            _fsync_directory(accepted_directory)
+        _fsync_directory(directory)
 
 
 def submit_command(root: Path, command: dict[str, Any]) -> str:

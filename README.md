@@ -39,6 +39,8 @@ many readers <- atomic snapshot + broadcast journal  <- across allocated nodes
 - Raw logs are stored once. The journal contains ordered lifecycle events and
   output-range references, so independent readers can replay it without
   consuming messages from one another.
+- Jobs can publish bounded semantic progress into the same journal, while
+  dependency metadata turns independently submitted jobs into simple workflows.
 
 ## Install
 
@@ -114,6 +116,8 @@ result = submit_job(
     environment={},
     request=ResourceRequest(1, 1, 14, 128),
     request_id="agent-a/train-001",
+    workflow_id="experiment-7",
+    task_id="train",
 )
 ```
 
@@ -128,6 +132,67 @@ scruffy --root "$SCRUFFY_ROOT" submit \
 
 The same command runs once on every selected node. Slurm provides rank and node
 environment variables; distributed launch recipes remain application-owned.
+
+## Chain jobs without waiting
+
+Tasks are still independent, durable submissions. A task can name upstream
+tasks in the same workflow and return immediately, even when those tasks have
+not been submitted yet:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" submit \
+  --workflow-id experiment-7 --task-id infer \
+  --needs train:succeeded -- python infer.py
+
+scruffy --root "$SCRUFFY_ROOT" submit \
+  --workflow-id experiment-7 --task-id train -- python train.py
+```
+
+`succeeded` runs the dependent only after a successful upstream result;
+`terminal` runs it after any terminal result. Missing dependencies remain
+visibly `blocked`. An unsatisfied `succeeded` edge makes the dependent `skipped`,
+and duplicate task IDs, self-dependencies, and cycles are rejected. Task IDs are
+unique only within a workflow, so multiple agents can safely use separate
+workflow namespaces.
+
+Use `scruffy explain JOB_ID` to see the resolved upstream job IDs and current
+blockers. Python callers pass `workflow_id`, `task_id`, and a `needs` sequence of
+`{"task_id": ..., "condition": "succeeded" | "terminal"}` objects to
+`submit_job`.
+
+## Publish semantic workload progress
+
+Workers receive reserved `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`,
+and `SCRUFFY_NODE` environment variables. They can durably publish a small
+semantic update without talking to the controller process:
+
+```bash
+scruffy report workload.progress \
+  --event-id train/step-12000 \
+  --source name=my-trainer \
+  --data-json '{"phase":"training","step":12000,"metrics":{"loss":1.42}}'
+```
+
+```python
+from pathlib import Path
+from scruffy import publish_event
+
+publish_event(
+    Path("/shared/runs/scruffy"),
+    job_id="job-...",
+    event_id="train/step-12000",
+    kind="workload.progress",
+    source={"name": "my-trainer"},
+    data={"phase": "training", "step": 12000, "metrics": {"loss": 1.42}},
+)
+```
+
+The public kinds are `workload.phase`, `workload.progress`,
+`workload.milestone`, `workload.artifact`, and `workload.notice`. Events are
+finite JSON objects capped at 64 KiB. Producer IDs are idempotent within a job;
+raw logs, full metric histories, configs, and checkpoint bytes belong elsewhere.
+Reports update only the bounded `job.workload` view and can never change queue
+lifecycle or GPU ownership. See [the v1 event contract](docs/events-v1.md).
 
 ## Observe from many agents
 
@@ -144,12 +209,18 @@ text.
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" status
+scruffy --root "$SCRUFFY_ROOT" summary --limit 20
+scruffy --root "$SCRUFFY_ROOT" explain JOB_ID
 scruffy --root "$SCRUFFY_ROOT" watch --follow --output
 scruffy --root "$SCRUFFY_ROOT" logs JOB_ID --tail 200 --follow
 scruffy --root "$SCRUFFY_ROOT" wait JOB_ID
 scruffy --root "$SCRUFFY_ROOT" cancel JOB_ID
 scruffy --root "$SCRUFFY_ROOT" drain
 ```
+
+`summary` includes durable submissions immediately, even before a controller
+has admitted them into its snapshot. This lets one agent submit while another
+orients itself without a synchronization handshake.
 
 Cancellation is also asynchronous. A cancelling job retains its resources until
 the local `srun` client has exited, both output streams have closed, and a fresh
@@ -174,7 +245,8 @@ resulting or ignored event, so concurrent agents can correlate their commands.
   refuses any restart with unresolved work because it cannot prove old children
   are gone.
 - Terminal states are `succeeded`, `failed`, `cancelled`, `lost`, and `rejected`.
-  Agents never need to infer failure from stderr.
+  Dependency failure also produces terminal `skipped`. Agents never need to
+  infer failure from stderr.
 
 ## State on disk
 
@@ -182,6 +254,8 @@ resulting or ignored event, so concurrent agents can correlate their commands.
 ROOT/
   requests/<job-id>/spec.json
   commands/<request-id>.json
+  reports/<job-id>/<event-id-hash>.json
+  reports/.accepted/<job-id>/<event-id-hash>.json
   jobs/<job-id>/assignment.json
   jobs/<job-id>/stdout.log
   jobs/<job-id>/stderr.log
@@ -190,8 +264,9 @@ ROOT/
   controller.lock
 ```
 
-Clients only create immutable requests and commands. The controller alone writes
-state and assigns the globally ordered event sequence.
+Clients only create immutable requests, commands, and workload reports. The
+controller alone writes state and assigns the globally ordered event sequence.
+Accepted report receipts retain per-job idempotency for the queue's lifetime.
 
 The queue directory is trusted shared state. Job argv, working directories, and
 environment overrides are stored there in plaintext and appear in snapshots and

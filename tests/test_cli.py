@@ -63,6 +63,80 @@ class SubmitCliTests(unittest.TestCase):
                 memory_gb_per_node=384,
             ),
             request_id="agent-a/run-1",
+            workflow_id=None,
+            task_id=None,
+            needs=[],
+        )
+
+    def test_submit_parses_workflow_dependencies(self) -> None:
+        response = {"job_id": "job-infer", "state": "submitted"}
+        with (
+            mock.patch("scruffy.cli.submit_job", return_value=response) as submit,
+            mock.patch("scruffy.cli._json"),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "submit",
+                    "--workflow-id",
+                    "run-7",
+                    "--task-id",
+                    "infer",
+                    "--needs",
+                    "train",
+                    "--needs",
+                    "evaluate:terminal",
+                    "--",
+                    "true",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual("run-7", submit.call_args.kwargs["workflow_id"])
+        self.assertEqual("infer", submit.call_args.kwargs["task_id"])
+        self.assertEqual(
+            [
+                {"task_id": "train", "condition": "succeeded"},
+                {"task_id": "evaluate", "condition": "terminal"},
+            ],
+            submit.call_args.kwargs["needs"],
+        )
+
+    def test_report_uses_worker_identity_and_parses_json(self) -> None:
+        response = {"event_id": "event-1", "state": "spooled"}
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"SCRUFFY_JOB_ID": "job-1", "SCRUFFY_ROOT": str(self.root)},
+                clear=True,
+            ),
+            mock.patch("scruffy.cli.publish_event", return_value=response) as publish,
+            mock.patch("scruffy.cli._json") as print_json,
+        ):
+            result = main(
+                [
+                    "report",
+                    "workload.progress",
+                    "--event-id",
+                    "progress-4",
+                    "--source",
+                    "name=trainer",
+                    "--data-json",
+                    '{"step":4,"loss":0.25}',
+                ]
+            )
+
+        self.assertEqual(0, result)
+        print_json.assert_called_once_with(response)
+        publish.assert_called_once_with(
+            self.root,
+            job_id="job-1",
+            kind="workload.progress",
+            data={"step": 4, "loss": 0.25},
+            event_id="progress-4",
+            occurred_at=None,
+            source={"name": "trainer"},
         )
 
     def test_submit_requires_a_command(self) -> None:

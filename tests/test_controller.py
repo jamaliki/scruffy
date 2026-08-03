@@ -12,7 +12,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from scruffy.client import cancel_job, drain_queue, status, submit_job, wait_for_job
+from scruffy.client import (
+    cancel_job,
+    drain_queue,
+    publish_event,
+    status,
+    submit_job,
+    wait_for_job,
+)
 from scruffy.controller import run_controller
 from scruffy.models import NodeInventory, ResourceRequest
 from scruffy.storage import read_events
@@ -128,6 +135,9 @@ class ControllerIntegrationTests(unittest.TestCase):
         code: str,
         *,
         environment: dict[str, str] | None = None,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+        needs: tuple[dict[str, str], ...] = (),
     ) -> str:
         response = submit_job(
             self.root,
@@ -137,10 +147,166 @@ class ControllerIntegrationTests(unittest.TestCase):
             environment=environment or {},
             request=REQUEST,
             request_id=f"test/{name}",
+            workflow_id=workflow_id,
+            task_id=task_id,
+            needs=needs,
         )
         self.assertEqual("submitted", response["state"])
         self.assertFalse(response["deduplicated"])
         return str(response["job_id"])
+
+    def test_dependencies_block_release_and_skip_without_waiting_to_submit(self) -> None:
+        self._start_controller((0,))
+        release = self.workspace / "release-dependency"
+        child_id = self._submit(
+            "workflow-child",
+            "print('dependent ran')",
+            workflow_id="workflow-success",
+            task_id="infer",
+            needs=({"task_id": "train", "condition": "succeeded"},),
+        )
+        missing = self._wait_for_state(child_id, "blocked")
+        self.assertEqual("dependency_missing", missing["blockers"][0]["reason"])
+        root_id = self._submit(
+            "workflow-root",
+            "import os, time; from pathlib import Path; "
+            "release=Path(os.environ['RELEASE']); "
+            "exec(\"while not release.exists():\\n time.sleep(0.01)\")",
+            environment={"RELEASE": str(release)},
+            workflow_id="workflow-success",
+            task_id="train",
+        )
+
+        self._wait_for_state(root_id, "running")
+        blocked = self._wait_for_state(child_id, "blocked")
+        self.assertEqual("train", blocked["blockers"][0]["task_id"])
+        release.write_text("go")
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, root_id, timeout=TIMEOUT)["state"]
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, child_id, timeout=TIMEOUT)["state"]
+        )
+
+        failed_id = self._submit(
+            "workflow-fails",
+            "raise SystemExit(3)",
+            workflow_id="workflow-failure",
+            task_id="train",
+        )
+        skipped_id = self._submit(
+            "workflow-skipped",
+            "raise RuntimeError('must not run')",
+            workflow_id="workflow-failure",
+            task_id="infer",
+            needs=({"task_id": "train", "condition": "succeeded"},),
+        )
+        cleanup_id = self._submit(
+            "workflow-cleanup",
+            "print('cleanup ran')",
+            workflow_id="workflow-failure",
+            task_id="cleanup",
+            needs=({"task_id": "train", "condition": "terminal"},),
+        )
+
+        self.assertEqual(
+            "failed", wait_for_job(self.root, failed_id, timeout=TIMEOUT)["state"]
+        )
+        skipped = wait_for_job(self.root, skipped_id, timeout=TIMEOUT)
+        self.assertEqual(
+            ("skipped", "dependency_unsatisfied"),
+            (skipped["state"], skipped["reason"]),
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, cleanup_id, timeout=TIMEOUT)["state"]
+        )
+
+    def test_workload_reports_are_projected_and_broadcast_once(self) -> None:
+        self._start_controller((0,))
+        release = self.workspace / "release-report"
+        job_id = self._submit(
+            "reporting",
+            "import os, time; from pathlib import Path; "
+            "release=Path(os.environ['RELEASE']); "
+            "exec(\"while not release.exists():\\n time.sleep(0.01)\")",
+            environment={"RELEASE": str(release)},
+        )
+        self._wait_for_state(job_id, "running")
+        response = publish_event(
+            self.root,
+            job_id=job_id,
+            event_id="koochak-progress-1",
+            kind="workload.progress",
+            data={
+                "phase": "training",
+                "completed": 12,
+                "total": 20,
+                "unit": "steps",
+                "metrics": {"loss": 1.25},
+            },
+            source={"name": "koochak", "node": "local-node"},
+        )
+        self.assertEqual("spooled", response["state"])
+
+        projected = self._wait_until(
+            lambda: (
+                job
+                if (job := status(self.root, job_id)).get("workload", {})
+                .get("progress", {})
+                .get("completed")
+                == 12
+                else None
+            ),
+            "workload progress projection",
+        )
+        self.assertEqual("training", projected["workload"]["phase"])
+        retry = publish_event(
+            self.root,
+            job_id=job_id,
+            event_id="koochak-progress-1",
+            kind="workload.progress",
+            data={
+                "phase": "training",
+                "completed": 12,
+                "total": 20,
+                "unit": "steps",
+                "metrics": {"loss": 1.25},
+            },
+            source={"name": "koochak", "node": "local-node"},
+        )
+        self.assertTrue(retry["deduplicated"])
+        events = [
+            event
+            for event in read_events(self.root)
+            if event.get("source_event_id") == "koochak-progress-1"
+        ]
+        self.assertEqual(1, len(events))
+        self.assertEqual("workload.progress", events[0]["kind"])
+        publish_event(
+            self.root,
+            job_id=job_id,
+            event_id="empty-notice",
+            kind="workload.notice",
+            data={},
+            source={},
+        )
+        empty = self._wait_until(
+            lambda: next(
+                (
+                    event
+                    for event in read_events(self.root)
+                    if event.get("source_event_id") == "empty-notice"
+                ),
+                None,
+            ),
+            "empty workload envelope",
+        )
+        self.assertEqual({}, empty["data"])
+        self.assertEqual({}, empty["source"])
+        release.write_text("go")
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, job_id, timeout=TIMEOUT)["state"]
+        )
 
     def test_async_success_and_failure_emit_output_before_terminal(self) -> None:
         self._start_controller((0, 1))

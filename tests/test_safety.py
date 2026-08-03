@@ -7,8 +7,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy.client import cancel_job, submit_job
-from scruffy.controller import _ingest_commands, _ingest_requests, _initialize_controller
+from scruffy.client import cancel_job, publish_event, submit_job
+from scruffy.controller import (
+    _discard_journaled_commands,
+    _discard_journaled_reports,
+    _ingest_commands,
+    _ingest_requests,
+    _initialize_controller,
+    _refresh_dependencies,
+    _report_batch,
+)
 from scruffy.lifecycle import drain_messages, poll_processes, start_job
 from scruffy.models import (
     Assignment,
@@ -23,9 +31,11 @@ from scruffy.state import load_recovered_state
 from scruffy.storage import (
     append_event,
     list_commands,
+    list_reports,
     open_journal,
     queue_id,
     read_events,
+    submit_command,
     utc_now,
     write_state,
 )
@@ -259,6 +269,192 @@ class LaunchCleanupTests(unittest.TestCase):
 
 
 class AsyncCommandRaceTests(unittest.TestCase):
+    def test_dependency_refresh_reaches_a_fixed_point_in_one_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            controller.state["jobs"] = {
+                "grandchild": {
+                    "id": "grandchild",
+                    "state": "blocked",
+                    "workflow_id": "flow",
+                    "task_id": "grandchild",
+                    "needs": [{"task_id": "child", "condition": "terminal"}],
+                    "blockers": [],
+                },
+                "child": {
+                    "id": "child",
+                    "state": "blocked",
+                    "workflow_id": "flow",
+                    "task_id": "child",
+                    "needs": [{"task_id": "root", "condition": "succeeded"}],
+                    "blockers": [],
+                },
+                "root": {
+                    "id": "root",
+                    "state": "failed",
+                    "workflow_id": "flow",
+                    "task_id": "root",
+                    "needs": [],
+                },
+            }
+
+            _refresh_dependencies(controller)
+
+            self.assertEqual("skipped", controller.state["jobs"]["child"]["state"])
+            self.assertEqual("queued", controller.state["jobs"]["grandchild"]["state"])
+
+    def test_batch_admission_never_snapshots_undecided_later_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            for request_id in ("batch-a", "batch-b"):
+                submit_job(
+                    root,
+                    argv=["true"],
+                    name=request_id,
+                    cwd=Path.cwd(),
+                    environment={},
+                    request=REQUEST,
+                    request_id=request_id,
+                )
+
+            visible_jobs: list[set[str]] = []
+
+            def record_emit(
+                observed: Controller, _kind: str, **_kwargs: object
+            ) -> dict[str, object]:
+                visible_jobs.append(set(observed.state["jobs"]))
+                return {}
+
+            with mock.patch("scruffy.controller.emit", side_effect=record_emit):
+                _ingest_requests(controller)
+
+            self.assertEqual([1, 2], [len(job_ids) for job_ids in visible_jobs])
+
+    def test_report_recovery_keys_idempotency_by_job_and_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            for job_id in ("job-a", "job-b"):
+                publish_event(
+                    root,
+                    job_id=job_id,
+                    event_id="step-1",
+                    kind="workload.progress",
+                    data={"step": 1},
+                )
+            append_event(
+                controller.journal,
+                {
+                    "seq": controller.state["last_seq"] + 1,
+                    "kind": "workload.progress",
+                    "job_id": "job-a",
+                    "source_event_id": "step-1",
+                },
+                sync=True,
+            )
+
+            _discard_journaled_reports(controller)
+
+            pending = [document for _, document in list_reports(root)]
+            self.assertEqual(["job-b"], [document["job_id"] for document in pending])
+
+    def test_report_batch_round_robins_across_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            for event_id in ("a-1", "a-2", "a-3"):
+                publish_event(
+                    root,
+                    job_id="job-a",
+                    event_id=event_id,
+                    kind="workload.progress",
+                    data={"event": event_id},
+                )
+            publish_event(
+                root,
+                job_id="job-b",
+                event_id="b-1",
+                kind="workload.progress",
+                data={"event": "b-1"},
+            )
+
+            batch = _report_batch(controller, 2)
+
+            self.assertEqual({"job-a", "job-b"}, {item[0].parent.name for item in batch})
+
+    def test_command_recovery_discards_a_durably_journaled_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            request_id = submit_command(
+                root,
+                {
+                    "kind": "cancel",
+                    "job_id": "job-done",
+                    "request_id": "cancel-1",
+                },
+            )
+            append_event(
+                controller.journal,
+                {
+                    "seq": controller.state["last_seq"] + 1,
+                    "kind": "job.cancel_ignored",
+                    "data": {"request_id": request_id, "job_id": "job-done"},
+                },
+                sync=True,
+            )
+
+            _discard_journaled_commands(controller)
+
+            self.assertEqual([], list_commands(root))
+
     def test_cancel_waits_for_a_durable_request_not_yet_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "queue"
