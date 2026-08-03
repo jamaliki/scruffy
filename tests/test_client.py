@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy import publish_event as public_publish_event
+from scruffy import ConflictError, publish_event as public_publish_event
 from scruffy.client import explain, observe, publish_event, status, submit_job, summary
 from scruffy.models import ResourceRequest
 from scruffy.protocol import ProtocolError
@@ -112,6 +112,13 @@ class ObserveTests(unittest.TestCase):
 
         self.assertEqual("submitted", response["state"])
         self.assertEqual("submitted", status(self.root, response["job_id"])["state"])
+        self.assertEqual(
+            "submitted", status(self.root)["jobs"][response["job_id"]]["state"]
+        )
+        self.assertEqual(
+            "submitted",
+            observe(self.root)["snapshot"]["jobs"][response["job_id"]]["state"],
+        )
 
     def test_submit_persists_validated_workflow_metadata(self) -> None:
         response = submit_job(
@@ -134,7 +141,7 @@ class ObserveTests(unittest.TestCase):
             [{"task_id": "train", "condition": "succeeded"}],
             submitted["needs"],
         )
-        with self.assertRaisesRegex(ValueError, "provided together"):
+        with self.assertRaisesRegex(ValueError, "provide.*together"):
             submit_job(
                 self.root,
                 argv=["true"],
@@ -216,6 +223,15 @@ class ObserveTests(unittest.TestCase):
         )
         self.assertTrue(retried["deduplicated"])
         self.assertEqual(1, len(list_reports(self.root)))
+        with self.assertRaises(ConflictError):
+            publish_event(
+                self.root,
+                job_id="job-reporter",
+                event_id="koochak/step-7",
+                kind="workload.progress",
+                data={"step": 7, "loss": 0.4},
+                source={"name": "koochak", "node": "gpu-3"},
+            )
 
     def test_publish_event_defaults_source_and_validates_before_writing(self) -> None:
         response = publish_event(

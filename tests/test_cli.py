@@ -300,8 +300,8 @@ class ServeCliTests(unittest.TestCase):
         self.assertEqual("scruffy: unsafe active jobs\n", stderr.getvalue())
 
 
-class WatchCliTests(unittest.TestCase):
-    def test_watch_flushes_the_initial_snapshot(self) -> None:
+class ObserveFollowCliTests(unittest.TestCase):
+    def test_follow_flushes_the_initial_snapshot(self) -> None:
         response = {
             "snapshot": {"allocation": None, "jobs": {}},
             "events": [],
@@ -309,11 +309,11 @@ class WatchCliTests(unittest.TestCase):
         }
         with (
             mock.patch("scruffy.cli.observe", return_value=response),
-            mock.patch("builtins.print") as print_output,
+            mock.patch("builtins.print", side_effect=KeyboardInterrupt) as print_output,
         ):
-            result = main(["--root", "/tmp/scruffy-test", "watch"])
+            result = main(["--root", "/tmp/scruffy-test", "observe", "--follow"])
 
-        self.assertEqual(0, result)
+        self.assertEqual(130, result)
         print_output.assert_called_once_with(
             '{"kind": "snapshot", "data": {"allocation": null, "jobs": {}}}',
             flush=True,

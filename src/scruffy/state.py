@@ -7,9 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import Assignment, NodeInventory, ResourceRequest
+from .models import ACTIVE_JOB_STATES, Assignment, NodeInventory, ResourceRequest
 from .runtime import Controller
-from .scheduler import assert_invariants
+from .scheduler import available_resources
 from .storage import (
     append_event,
     journal_tail,
@@ -19,17 +19,6 @@ from .storage import (
     utc_now,
     write_state,
 )
-
-
-ACTIVE_STATES = {"starting", "running", "cancelling", "finishing"}
-TERMINAL_STATES = {
-    "succeeded",
-    "failed",
-    "cancelled",
-    "lost",
-    "rejected",
-    "skipped",
-}
 
 
 def _event_key(occurred_at: str, event_id: str) -> tuple[datetime, str]:
@@ -192,7 +181,7 @@ def active_assignments(state: dict[str, Any]) -> tuple[Assignment, ...]:
     return tuple(
         Assignment.from_dict(job["assignment"])
         for job in state["jobs"].values()
-        if job["state"] in ACTIVE_STATES and job.get("assignment") is not None
+        if job["state"] in ACTIVE_JOB_STATES and job.get("assignment") is not None
     )
 
 
@@ -202,14 +191,16 @@ def refresh_nodes(
     """Rebuild the public per-node ledger from active assignments."""
 
     assignments = active_assignments(state)
-    assert_invariants(inventory, assignments)
+    free_by_node = {
+        item.name: item for item in available_resources(inventory, assignments)
+    }
     nodes = {
         item.name: {
             "capacity": item.to_dict(),
             "free": {
-                "gpu_ids": list(item.gpu_ids),
-                "cpus": item.cpus,
-                "memory_gb": item.memory_gb,
+                "gpu_ids": list(free_by_node[item.name].gpu_ids),
+                "cpus": free_by_node[item.name].cpus,
+                "memory_gb": free_by_node[item.name].memory_gb,
             },
             "assignments": {},
         }
@@ -218,14 +209,6 @@ def refresh_nodes(
     for assignment in assignments:
         for reservation in assignment.reservations:
             node = nodes[reservation.node]
-            free = node["free"]
-            free["gpu_ids"] = [
-                gpu_id
-                for gpu_id in free["gpu_ids"]
-                if gpu_id not in reservation.gpu_ids
-            ]
-            free["cpus"] -= reservation.cpus
-            free["memory_gb"] -= reservation.memory_gb
             node["assignments"][assignment.job_id] = reservation.to_dict()
     state["nodes"] = nodes
     state["updated_at"] = utc_now()

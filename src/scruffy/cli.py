@@ -13,7 +13,6 @@ from typing import Any
 
 from . import __version__
 from .client import (
-    TERMINAL_STATES,
     cancel_job,
     drain_queue,
     explain,
@@ -25,9 +24,10 @@ from .client import (
     wait_for_job,
 )
 from .controller import run_controller
-from .models import ResourceRequest
+from .models import ResourceRequest, TERMINAL_JOB_STATES
+from .protocol import EVENT_KINDS
 from .slurm import discover_slurm_inventory, load_inventory
-from .storage import RequestConflict, StorageError, tail_bytes
+from .storage import StorageError, tail_bytes
 
 
 def _json(value: Any) -> None:
@@ -194,27 +194,29 @@ def _report(arguments: argparse.Namespace) -> int:
 
 
 def _observe(arguments: argparse.Namespace) -> int:
-    _json(
-        observe(
-            _root(arguments),
-            after=arguments.after,
-            wait_seconds=arguments.wait,
-            include_output=arguments.output,
-            limit=arguments.limit,
-        )
-    )
-    return 0
-
-
-def _watch(arguments: argparse.Namespace) -> int:
     root = _root(arguments)
+    wait_seconds = arguments.wait
+    if wait_seconds is None:
+        wait_seconds = 30 if arguments.follow else 0
+    if not arguments.follow:
+        _json(
+            observe(
+                root,
+                after=arguments.after,
+                wait_seconds=wait_seconds,
+                include_output=arguments.output,
+                limit=arguments.limit,
+            )
+        )
+        return 0
+
     cursor = arguments.after
     first = True
     while True:
         response = observe(
             root,
             after=cursor,
-            wait_seconds=arguments.wait,
+            wait_seconds=wait_seconds,
             include_output=arguments.output,
             limit=arguments.limit,
         )
@@ -227,8 +229,6 @@ def _watch(arguments: argparse.Namespace) -> int:
         for event in response["events"]:
             print(json.dumps(event, sort_keys=True), flush=True)
         cursor = response["next_cursor"]
-        if not arguments.follow:
-            return 0
 
 
 def _logs(arguments: argparse.Namespace) -> int:
@@ -259,7 +259,7 @@ def _logs(arguments: argparse.Namespace) -> int:
                 sys.stdout.buffer.write(data)
                 sys.stdout.buffer.flush()
         job = status(root, arguments.job_id)
-        if job["state"] in TERMINAL_STATES:
+        if job["state"] in TERMINAL_JOB_STATES:
             return 0
         time.sleep(0.2)
 
@@ -285,6 +285,8 @@ def _drain(arguments: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the public CLI and its concise operational help."""
+
     parser = argparse.ArgumentParser(
         prog="scruffy",
         description="A small GPU queue inside a multi-node Slurm allocation.",
@@ -293,35 +295,87 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="subcommand", required=True)
 
-    serve = commands.add_parser("serve", help="run the allocation controller")
-    serve.add_argument("--inventory", help="explicit JSON inventory")
-    serve.add_argument("--launcher", choices=("auto", "local", "slurm"), default="auto")
-    serve.add_argument("--allocation-id")
-    serve.add_argument("--slurm-job-id")
+    serve = commands.add_parser(
+        "serve",
+        help="run the allocation controller",
+        description="Run the single controller for an allocation.",
+    )
+    serve.add_argument("--inventory", help="explicit JSON inventory file")
+    serve.add_argument(
+        "--launcher",
+        choices=("auto", "local", "slurm"),
+        default="auto",
+        help="worker launcher (default: auto)",
+    )
+    serve.add_argument("--allocation-id", help="controller allocation identity")
+    serve.add_argument("--slurm-job-id", help="outer Slurm allocation job ID")
     serve.add_argument(
         "--gpus-per-node",
         type=int,
         help="full-node GPU count for automatic IDs 0..N-1",
     )
-    serve.add_argument("--cpus-per-node", type=int, default=112)
-    serve.add_argument("--memory-gb-per-node", type=int, default=1024)
-    serve.add_argument("--poll-interval", type=float, default=0.2)
+    serve.add_argument(
+        "--cpus-per-node",
+        type=int,
+        default=112,
+        help="managed CPU budget per node (default: 112)",
+    )
+    serve.add_argument(
+        "--memory-gb-per-node",
+        type=int,
+        default=1024,
+        help="managed memory budget per node (default: 1024)",
+    )
+    serve.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.2,
+        help="controller poll seconds (default: 0.2)",
+    )
     serve.add_argument(
         "--cancel-grace",
         type=float,
         default=30,
-        help="seconds before SIGKILL in local test mode (Slurm uses scancel)",
+        help="local seconds before SIGKILL; Slurm uses scancel (default: 30)",
     )
     serve.set_defaults(handler=_serve)
 
-    submit = commands.add_parser("submit", help="enqueue without waiting for resources")
-    submit.add_argument("--name")
-    submit.add_argument("--nodes", type=int, default=1)
-    submit.add_argument("--gpus-per-node", type=int, default=1)
-    submit.add_argument("--cpus-per-node", type=int)
-    submit.add_argument("--memory-gb-per-node", type=int)
-    submit.add_argument("--cwd")
-    submit.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    submit = commands.add_parser(
+        "submit",
+        help="enqueue without waiting for resources",
+        description=(
+            "Durably enqueue COMMAND and return immediately. Put COMMAND after --."
+        ),
+    )
+    submit.add_argument("--name", help="display name; defaults to command name")
+    submit.add_argument(
+        "--nodes",
+        type=int,
+        default=1,
+        help="nodes requested atomically (default: 1)",
+    )
+    submit.add_argument(
+        "--gpus-per-node",
+        type=int,
+        default=1,
+        help="GPUs required on every node (default: 1)",
+    )
+    submit.add_argument(
+        "--cpus-per-node", type=int, help="default: 14 times --gpus-per-node"
+    )
+    submit.add_argument(
+        "--memory-gb-per-node",
+        type=int,
+        help="default: 128 times --gpus-per-node",
+    )
+    submit.add_argument("--cwd", help="worker directory; defaults to current directory")
+    submit.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="worker override",
+    )
     submit.add_argument("--request-id", help="global idempotency key for this queue")
     submit.add_argument("--workflow-id", help="workflow namespace for this task")
     submit.add_argument("--task-id", help="task name, unique within its workflow")
@@ -332,75 +386,121 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TASK[:CONDITION]",
         help="dependency condition: succeeded (default) or terminal",
     )
-    submit.add_argument("command", nargs=argparse.REMAINDER)
+    submit.add_argument("command", nargs=argparse.REMAINDER, help="argv to execute")
     submit.set_defaults(handler=_submit)
 
     show = commands.add_parser("status", help="show the queue or one job")
-    show.add_argument("job_id", nargs="?")
+    show.add_argument("job_id", nargs="?", help="omit for the complete queue")
     show.set_defaults(handler=_status)
 
     summary_parser = commands.add_parser(
-        "summary", help="show a bounded allocation view for humans and agents"
+        "summary",
+        help="show a bounded allocation view for humans and agents",
     )
-    summary_parser.add_argument("--limit", type=int, default=20)
+    summary_parser.add_argument(
+        "--limit", type=int, default=20, help="jobs per section (default: 20)"
+    )
     summary_parser.set_defaults(handler=_summary)
 
     explain_parser = commands.add_parser(
-        "explain", help="explain one job and its dependency states"
+        "explain",
+        help="explain one job and its dependency states",
     )
-    explain_parser.add_argument("job_id")
+    explain_parser.add_argument("job_id", help="job to explain")
     explain_parser.set_defaults(handler=_explain)
 
     report = commands.add_parser("report", help="publish a semantic workload event")
-    report.add_argument("kind")
+    report.add_argument("kind", choices=sorted(EVENT_KINDS))
     report.add_argument("--job-id", help="defaults to SCRUFFY_JOB_ID")
     report.add_argument("--event-id", help="stable producer idempotency key")
     report.add_argument("--occurred-at", help="ISO 8601 producer timestamp")
-    report.add_argument("--source", action="append", default=[], metavar="KEY=VALUE")
-    report.add_argument("--data-json", default="{}", metavar="OBJECT")
+    report.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="producer metadata",
+    )
+    report.add_argument(
+        "--data-json",
+        default="{}",
+        metavar="OBJECT",
+        help="bounded event payload (default: {})",
+    )
     report.set_defaults(handler=_report)
 
-    observe_parser = commands.add_parser("observe", help="snapshot plus events after a cursor")
-    observe_parser.add_argument("--after")
-    observe_parser.add_argument("--wait", type=float, default=0)
-    observe_parser.add_argument("--limit", type=int, default=1000)
-    observe_parser.add_argument("--output", action="store_true")
+    observe_parser = commands.add_parser(
+        "observe",
+        help="read or follow the shared allocation event stream",
+        description=(
+            "Return a snapshot and one event page. Without --after, start at the "
+            "current tail. --follow emits snapshot/event JSON lines continuously."
+        ),
+    )
+    observe_parser.add_argument(
+        "--after", help="opaque cursor returned by a prior call"
+    )
+    observe_parser.add_argument(
+        "--wait",
+        type=float,
+        help="long-poll seconds; defaults to 0, or 30 with --follow",
+    )
+    observe_parser.add_argument(
+        "--limit", type=int, default=1000, help="events per page (default: 1000)"
+    )
+    observe_parser.add_argument(
+        "--output", action="store_true", help="expand job.output references into text"
+    )
+    observe_parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="emit snapshot/event JSON lines continuously",
+    )
     observe_parser.set_defaults(handler=_observe)
 
-    watch = commands.add_parser("watch", help="stream the allocation event journal")
-    watch.add_argument("--after")
-    watch.add_argument("--wait", type=float, default=30)
-    watch.add_argument("--limit", type=int, default=1000)
-    watch.add_argument("--output", action="store_true")
-    watch.add_argument("--follow", action="store_true")
-    watch.set_defaults(handler=_watch)
-
     logs = commands.add_parser("logs", help="read a job's raw output")
-    logs.add_argument("job_id")
-    logs.add_argument("--stream", choices=("stdout", "stderr"))
-    logs.add_argument("--tail", type=int, default=200)
-    logs.add_argument("--follow", action="store_true")
+    logs.add_argument("job_id", help="job whose logs to read")
+    logs.add_argument(
+        "--stream", choices=("stdout", "stderr"), help="select one stream"
+    )
+    logs.add_argument(
+        "--tail", type=int, default=200, help="final lines per stream (default: 200)"
+    )
+    logs.add_argument(
+        "--follow", action="store_true", help="follow until the job is terminal"
+    )
     logs.set_defaults(handler=_logs)
 
     wait = commands.add_parser("wait", help="wait for one terminal job state")
-    wait.add_argument("job_id")
-    wait.add_argument("--timeout", type=float)
+    wait.add_argument("job_id", help="job to wait for")
+    wait.add_argument("--timeout", type=float, help="maximum seconds to wait")
     wait.set_defaults(handler=_wait)
 
     cancel = commands.add_parser("cancel", help="asynchronously request cancellation")
-    cancel.add_argument("job_id")
+    cancel.add_argument("job_id", help="job to cancel")
     cancel.set_defaults(handler=_cancel)
 
-    drain = commands.add_parser("drain", help="stop launching queued jobs")
+    drain = commands.add_parser(
+        "drain",
+        help="disable launches until controller restart",
+        description=(
+            "Disable new launches until this controller is restarted; "
+            "running jobs continue."
+        ),
+    )
     drain.set_defaults(handler=_drain)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the Scruffy command-line client."""
+
     parser = build_parser()
     arguments = parser.parse_args(argv)
     try:
         return int(arguments.handler(arguments))
-    except (KeyError, RequestConflict, StorageError, TimeoutError, ValueError) as exc:
+    except KeyboardInterrupt:
+        return 130
+    except (KeyError, StorageError, TimeoutError, ValueError) as exc:
         print(f"scruffy: {exc}", file=sys.stderr)
         return 2

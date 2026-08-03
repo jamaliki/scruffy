@@ -6,17 +6,9 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+from .models import ACTIVE_JOB_STATES, TERMINAL_JOB_STATES
 
-ACTIVE_STATES = {"starting", "running", "finishing", "cancelling"}
 ATTENTION_STATES = {"failed", "lost", "rejected", "skipped"}
-TERMINAL_STATES = {
-    "succeeded",
-    "failed",
-    "cancelled",
-    "lost",
-    "rejected",
-    "skipped",
-}
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -83,7 +75,7 @@ def build_summary(
         key=lambda job: str(job.get("submitted_at") or ""),
     )
     active_jobs = sorted(
-        (job for job in jobs if job.get("state") in ACTIVE_STATES),
+        (job for job in jobs if job.get("state") in ACTIVE_JOB_STATES),
         key=_queue_order,
     )
     queued_jobs = sorted(
@@ -100,7 +92,7 @@ def build_summary(
             for job in jobs
             if job.get("state") in ATTENTION_STATES
             or (
-                job.get("state") in ACTIVE_STATES
+                job.get("state") in ACTIVE_JOB_STATES
                 and isinstance(job.get("error"), str)
                 and bool(job["error"])
             )
@@ -112,12 +104,9 @@ def build_summary(
     active = [_job_view(job, current) for job in active_jobs]
     queued = [_job_view(job, current) for job in queued_jobs]
     blocked = [_job_view(job, current) for job in blocked_jobs]
-    attention = [
-        _job_view(job, current)
-        for job in attention_jobs
-    ]
+    attention = [_job_view(job, current) for job in attention_jobs]
     recent = sorted(
-        (job for job in jobs if job.get("state") in TERMINAL_STATES),
+        (job for job in jobs if job.get("state") in TERMINAL_JOB_STATES),
         key=lambda job: str(job.get("finished_at") or ""),
         reverse=True,
     )

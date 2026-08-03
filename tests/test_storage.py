@@ -16,7 +16,6 @@ from scruffy.storage import (
     controller_lock,
     find_request,
     journal_tail,
-    last_event_sequence,
     list_reports,
     list_requests,
     open_journal,
@@ -331,7 +330,7 @@ class EventJournalTests(StorageTestCase):
             self.assertEqual(self.EVENTS, events)
         self.assertEqual(self.EVENTS, read_events(self.root))
         self.assertEqual(self.EVENTS[1:], read_events(self.root, after=1))
-        self.assertEqual(3, last_event_sequence(self.root))
+        self.assertEqual(3, journal_tail(self.root)[0])
 
     def test_incomplete_trailing_event_is_ignored(self) -> None:
         complete = self.EVENTS[:2]
@@ -343,7 +342,7 @@ class EventJournalTests(StorageTestCase):
 
         self.assertEqual(complete, read_events(self.root))
         self.assertEqual([], read_events(self.root, after=2))
-        self.assertEqual(2, last_event_sequence(self.root))
+        self.assertEqual(2, journal_tail(self.root)[0])
 
     def test_torn_first_record_does_not_advance_byte_cursor(self) -> None:
         journal = self.root / "events.jsonl"

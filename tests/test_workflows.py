@@ -4,10 +4,8 @@ import unittest
 
 from scruffy.workflows import (
     WorkflowError,
-    dependency_blockers,
     resolve_dependencies,
     validate_workflows,
-    workflow_resolutions,
 )
 
 
@@ -37,7 +35,7 @@ class WorkflowValidationTests(unittest.TestCase):
         validate_workflows(jobs)
 
         self.assertEqual(
-            workflow_resolutions(jobs),
+            [resolve_dependencies(job, jobs) for job in jobs],
             [
                 {"decision": "ready", "reason": None, "blockers": []},
                 {"decision": "ready", "reason": None, "blockers": []},
@@ -83,15 +81,22 @@ class WorkflowValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowError, "duplicate task_id"):
             validate_workflows([task("train"), task("train")])
 
-    def test_missing_and_cross_workflow_dependencies_are_distinguished(self) -> None:
+    def test_missing_and_cross_workflow_dependencies_remain_open(self) -> None:
         missing = task("child", needs=[need("absent")])
-        with self.assertRaisesRegex(WorkflowError, "missing dependency"):
-            validate_workflows([missing])
+        validate_workflows([missing])
+        self.assertEqual(
+            "dependency_missing",
+            resolve_dependencies(missing, [missing])["blockers"][0]["reason"],
+        )
 
         cross_workflow = task("child", workflow_id="a", needs=[need("root")])
         root_elsewhere = task("root", workflow_id="b")
-        with self.assertRaisesRegex(WorkflowError, "cross-workflow"):
-            validate_workflows([cross_workflow, root_elsewhere])
+        jobs = [cross_workflow, root_elsewhere]
+        validate_workflows(jobs)
+        self.assertEqual(
+            "dependency_missing",
+            resolve_dependencies(cross_workflow, jobs)["blockers"][0]["reason"],
+        )
 
     def test_self_and_duplicate_edges_are_rejected(self) -> None:
         with self.assertRaisesRegex(WorkflowError, "depend on itself"):
@@ -127,8 +132,8 @@ class WorkflowResolutionTests(unittest.TestCase):
             needs=[{"task_id": "train", "condition": "succeeded"}],
         )
 
-        validate_workflows([child], allow_missing=True)
-        resolution = resolve_dependencies(child, [child], allow_missing=True)
+        validate_workflows([child])
+        resolution = resolve_dependencies(child, [child])
 
         self.assertEqual("blocked", resolution["decision"])
         self.assertEqual(
@@ -228,7 +233,7 @@ class WorkflowResolutionTests(unittest.TestCase):
         second = task("second", state="starting")
         child = task("child", needs=[need("second"), need("first", "terminal")])
 
-        blockers = dependency_blockers(child, [first, second, child])
+        blockers = resolve_dependencies(child, [first, second, child])["blockers"]
 
         self.assertEqual([item["task_id"] for item in blockers], ["second", "first"])
 
@@ -238,10 +243,11 @@ class WorkflowResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowError, "not present in jobs"):
             resolve_dependencies(outsider, [task("root")])
 
-    def test_generator_input_is_supported_and_resolved_once(self) -> None:
+    def test_generator_input_is_supported(self) -> None:
         jobs = [task("root", state="succeeded"), task("child", needs=[need("root")])]
 
-        resolutions = workflow_resolutions(job for job in jobs)
+        validate_workflows(job for job in jobs)
+        resolutions = [resolve_dependencies(job, jobs) for job in jobs]
 
         self.assertEqual([item["decision"] for item in resolutions], ["ready", "ready"])
 

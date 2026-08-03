@@ -13,6 +13,11 @@ from typing import Mapping, Sequence
 
 JsonObject = Mapping[str, object]
 
+ACTIVE_JOB_STATES = frozenset({"starting", "running", "finishing", "cancelling"})
+TERMINAL_JOB_STATES = frozenset(
+    {"succeeded", "failed", "cancelled", "lost", "rejected", "skipped"}
+)
+
 
 class ModelError(ValueError):
     """Raised when persisted or programmatic model data is invalid."""

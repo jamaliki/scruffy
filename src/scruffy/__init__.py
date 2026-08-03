@@ -13,7 +13,8 @@ from .client import (
     summary,
     wait_for_job,
 )
-from .models import NodeInventory, ResourceRequest
+from .models import ResourceRequest
+from .storage import ConflictError
 
 try:
     __version__ = version("scruffy-gpu")
@@ -21,7 +22,7 @@ except PackageNotFoundError:  # Running directly from a source checkout.
     __version__ = "0.1.0"
 
 __all__ = [
-    "NodeInventory",
+    "ConflictError",
     "ResourceRequest",
     "__version__",
     "cancel_job",

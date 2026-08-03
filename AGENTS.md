@@ -1,62 +1,63 @@
-# Scruffy agent guide
+# Scruffy agent protocol
 
-Scruffy is a cooperative GPU queue inside one multi-node Slurm allocation.
+Scruffy is a cooperative GPU queue inside one multi-node Slurm allocation. The
+canonical response, state, cursor, and exit-code contract is
+[`docs/client-v1.md`](docs/client-v1.md).
 
-## Safe agent workflow
+## Operating loop
 
 ```bash
 export SCRUFFY_ROOT=/shared/run/scruffy
 
-scruffy submit --request-id "$UNIQUE_REQUEST_ID" --gpus-per-node 1 -- command arg...
-scruffy summary        # bounded current state, progress, failures, and blockers
-scruffy explain JOB_ID # one job plus its resolved dependency states
+# 1. Orient and save the returned as_of_cursor.
+scruffy summary --limit 20
+
+# 2. Submit durably without waiting for resources or dependencies.
+scruffy submit \
+  --request-id agent-name/campaign/task/attempt-1 \
+  --gpus-per-node 1 -- command arg...
+
+# 3. Poll with this agent's private cursor; persist next_cursor each time.
 scruffy observe --after "$CURSOR" --wait 30
-scruffy logs JOB_ID --tail 200
-scruffy cancel JOB_ID
+
+# 4. Diagnose only when needed.
+scruffy explain JOB_ID
+scruffy logs JOB_ID --stream stderr --tail 200
 ```
 
-- `submit` returns after the immutable request is durable. It never waits for a
-  controller, free resources, or another job.
-- Always use a stable, globally unique `--request-id` when a submission may be
-  retried. Reusing it with a different specification is an error.
-- Commands are argv arrays after `--`. Do not construct nested shell strings;
-  explicitly submit `bash -lc ...` only when shell behavior is genuinely needed.
-- Every observer owns its cursor. Reading events never consumes them for another
-  agent.
-- Submit workflow tasks with `--workflow-id`, `--task-id`, and repeated
-  `--needs TASK[:succeeded|terminal]`. Submission never waits for dependencies,
-  and dependencies may be submitted later by another agent.
-- `blocked` means an upstream task is pending or missing. `skipped` is terminal
-  and means a required successful dependency ended unsuccessfully.
-- Prefer `summary` for orientation, `explain` for one chain, and `observe` with
-  your own saved cursor for incremental monitoring.
-- Match asynchronous cancel and drain outcomes by the returned `request_id`.
-- Treat the snapshot as current truth and lifecycle events as notifications.
-  Never infer job success or failure from log text.
+While `observe.more` is true, request the next page immediately. If
+`observe.reset` is true, discard the old local view, accept the returned full
+snapshot, and save the returned cursor. Never share cursor state between agents;
+reading does not consume events for anyone else. Use `observe --follow --output`
+only for interactive streaming.
 
-## Workload messages
+## Rules
 
-- Inside a worker, `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and
-  `SCRUFFY_NODE` are controller-owned. Do not override or redirect them.
-- Publish bounded semantic state through `scruffy report` or
-  `scruffy.publish_event`; keep detailed telemetry and artifacts in their normal
-  stores. Use a stable event ID when retrying.
-- Workload events are annotations only. The queue lifecycle and assignment in
-  the snapshot remain authoritative.
-
-## Resource invariants
-
-- There is exactly one controller for a queue.
-- GPU identities are `(node, gpu_id)`, never bare global ordinals.
-- A rectangular multi-node placement is reserved completely before launch.
+- Use a stable, queue-wide `request_id` for every retryable submission. A useful
+  convention is `<agent>/<campaign>/<task>/<attempt>`. Identical reuse is safe;
+  different reuse raises `ConflictError`.
+- Commands are argv after `--`. Avoid nested shell strings; submit `bash -lc`
+  explicitly only when shell behavior is required.
+- `cwd`, executables, and referenced files must exist at the same paths on the
+  selected worker nodes.
+- Workflow tasks use `--workflow-id`, `--task-id`, and repeated
+  `--needs TASK[:succeeded|terminal]`. Dependencies may be submitted later by
+  another agent.
+- Prefer `summary` for bounded orientation, `explain` for one dependency chain,
+  and `observe` for incremental monitoring.
+- The snapshot is authoritative. Never infer lifecycle success or failure from
+  stdout, stderr, or a workload annotation.
+- `blocked` means an upstream task is missing or unfinished. `skipped` is
+  terminal and means a required successful dependency ended unsuccessfully.
+- Match asynchronous cancel and drain outcomes using the returned `request_id`.
+  `drain` disables new launches until the controller is restarted.
+- GPU identity is `(node, gpu_id)`, never a bare global ordinal.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
-- Local resources are released only after the launcher exits and both output
-  streams close. Slurm resources additionally require a fresh successful
-  `scontrol` snapshot proving the named step is absent.
-- CPU and memory are cooperative admission budgets. GPU IDs are the exclusive
-  units managed by the queue API.
-- Scruffy guarantees non-overlap only for work submitted through Scruffy. Do not
-  launch out-of-band GPU work against its configured inventory.
-
-The shared queue contains argv and environment overrides in plaintext. Do not
-submit secret values directly; reference protected files instead.
+- CPU and memory are cooperative budgets. GPU exclusivity covers only work
+  submitted through Scruffy; do not launch out-of-band work on its inventory.
+- `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE` are
+  controller-owned inside a worker.
+- Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
+  detailed telemetry and artifact bytes in their normal stores.
+- Queue state contains argv and environment overrides in plaintext. Reference
+  protected secret files instead of submitting secret values.

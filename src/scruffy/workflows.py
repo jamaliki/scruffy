@@ -11,15 +11,14 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 
+from .models import TERMINAL_JOB_STATES
+
 
 Job = Mapping[str, object]
 TaskKey = tuple[str, str]
 Need = tuple[str, str]
 
 DEPENDENCY_CONDITIONS = frozenset({"succeeded", "terminal"})
-TERMINAL_JOB_STATES = frozenset(
-    {"succeeded", "failed", "cancelled", "lost", "rejected", "skipped"}
-)
 
 
 class WorkflowError(ValueError):
@@ -121,12 +120,8 @@ def _validate_cycles(needs: Mapping[TaskKey, tuple[Need, ...]]) -> None:
         raise WorkflowError(f"dependency cycle involving: {details}")
 
 
-def _validate_references(
-    by_key: Mapping[TaskKey, Job],
+def _validate_self_dependencies(
     needs: Mapping[TaskKey, tuple[Need, ...]],
-    locations: Mapping[str, set[str]],
-    *,
-    allow_missing: bool,
 ) -> None:
     for key, dependencies in needs.items():
         workflow_id, task_id = key
@@ -135,43 +130,22 @@ def _validate_references(
                 raise WorkflowError(
                     f"task {workflow_id!r}/{task_id!r} cannot depend on itself"
                 )
-            if (workflow_id, dependency_id) in by_key:
-                continue
-            if allow_missing:
-                continue
-            other_workflows = sorted(locations.get(dependency_id, ()))
-            if other_workflows:
-                raise WorkflowError(
-                    f"task {workflow_id!r}/{task_id!r} has cross-workflow "
-                    f"dependency {dependency_id!r}; found in {other_workflows!r}"
-                )
-            raise WorkflowError(
-                f"task {workflow_id!r}/{task_id!r} has missing dependency "
-                f"{dependency_id!r}"
-            )
 
 
 def _validated_graph(
     jobs: Iterable[Job],
-    *,
-    allow_missing: bool = False,
 ) -> tuple[
-    tuple[Job, ...],
-    tuple[TaskKey | None, ...],
     dict[TaskKey, Job],
     dict[TaskKey, tuple[Need, ...]],
 ]:
     ordered = _materialize(jobs)
-    keys: list[TaskKey | None] = []
     by_key: dict[TaskKey, Job] = {}
     needs: dict[TaskKey, tuple[Need, ...]] = {}
-    locations: dict[str, set[str]] = {}
 
     for index, job in enumerate(ordered):
         label = f"jobs[{index}]"
         key = _identity(job, label)
         dependencies = _dependencies(job, label)
-        keys.append(key)
         if key is None:
             if dependencies:
                 raise WorkflowError(
@@ -185,23 +159,22 @@ def _validated_graph(
             )
         by_key[key] = job
         needs[key] = dependencies
-        locations.setdefault(key[1], set()).add(key[0])
 
-    _validate_references(by_key, needs, locations, allow_missing=allow_missing)
+    _validate_self_dependencies(needs)
     _validate_cycles(needs)
-    return ordered, tuple(keys), by_key, needs
+    return by_key, needs
 
 
-def validate_workflows(jobs: Iterable[Job], *, allow_missing: bool = False) -> None:
+def validate_workflows(jobs: Iterable[Job]) -> None:
     """Validate workflow identities and dependency graphs.
 
     Jobs outside a workflow may omit all three workflow fields.  A task must
     provide both identifiers, and task IDs need only be unique inside their
-    workflow. ``allow_missing`` models a workflow that is still receiving
-    asynchronous task submissions; unresolved references remain blockers.
+    workflow. Missing upstream tasks are valid because workflows are submitted
+    asynchronously; unresolved references remain blockers.
     """
 
-    _validated_graph(jobs, allow_missing=allow_missing)
+    _validated_graph(jobs)
 
 
 def _blockers(
@@ -261,16 +234,6 @@ def _target_key(job: Job, by_key: Mapping[TaskKey, Job]) -> TaskKey | None:
     return key
 
 
-def dependency_blockers(
-    job: Job, jobs: Iterable[Job], *, allow_missing: bool = False
-) -> list[dict[str, object]]:
-    """Return every pending or permanently unsatisfied dependency for ``job``."""
-
-    _, _, by_key, needs = _validated_graph(jobs, allow_missing=allow_missing)
-    key = _target_key(job, by_key)
-    return [] if key is None else _blockers(key, by_key, needs)
-
-
 def _resolution(
     key: TaskKey | None,
     by_key: Mapping[TaskKey, Job],
@@ -292,19 +255,8 @@ def _resolution(
     return {"decision": decision, "reason": reason, "blockers": blockers}
 
 
-def resolve_dependencies(
-    job: Job, jobs: Iterable[Job], *, allow_missing: bool = False
-) -> dict[str, object]:
+def resolve_dependencies(job: Job, jobs: Iterable[Job]) -> dict[str, object]:
     """Resolve one job to ``ready``, ``blocked``, or ``skipped``."""
 
-    _, _, by_key, needs = _validated_graph(jobs, allow_missing=allow_missing)
+    by_key, needs = _validated_graph(jobs)
     return _resolution(_target_key(job, by_key), by_key, needs)
-
-
-def workflow_resolutions(
-    jobs: Iterable[Job], *, allow_missing: bool = False
-) -> list[dict[str, object]]:
-    """Return dependency decisions in the same order as ``jobs``."""
-
-    _, keys, by_key, needs = _validated_graph(jobs, allow_missing=allow_missing)
-    return [_resolution(key, by_key, needs) for key in keys]

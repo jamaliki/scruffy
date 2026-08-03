@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .models import ResourceRequest
+from .models import ResourceRequest, TERMINAL_JOB_STATES
 from .protocol import validate_event
 from .storage import (
     create_job_id,
@@ -26,16 +26,8 @@ from .storage import (
     submit_request,
     utc_now,
 )
-
-
-TERMINAL_STATES = {
-    "succeeded",
-    "failed",
-    "cancelled",
-    "lost",
-    "rejected",
-    "skipped",
-}
+from .summary import build_summary, explain_job
+from .workflows import validate_workflows
 
 
 def _workflow_fields(
@@ -45,55 +37,19 @@ def _workflow_fields(
 ) -> dict[str, Any]:
     """Validate one task's local metadata without requiring upstream jobs yet."""
 
-    if (workflow_id is None) != (task_id is None):
-        raise ValueError("workflow_id and task_id must be provided together")
+    dependencies = () if needs is None else needs
+    candidate: dict[str, object] = {"needs": dependencies}
     if workflow_id is not None:
-        for value, label in ((workflow_id, "workflow_id"), (task_id, "task_id")):
-            if not isinstance(value, str) or not value.strip() or value != value.strip():
-                raise ValueError(f"{label} must be a non-empty trimmed string")
-
-    if needs is None:
-        dependencies: list[dict[str, str]] = []
-    elif isinstance(needs, (str, bytes)) or not isinstance(needs, Sequence):
-        raise ValueError("needs must be an array")
-    else:
-        dependencies = []
-        seen: set[str] = set()
-        for index, need in enumerate(needs):
-            if not isinstance(need, Mapping) or set(need) != {"task_id", "condition"}:
-                raise ValueError(
-                    f"needs[{index}] must contain exactly task_id and condition"
-                )
-            dependency = need["task_id"]
-            condition = need["condition"]
-            if (
-                not isinstance(dependency, str)
-                or not dependency.strip()
-                or dependency != dependency.strip()
-            ):
-                raise ValueError(f"needs[{index}].task_id must be a non-empty trimmed string")
-            if not isinstance(condition, str) or condition not in {
-                "succeeded",
-                "terminal",
-            }:
-                raise ValueError(
-                    f"needs[{index}].condition must be 'succeeded' or 'terminal'"
-                )
-            if dependency in seen:
-                raise ValueError(f"duplicate dependency on task {dependency!r}")
-            if dependency == task_id:
-                raise ValueError("a task cannot depend on itself")
-            seen.add(dependency)
-            dependencies.append({"task_id": dependency, "condition": condition})
-
+        candidate["workflow_id"] = workflow_id
+    if task_id is not None:
+        candidate["task_id"] = task_id
+    validate_workflows([candidate])
     if workflow_id is None:
-        if dependencies:
-            raise ValueError("needs requires workflow_id and task_id")
         return {}
     return {
         "workflow_id": workflow_id,
         "task_id": task_id,
-        "needs": dependencies,
+        "needs": [dict(need) for need in dependencies],
     }
 
 
@@ -110,7 +66,7 @@ def submit_job(
     task_id: str | None = None,
     needs: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Durably enqueue and return without waiting for a controller or GPU."""
+    """Durably enqueue a job and return immediately with its stable job ID."""
 
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("command must contain at least one non-empty argument")
@@ -143,7 +99,7 @@ def publish_event(
     occurred_at: str | None = None,
     source: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Durably spool a non-authoritative event reported by a workload."""
+    """Durably spool a validated workload event; retries may reuse ``event_id``."""
 
     document = validate_event(
         {
@@ -168,6 +124,8 @@ def publish_event(
 
 
 def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
+    """Request cancellation asynchronously and return its correlation ID."""
+
     request_id = submit_command(
         root,
         {"kind": "cancel", "job_id": job_id, "submitted_at": utc_now()},
@@ -176,6 +134,8 @@ def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
 
 
 def drain_queue(root: Path) -> dict[str, Any]:
+    """Disable new launches until controller restart; running jobs continue."""
+
     request_id = submit_command(root, {"kind": "drain", "submitted_at": utc_now()})
     return {"request_id": request_id, "state": "drain_requested"}
 
@@ -199,6 +159,8 @@ def _submitted_from_spec(job_id: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
+    """Return one job or the complete queue, including unadmitted submissions."""
+
     state = load_state(root)
     if state is None:
         state = {
@@ -212,6 +174,10 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
             "draining": False,
         }
     if job_id is None:
+        jobs = state["jobs"]
+        for spec in list_requests(root, exclude=set(jobs)):
+            submitted_id = str(spec["job_id"])
+            jobs[submitted_id] = _submitted_from_spec(submitted_id, spec)
         return state
     job = state.get("jobs", {}).get(job_id)
     if job is not None:
@@ -220,17 +186,6 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
     if spec is not None:
         return _submitted_from_spec(job_id, spec)
     raise KeyError(f"unknown job {job_id}")
-
-
-def _state_with_submitted(root: Path) -> dict[str, Any]:
-    """Merge durable requests not yet reflected in the controller snapshot."""
-
-    state = status(root)
-    jobs = state["jobs"]
-    for spec in list_requests(root, exclude=set(jobs)):
-        job_id = str(spec["job_id"])
-        jobs[job_id] = _submitted_from_spec(job_id, spec)
-    return state
 
 
 def _snapshot_cursor(root: Path) -> tuple[int, int]:
@@ -270,7 +225,7 @@ def observe(
     include_output: bool = False,
     limit: int = 1000,
 ) -> dict[str, Any]:
-    """Return a snapshot and non-destructive events after an independent cursor."""
+    """Return a queue snapshot and one non-destructive page after ``after``."""
 
     if limit <= 0:
         raise ValueError("limit must be positive")
@@ -323,10 +278,12 @@ def observe(
 def wait_for_job(
     root: Path, job_id: str, *, timeout: float | None = None
 ) -> dict[str, Any]:
+    """Block until one job is terminal, or raise ``TimeoutError``."""
+
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         job = status(root, job_id)
-        if job["state"] in TERMINAL_STATES:
+        if job["state"] in TERMINAL_JOB_STATES:
             return job
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for {job_id}")
@@ -336,14 +293,10 @@ def wait_for_job(
 def summary(root: Path, *, limit: int = 20) -> dict[str, Any]:
     """Return a bounded, action-oriented view of the whole allocation."""
 
-    from .summary import build_summary
-
-    return build_summary(_state_with_submitted(root), limit=limit)
+    return build_summary(status(root), limit=limit)
 
 
 def explain(root: Path, job_id: str) -> dict[str, Any]:
     """Explain one job's state and dependency chain."""
 
-    from .summary import explain_job
-
-    return explain_job(_state_with_submitted(root), job_id)
+    return explain_job(status(root), job_id)

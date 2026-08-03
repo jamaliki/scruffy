@@ -7,15 +7,18 @@
 #SBATCH --gres=gpu:8
 #SBATCH --mem=1024G
 #SBATCH --time=24:00:00
+#SBATCH --signal=B:TERM@60
 #SBATCH --output=scruffy-%j.out
 #SBATCH --error=scruffy-%j.err
 
 set -euo pipefail
+umask 077
 
 : "${SCRUFFY_ROOT:?set SCRUFFY_ROOT to a shared filesystem directory}"
 
-# Install scruffy-gpu in this Python environment first. The controller remains
-# the foreground payload so Slurm tears down every child step if it exits.
+# SCRUFFY_ROOT and this Python environment must be visible at the same absolute
+# paths on every node. Keeping the controller in the foreground lets Slurm tear
+# down every child step if it exits; the early TERM gives it time to reconcile.
 exec scruffy --root "$SCRUFFY_ROOT" serve \
   --gpus-per-node 8 \
   --cpus-per-node 112 \

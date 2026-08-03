@@ -15,13 +15,17 @@ from .lifecycle import (
     request_cancellation,
     schedule,
 )
-from .models import NodeInventory, ResourceRequest, validate_inventory
-from .protocol import ProtocolError, validate_event
+from .models import (
+    ACTIVE_JOB_STATES,
+    NodeInventory,
+    ResourceRequest,
+    validate_inventory,
+)
+from .protocol import validate_event
 from .runtime import Controller, OutputNotifier, abandon_processes
 from .scheduler import request_can_ever_fit
 from .slurm import allocation_metadata
 from .state import (
-    ACTIVE_STATES,
     apply_workload_event,
     emit,
     job_from_spec,
@@ -70,7 +74,9 @@ def _initialize_controller(
 ) -> Controller:
     state = load_recovered_state(root)
     active = [
-        job for job in state.get("jobs", {}).values() if job["state"] in ACTIVE_STATES
+        job
+        for job in state.get("jobs", {}).values()
+        if job["state"] in ACTIVE_JOB_STATES
     ]
     previous = state.get("allocation") or {}
     if active and (launcher == "local" or previous.get("id") == allocation_id):
@@ -160,13 +166,6 @@ def _mark_workflow_rejected(job: dict[str, Any], exc: Exception) -> None:
     job["error"] = str(exc)
 
 
-def _reject_workflow_job(
-    controller: Controller, job: dict[str, Any], exc: Exception
-) -> None:
-    _mark_workflow_rejected(job, exc)
-    emit(controller, "job.rejected", job=job)
-
-
 def _resolution_workflow_jobs(
     jobs: dict[str, dict[str, Any]], workflow_id: str
 ) -> list[dict[str, Any]]:
@@ -202,7 +201,7 @@ def _stage_job(
     try:
         # Missing upstream tasks are valid during asynchronous submission; this
         # first pass checks only the task's own shape and self-dependencies.
-        validate_workflows([job], allow_missing=True)
+        validate_workflows([job])
     except WorkflowError as exc:
         _mark_workflow_rejected(job, exc)
         return job
@@ -236,7 +235,7 @@ def _stage_job(
             and not candidate.get("workflow_invalid")
         ]
         try:
-            validate_workflows([*candidates, job], allow_missing=True)
+            validate_workflows([*candidates, job])
         except WorkflowError as exc:
             # Reject the request which closes a cycle, not the whole workflow.
             _mark_workflow_rejected(job, exc)
@@ -267,7 +266,7 @@ def _admit_job(
         return
 
     workflow_jobs = _resolution_workflow_jobs(prospective, job["workflow_id"])
-    resolution = resolve_dependencies(job, workflow_jobs, allow_missing=True)
+    resolution = resolve_dependencies(job, workflow_jobs)
     job["blockers"] = resolution["blockers"]
     if resolution["decision"] == "ready":
         emit(controller, "job.queued", job=job)
@@ -322,11 +321,10 @@ def _refresh_dependencies(controller: Controller) -> None:
                 continue
             workflow_jobs = _resolution_workflow_jobs(jobs, job["workflow_id"])
             try:
-                resolution = resolve_dependencies(
-                    job, workflow_jobs, allow_missing=True
-                )
+                resolution = resolve_dependencies(job, workflow_jobs)
             except WorkflowError as exc:
-                _reject_workflow_job(controller, job, exc)
+                _mark_workflow_rejected(job, exc)
+                emit(controller, "job.rejected", job=job)
                 transitioned = True
                 continue
             blockers = resolution["blockers"]
@@ -518,7 +516,7 @@ def _ingest_reports(
             continue
         try:
             event = validate_event(document)
-        except (ProtocolError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             _reject_report(controller, source, str(exc))
             continue
         job_id = event["job_id"]

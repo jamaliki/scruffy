@@ -29,11 +29,15 @@ class StorageError(RuntimeError):
     """Raised when durable queue state is missing or inconsistent."""
 
 
-class RequestConflict(StorageError):
+class ConflictError(StorageError):
+    """Raised when an idempotency key is reused with different content."""
+
+
+class RequestConflict(ConflictError):
     """Raised when an idempotency key is reused for a different job."""
 
 
-class ReportConflict(StorageError):
+class ReportConflict(ConflictError):
     """Raised when an event ID is reused for a different workload report."""
 
 
@@ -469,10 +473,6 @@ def journal_tail(root: Path) -> tuple[int, int]:
     # A cursor may only advance past complete records. In particular, do not
     # skip a torn first record that a concurrent writer may still complete.
     return 0, 0
-
-
-def last_event_sequence(root: Path) -> int:
-    return journal_tail(root)[0]
 
 
 def job_directory(root: Path, job_id: str) -> Path:

@@ -50,9 +50,9 @@ The controller validates and sequences a report, then adds its queue identity,
 allocation identity, global sequence, recording timestamp, canonical event ID,
 and the original `event_id` as `source_event_id`. Every observer has an
 independent cursor; reading never consumes an event for another observer.
-Pending reports are processed round-robin across jobs. Every report is preserved
-in the journal, while the bounded current projection compares producer
-timestamps and does not let a late older report regress newer progress.
+Every report is preserved in the journal, while the bounded current projection
+compares producer timestamps and does not let a late older report regress newer
+progress.
 
 ## Authority
 
