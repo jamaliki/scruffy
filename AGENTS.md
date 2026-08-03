@@ -38,6 +38,8 @@ agents; reading does not consume events for anyone else. Use
   convention is `<agent>/<campaign>/<task>/<attempt>`. Identical reuse is safe;
   different reuse raises `ConflictError`. This exact identity survives detailed
   job eviction through a compact archive receipt.
+- Transient request/report read errors are retried by the controller; they do
+  not reject the item or consume its idempotency key.
 - Commands are argv after `--`. Avoid nested shell strings; submit `bash -lc`
   explicitly only when shell behavior is required.
 - `cwd`, executables, and referenced files must exist at the same paths on the

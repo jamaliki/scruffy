@@ -50,8 +50,10 @@ permanent exactly-once ledger.
 With `deduplicated: false`, a successful `scruffy report` or
 `publish_event(...)` call means a new immutable report is durably spooled. With
 `deduplicated: true`, a matching pending report or durable retained receipt was
-found, so no new report was written. Neither result proves that the job exists
-or that the controller has accepted and published the report yet.
+found, so no new report was written. A retained rejection is a conflict, never a
+successful deduplication. Neither successful result proves that the job exists
+or that the controller has accepted and published the report yet. A transient
+read error leaves the report pending for a later controller poll.
 
 ## Controller envelope
 

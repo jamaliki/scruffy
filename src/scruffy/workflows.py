@@ -167,11 +167,14 @@ def _validated_graph(
                 f"duplicate task_id {task_id!r} in workflow {workflow_id!r}"
             )
         by_key[key] = job
-        # Completed attempts no longer wait on their historical dependencies.
-        # Keeping the node but removing its outgoing edges preserves its result
-        # for dependants without letting a stale failed attempt form a cycle.
+        # Once an admitted task has crossed its dependency gate, historical
+        # edges cannot create a new cycle during a retry. Keeping the node still
+        # preserves its current result for dependants.
         needs[key] = (
-            () if job.get("state") in TERMINAL_JOB_STATES else dependencies
+            ()
+            if job.get("state") in TERMINAL_JOB_STATES
+            or job.get("dependency_gate_passed") is True
+            else dependencies
         )
 
     _validate_self_dependencies(needs)

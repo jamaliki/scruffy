@@ -357,6 +357,7 @@ class LogsCliTests(unittest.TestCase):
                 return {"id": "job-1", "state": "succeeded"}
 
             output = mock.Mock(buffer=io.BytesIO())
+            output.fileno.return_value = 1
             with (
                 mock.patch("scruffy.cli.status", side_effect=job_status),
                 mock.patch("scruffy.cli.sys.stdout", output),

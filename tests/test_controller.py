@@ -268,6 +268,47 @@ class ControllerIntegrationTests(unittest.TestCase):
             "succeeded", wait_for_job(self.root, retry_a, timeout=TIMEOUT)["state"]
         )
 
+    def test_retry_cycle_check_ignores_edges_of_a_running_task(self) -> None:
+        self._start_controller((0,))
+        first_a = self._submit(
+            "gate-a-1",
+            "raise SystemExit(3)",
+            workflow_id="gate-retry",
+            task_id="a",
+        )
+        self.assertEqual(
+            "failed", wait_for_job(self.root, first_a, timeout=TIMEOUT)["state"]
+        )
+        release = self.workspace / "release-gate-b"
+        running_b = self._submit(
+            "gate-b-1",
+            "import os,time; "
+            "release=os.environ['RELEASE']; "
+            "exec(\"while not os.path.exists(release): time.sleep(0.02)\")",
+            environment={"RELEASE": str(release)},
+            workflow_id="gate-retry",
+            task_id="b",
+            needs=({"task_id": "a", "condition": "terminal"},),
+        )
+        self._wait_for_state(running_b, "running")
+
+        retry_a = self._submit(
+            "gate-a-2",
+            "print('repaired')",
+            workflow_id="gate-retry",
+            task_id="a",
+            needs=({"task_id": "b", "condition": "terminal"},),
+        )
+        self._wait_for_state(retry_a, "blocked")
+        release.write_text("go", encoding="utf-8")
+
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, running_b, timeout=TIMEOUT)["state"]
+        )
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, retry_a, timeout=TIMEOUT)["state"]
+        )
+
     def test_lost_workflow_tasks_can_be_resubmitted_after_restart(self) -> None:
         self._start_controller((0,))
         first_a = self._submit(

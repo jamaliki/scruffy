@@ -236,17 +236,28 @@ def _snapshot_cursor(root: Path) -> tuple[int, int, int]:
 def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, bool]:
     """Return generation, sequence, offset, and whether the cursor reset."""
 
+    def component(value: object) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid cursor") from exc
+        if parsed < 0:
+            raise ValueError("invalid cursor")
+        return parsed
+
     current_generation, current_sequence, current_offset = _snapshot_cursor(root)
     if cursor is None:
         return current_generation, current_sequence, current_offset, False
     if isinstance(cursor, int):
+        sequence = component(cursor)
         if current_generation:
             return current_generation, current_sequence, current_offset, True
-        return current_generation, cursor, 0, False
+        return current_generation, sequence, 0, False
     if ":" not in cursor:
+        sequence = component(cursor)
         if current_generation:
             return current_generation, current_sequence, current_offset, True
-        return current_generation, int(cursor), 0, False
+        return current_generation, sequence, 0, False
     parts = cursor.split(":")
     if len(parts) == 2:
         cursor_queue, sequence = parts
@@ -259,9 +270,12 @@ def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, b
         cursor_queue, generation, sequence, offset = parts
     else:
         raise ValueError("invalid cursor")
-    if cursor_queue != queue_id(root) or int(generation) != current_generation:
+    parsed_generation = component(generation)
+    parsed_sequence = component(sequence)
+    parsed_offset = component(offset)
+    if cursor_queue != queue_id(root) or parsed_generation != current_generation:
         return current_generation, current_sequence, current_offset, True
-    return current_generation, int(sequence), int(offset), False
+    return current_generation, parsed_sequence, parsed_offset, False
 
 
 def observe(

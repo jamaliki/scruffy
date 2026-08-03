@@ -8,7 +8,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy.slurm import build_srun_argv, cancel_step, live_steps, load_inventory
+from scruffy.slurm import (
+    build_srun_argv,
+    build_srun_environment,
+    cancel_step,
+    live_steps,
+    load_inventory,
+)
 from scruffy.worker import current_node, execute_assignment, find_node_assignment
 
 
@@ -74,6 +80,17 @@ class SlurmArgumentTests(unittest.TestCase):
 
         self.assertIn("--wait=0", argv)
         self.assertIn("--wait-for-children", argv)
+
+    def test_srun_does_not_inherit_a_stale_scruffy_node(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SCRUFFY_NODE": "stale-node", "KEPT": "yes"},
+            clear=True,
+        ):
+            environment = build_srun_environment()
+
+        self.assertNotIn("SCRUFFY_NODE", environment)
+        self.assertEqual("yes", environment["KEPT"])
 
 
 class InventoryTests(unittest.TestCase):

@@ -12,7 +12,12 @@ from typing import Any
 from .models import Assignment, QueuedJob, ResourceRequest
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_oldest_fitting_job
-from .slurm import build_local_argv, build_srun_argv, new_step_name
+from .slurm import (
+    build_local_argv,
+    build_srun_argv,
+    build_srun_environment,
+    new_step_name,
+)
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
 from .state import active_assignments, emit
 from .storage import atomic_write_json, job_directory, utc_now
@@ -53,7 +58,7 @@ def _launch_arguments(
                 cpus_per_node=assignment.request.cpus_per_node,
                 memory_gb_per_node=assignment.request.memory_gb_per_node,
             ),
-            None,
+            build_srun_environment(),
         )
     return build_local_argv(assignment_file, assignment.reservations[0].node)
 

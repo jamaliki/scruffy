@@ -17,7 +17,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import AbstractSet, Any, BinaryIO, Iterator, Sequence, TextIO
+from typing import AbstractSet, Any, BinaryIO, Callable, Iterator, Sequence, TextIO
 
 from .protocol import MAX_EVENT_BYTES, validate_event
 
@@ -30,6 +30,10 @@ INVALID_REQUEST_DIGEST = "-"
 
 class StorageError(RuntimeError):
     """Raised when durable queue state is missing or inconsistent."""
+
+
+class TransientStorageError(StorageError):
+    """Raised when an I/O failure says nothing about stored content validity."""
 
 
 class ConflictError(StorageError):
@@ -114,7 +118,9 @@ def read_json(source: Path) -> Any:
     try:
         with source.open(encoding="utf-8") as handle:
             return json.load(handle)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except OSError as exc:
+        raise TransientStorageError(f"cannot read {source}: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StorageError(f"cannot read {source}: {exc}") from exc
 
 
@@ -225,7 +231,7 @@ def submit_request(root: Path, spec: dict[str, Any]) -> tuple[str, bool]:
 def list_requests(
     root: Path, exclude: AbstractSet[str] = frozenset()
 ) -> list[tuple[str, dict[str, Any] | None]]:
-    """List request directories without letting one corrupt spec abort readers."""
+    """List requests, deferring transient reads and marking invalid documents."""
 
     request_root = ensure_layout(root) / "requests"
     requests: list[tuple[str, dict[str, Any] | None]] = []
@@ -239,6 +245,10 @@ def list_requests(
         spec_file = directory / "spec.json"
         try:
             document = read_json(spec_file)
+        except TransientStorageError:
+            # A missing file or NFS read error is not a verdict on immutable
+            # request content. Leave the directory untouched for the next poll.
+            continue
         except StorageError:
             document = None
         requests.append(
@@ -302,18 +312,28 @@ def reject_request(root: Path, job_id: str) -> bool:
     return _finish_request(root, job_id, INVALID_REQUEST_DIGEST)
 
 
-def accept_known_requests(root: Path, known_job_ids: AbstractSet[str]) -> int:
+def accept_known_requests(
+    root: Path,
+    known_job_ids: AbstractSet[str],
+    *,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> int:
     """Archive legacy request specs already represented in controller state."""
 
     accepted = 0
     for job_id, spec in list_requests(root):
         if job_id not in known_job_ids:
             continue
-        accepted_request = (
-            accept_request(root, job_id)
-            if spec is not None and spec.get("job_id") == job_id
-            else reject_request(root, job_id)
-        )
+        try:
+            accepted_request = (
+                accept_request(root, job_id)
+                if spec is not None and spec.get("job_id") == job_id
+                else reject_request(root, job_id)
+            )
+        except (OSError, StorageError) as exc:
+            if on_error is not None:
+                on_error(job_id, exc)
+            continue
         if accepted_request:
             accepted += 1
     return accepted
@@ -363,7 +383,10 @@ def archive_terminal_job(root: Path, job: dict[str, Any]) -> None:
         receipt = _read_request_receipt(request_root, job_id)
         digest = (receipt or {}).get("digest") or job.get("request_digest")
         if not isinstance(digest, str):
-            raise StorageError(f"job {job_id} has no request identity")
+            # Legacy jobs may predate retained request digests. Their ID was
+            # nevertheless consumed, so fail closed rather than blocking all
+            # future compaction or pretending an arbitrary retry is identical.
+            digest = INVALID_REQUEST_DIGEST
         _mkdir(receipt_file.parent.parent)
         _mkdir(receipt_file.parent)
         archived = _archived_job(job)
@@ -394,21 +417,42 @@ def find_archived_job(root: Path, job_id: str) -> dict[str, Any] | None:
     return job if isinstance(job, dict) else None
 
 
-def list_archived_workflow(root: Path, workflow_id: str) -> list[dict[str, Any]]:
-    """Load compact terminal tasks for one workflow, never the whole archive."""
+def list_archived_workflow(
+    root: Path,
+    workflow_id: str,
+    *,
+    on_error: Callable[[Path, StorageError], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Load one workflow, skipping corrupt entries and optionally reporting them."""
 
     directory = _workflow_archive(root, workflow_id)
     if not directory.exists():
         return []
     jobs: list[dict[str, Any]] = []
     for source in directory.glob("*.json"):
-        document = read_json(source)
-        if not isinstance(document, dict) or document.get("workflow_id") != workflow_id:
+        try:
+            document = read_json(source)
+            if (
+                not isinstance(document, dict)
+                or document.get("workflow_id") != workflow_id
+            ):
+                raise StorageError(f"invalid workflow archive entry {source}")
+            job = document.get("job")
+            if not isinstance(job, dict):
+                raise StorageError(f"workflow archive entry {source} has no job")
+        except TransientStorageError:
+            raise
+        except StorageError as exc:
+            if on_error is not None:
+                on_error(source, exc)
             continue
-        job = document.get("job")
-        if isinstance(job, dict):
-            jobs.append(job)
-    return sorted(jobs, key=lambda job: int(job.get("queue_order", 0)))
+        jobs.append(job)
+    return sorted(
+        jobs,
+        key=lambda job: (
+            job.get("queue_order") if type(job.get("queue_order")) is int else -1
+        ),
+    )
 
 
 def remove_cold_job_directories(root: Path, hot_job_ids: AbstractSet[str]) -> int:
@@ -531,7 +575,7 @@ def submit_report(root: Path, report: dict[str, Any]) -> tuple[str, bool]:
             report_root, document["job_id"], event_digest
         )
         if retained:
-            if previous_digest in {None, identity_digest}:
+            if previous_digest == identity_digest:
                 return event_id, True
             raise ReportConflict(
                 f"event ID {event_id!r} was already used for a different report"
@@ -572,7 +616,11 @@ def _report_stream(directory: Path) -> Iterator[tuple[Path, object | None]]:
                     if entry.stat().st_size <= MAX_EVENT_BYTES
                     else None
                 )
-            except (OSError, StorageError):
+            except (OSError, TransientStorageError):
+                # Do not destroy or acknowledge a report because one read or
+                # metadata lookup failed. A producer retry sees the same inbox.
+                continue
+            except StorageError:
                 document = None
             yield source, document
 

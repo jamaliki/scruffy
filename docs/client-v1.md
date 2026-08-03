@@ -96,6 +96,11 @@ Reusing it with a different specification raises `ConflictError`. Omitting it
 creates a new job on every call. Its exact identity digest is retained in the
 compact archive even after detailed job state expires.
 
+A transient I/O failure while the controller reads an immutable request defers
+admission to a later poll without deleting the request or consuming its ID.
+Decodable but invalid requests, including a `job_id` that disagrees with its
+directory, are rejected and permanently consume that ID.
+
 CLI resource defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per
 GPU. Python callers provide an explicit `ResourceRequest`.
 
@@ -168,7 +173,9 @@ Lifecycle kinds use `allocation.*` and `job.*`. A `job.output` event has this
 Workload events additionally preserve producer `occurred_at`, `source`, and
 `source_event_id`; their contract is [events-v1.md](events-v1.md). Consumers
 must ignore unknown fields and event kinds so compatible additions do not break
-v1 readers.
+v1 readers. A contained per-item storage failure is published as a `notice`
+whose `data.kind` is `storage.item_skipped`; the controller continues serving
+unrelated work.
 
 ## Retention
 
@@ -202,7 +209,8 @@ even though retained terminal-job detail and journal history are bounded.
 
 The corresponding outcome event repeats `request_id`. Cancellation retains its
 assignment until launcher exit, output closure, and Slurm reconciliation prove
-release safe.
+release safe. Cancelling any terminal job, including an archived one, produces
+`job.cancel_ignored` rather than `command.rejected`.
 
 Drain disables new launches for the current allocation. Running jobs continue,
 queued jobs remain durable, and controller restarts preserve the drain. A

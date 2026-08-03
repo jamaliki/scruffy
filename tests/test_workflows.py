@@ -139,6 +139,15 @@ class WorkflowValidationTests(unittest.TestCase):
             resolve_dependencies(replacement, [cancelled, replacement])["decision"],
         )
 
+    def test_task_past_its_dependency_gate_does_not_race_retry_validation(self) -> None:
+        running = {
+            **task("b", state="running", needs=[need("a")]),
+            "dependency_gate_passed": True,
+        }
+        retry = task("a", needs=[need("b", "terminal")])
+
+        validate_workflows([running, retry])
+
 
 class WorkflowResolutionTests(unittest.TestCase):
     def test_newest_valid_retry_shadows_failed_and_invalid_attempts(self) -> None:

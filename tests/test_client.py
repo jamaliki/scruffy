@@ -387,6 +387,27 @@ class ObserveTests(unittest.TestCase):
             parse_cursor(self.root, f"{identity}:0:39:99"),
         )
 
+    def test_malformed_cursor_is_rejected_before_generation_reset(self) -> None:
+        identity = queue_id(self.root)
+        for generation in (0, 2):
+            write_state(
+                self.root,
+                {
+                    "queue_id": identity,
+                    "journal_generation": generation,
+                    "last_seq": 40,
+                    "journal_offset": 123,
+                    "jobs": {},
+                    "nodes": {},
+                    "allocation": None,
+                    "draining": False,
+                },
+            )
+            for cursor in ("garbage", "wrong:not-a-number:39:99", "-1"):
+                with self.subTest(generation=generation, cursor=cursor):
+                    with self.assertRaisesRegex(ValueError, "invalid cursor"):
+                        parse_cursor(self.root, cursor)
+
 
 if __name__ == "__main__":
     unittest.main()

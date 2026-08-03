@@ -42,6 +42,7 @@ from .storage import (
     compact_report_receipts,
     controller_lock,
     ensure_layout,
+    find_archived_job,
     list_commands,
     list_archived_workflow,
     list_reports,
@@ -55,6 +56,8 @@ from .storage import (
     request_pending,
     remove_command,
     remove_cold_job_directories,
+    StorageError,
+    TransientStorageError,
     UnsafeRecovery,
     utc_now,
     job_identity_digest,
@@ -130,6 +133,12 @@ def _initialize_controller(
         # Journal each complete image, then publish one coherent snapshot with
         # allocation.started below. A crash is recovered by journal replay.
         emit(controller, "job.lost", job=job, snapshot=False)
+
+    # Queued and later workflow jobs have already crossed their dependency
+    # gate. Persist the marker for snapshots created before the field existed.
+    for job in state["jobs"].values():
+        if isinstance(job.get("workflow_id"), str):
+            job.setdefault("dependency_gate_passed", job.get("state") != "blocked")
 
     metadata = allocation_metadata(allocation_id, launcher)
     metadata.update(
@@ -223,6 +232,41 @@ def _resolution_workflow_jobs(
     return resolution_jobs
 
 
+def _storage_notice(
+    controller: Controller, operation: str, item: str, exc: Exception
+) -> None:
+    """Publish one contained storage failure without stopping the controller."""
+
+    emit(
+        controller,
+        "notice",
+        data={
+            "kind": "storage.item_skipped",
+            "operation": operation,
+            "item": item,
+            "error": str(exc),
+        },
+    )
+
+
+def _archived_workflow_jobs(
+    controller: Controller, workflow_id: str
+) -> list[dict[str, Any]] | None:
+    """Load a workflow archive while surfacing only the bad entries."""
+
+    try:
+        return list_archived_workflow(
+            controller.root,
+            workflow_id,
+            on_error=lambda source, exc: _storage_notice(
+                controller, "read_workflow_archive", source.name, exc
+            ),
+        )
+    except TransientStorageError as exc:
+        _storage_notice(controller, "read_workflow_archive", workflow_id, exc)
+        return None
+
+
 def _stage_job(
     spec: dict[str, Any],
     queue_order: int,
@@ -314,12 +358,15 @@ def _admit_job(
     resolution = resolve_dependencies(job, workflow_jobs)
     job["blockers"] = resolution["blockers"]
     if resolution["decision"] == "ready":
+        job["dependency_gate_passed"] = True
         emit(controller, "job.queued", job=job)
     elif resolution["decision"] == "blocked":
+        job["dependency_gate_passed"] = False
         job["state"] = "blocked"
         job["reason"] = "waiting_for_dependencies"
         emit(controller, "job.blocked", job=job)
     else:
+        job["dependency_gate_passed"] = True
         job["state"] = "skipped"
         job["finished_at"] = utc_now()
         job["reason"] = "dependency_unsatisfied"
@@ -354,6 +401,26 @@ def _stage_request(
     return _stage_job(spec, queue_order, prospective), False
 
 
+def _finish_staged_request(
+    controller: Controller, job: dict[str, Any], malformed_identity: bool
+) -> None:
+    """Retire one admitted inbox entry without endangering the serve loop."""
+
+    try:
+        if malformed_identity:
+            reject_request(controller.root, job["id"])
+        else:
+            accept_request(
+                controller.root,
+                job["id"],
+                identity_digest=job["request_digest"],
+            )
+    except (OSError, StorageError) as exc:
+        # Admission is already durable. Retain the request directory for
+        # diagnosis or exact retry and let unrelated jobs continue.
+        _storage_notice(controller, "finish_request", job["id"], exc)
+
+
 def _ingest_requests(controller: Controller) -> None:
     known = controller.state["jobs"]
     next_order = max(
@@ -376,16 +443,23 @@ def _ingest_requests(controller: Controller) -> None:
         for _, spec in requests
         if spec is not None and isinstance(spec.get("workflow_id"), str)
     }
+    deferred_workflows: set[str] = set()
     for workflow_id in workflow_ids:
+        archived = _archived_workflow_jobs(controller, workflow_id)
+        if archived is None:
+            deferred_workflows.add(workflow_id)
+            continue
         prospective.update(
             {
                 job["id"]: job
-                for job in list_archived_workflow(controller.root, workflow_id)
+                for job in archived
             }
         )
     prospective.update(known)
     for request_id, spec in requests:
         if request_id in prospective:
+            continue
+        if spec is not None and spec.get("workflow_id") in deferred_workflows:
             continue
         next_order += 1
         job, malformed_identity = _stage_request(
@@ -397,14 +471,7 @@ def _ingest_requests(controller: Controller) -> None:
     controller.state["next_queue_order"] = next_order
     for job, malformed_identity in staged:
         _admit_job(controller, job, prospective)
-        if malformed_identity:
-            reject_request(controller.root, job["id"])
-        else:
-            accept_request(
-                controller.root,
-                job["id"],
-                identity_digest=job["request_digest"],
-            )
+        _finish_staged_request(controller, job, malformed_identity)
 
 
 def _workflow_groups(
@@ -459,10 +526,14 @@ def _refresh_dependencies(controller: Controller) -> None:
         blocked_jobs = blocked_by_workflow.get(workflow_id, [])
         if not blocked_jobs:
             continue
+        archived = _archived_workflow_jobs(controller, workflow_id)
+        if archived is None:
+            retry_invalid.add(workflow_id)
+            continue
         try:
             resolution_jobs = _resolution_workflow_jobs(
                 [
-                    *list_archived_workflow(controller.root, workflow_id),
+                    *archived,
                     *workflows[workflow_id],
                 ],
                 workflow_id,
@@ -487,11 +558,13 @@ def _refresh_dependencies(controller: Controller) -> None:
             blockers = resolution["blockers"]
             decision = resolution["decision"]
             if decision == "ready":
+                job["dependency_gate_passed"] = True
                 job["state"] = "queued"
                 job["reason"] = None
                 job["blockers"] = []
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
+                job["dependency_gate_passed"] = True
                 job["state"] = "skipped"
                 job["finished_at"] = utc_now()
                 job["reason"] = "dependency_unsatisfied"
@@ -510,6 +583,38 @@ def _refresh_dependencies(controller: Controller) -> None:
     }
 
 
+def _finish_missing_cancel(
+    controller: Controller, command: dict[str, Any], job_id: str
+) -> bool:
+    """Emit an archived/unknown outcome; return false when it should retry."""
+
+    if request_pending(controller.root, job_id):
+        return False
+    try:
+        archived = find_archived_job(controller.root, job_id)
+    except TransientStorageError as exc:
+        _storage_notice(controller, "read_archived_job", job_id, exc)
+        return False
+    except (OSError, StorageError) as exc:
+        _storage_notice(controller, "read_archived_job", job_id, exc)
+        archived = None
+
+    data = {"request_id": command.get("request_id"), "job_id": job_id}
+    if archived is None:
+        emit(
+            controller,
+            "command.rejected",
+            data={**data, "reason": "unknown_job"},
+        )
+    else:
+        emit(
+            controller,
+            "job.cancel_ignored",
+            data={**data, "reason": f"job_is_{archived.get('state', 'terminal')}"},
+        )
+    return True
+
+
 def _ingest_commands(controller: Controller) -> None:
     for source, command in list_commands(controller.root):
         deferred = False
@@ -520,18 +625,7 @@ def _ingest_commands(controller: Controller) -> None:
             if job is None:
                 # Submit returns only after its request is durable. If command
                 # ingestion won a polling race, retain the cancel for next tick.
-                if request_pending(controller.root, job_id):
-                    deferred = True
-                else:
-                    emit(
-                        controller,
-                        "command.rejected",
-                        data={
-                            "request_id": command.get("request_id"),
-                            "job_id": job_id,
-                            "reason": "unknown_job",
-                        },
-                    )
+                deferred = not _finish_missing_cancel(controller, command, job_id)
             elif not request_cancellation(
                 controller, job, str(command.get("request_id") or "")
             ):
@@ -727,7 +821,11 @@ def _ingest_reports(
     acknowledged: list[tuple[Path, str | None]] = []
     new_report_ids: list[str] = []
     for source, document in _report_batch(controller, limit):
-        retained, retained_digest = report_was_accepted(controller.root, source)
+        try:
+            retained, retained_digest = report_was_accepted(controller.root, source)
+        except (OSError, StorageError) as exc:
+            _storage_notice(controller, "read_report_receipt", _report_id(source), exc)
+            continue
         if retained:
             acknowledged.append((source, retained_digest))
             continue
@@ -818,7 +916,13 @@ def _serve(controller: Controller) -> None:
     def stop(_signum: int, _frame: Any) -> None:
         controller.stopping = True
 
-    accept_known_requests(controller.root, controller.state["jobs"].keys())
+    accept_known_requests(
+        controller.root,
+        controller.state["jobs"].keys(),
+        on_error=lambda request_id, exc: _storage_notice(
+            controller, "finish_known_request", request_id, exc
+        ),
+    )
     compact_report_receipts(controller.root)
     _discard_journaled_reports(controller)
     _discard_journaled_commands(controller)

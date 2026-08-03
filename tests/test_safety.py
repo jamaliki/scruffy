@@ -43,6 +43,7 @@ from scruffy.storage import (
     queue_id,
     read_events,
     submit_command,
+    TransientStorageError,
     utc_now,
     write_state,
 )
@@ -258,6 +259,73 @@ class RecoverySafetyTests(unittest.TestCase):
         )
         _ingest_requests(controller)
         self.assertEqual("queued", controller.state["jobs"][infer["job_id"]]["state"])
+
+    def test_transient_request_read_is_retried_without_rejection(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+        submitted = submit_job(
+            self.root,
+            argv=["true"],
+            name="transient",
+            cwd=Path.cwd(),
+            environment={},
+            request=REQUEST,
+            request_id="transient-request",
+        )
+        job_id = str(submitted["job_id"])
+
+        with mock.patch(
+            "scruffy.storage.read_json",
+            side_effect=TransientStorageError("ESTALE"),
+        ):
+            _ingest_requests(controller)
+
+        self.assertNotIn(job_id, controller.state["jobs"])
+        self.assertTrue((self.root / "requests" / job_id).exists())
+        _ingest_requests(controller)
+        self.assertEqual("queued", controller.state["jobs"][job_id]["state"])
+
+    def test_compaction_archives_legacy_jobs_without_request_digests(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+        for index in range(2):
+            job_id = f"legacy-{index}"
+            controller.state["jobs"][job_id] = {
+                "id": job_id,
+                "name": job_id,
+                "state": "failed",
+                "submitted_at": f"2026-08-03T10:0{index}:00+00:00",
+                "finished_at": f"2026-08-03T10:0{index}:30+00:00",
+                "queue_order": index,
+            }
+
+        self.assertTrue(
+            compact_journal(
+                controller,
+                max_bytes=0,
+                max_terminal_jobs=1,
+                terminal_slack=0,
+            )
+        )
+
+        self.assertEqual(1, len(controller.state["jobs"]))
+        self.assertEqual("failed", status(self.root, "legacy-0")["state"])
 
     def test_checkpoint_recovery_replays_newer_workload_deltas(self) -> None:
         controller = _initialize_controller(
@@ -711,6 +779,54 @@ class AsyncCommandRaceTests(unittest.TestCase):
             self.assertEqual("blocked", child["state"])
             self.assertEqual("dependency_missing", child["blockers"][0]["reason"])
 
+    def test_transient_workflow_archive_read_retries_dependency_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            archive_terminal_job(
+                root,
+                {
+                    "id": "root",
+                    "name": "root",
+                    "state": "succeeded",
+                    "queue_order": 1,
+                    "request_digest": "a" * 64,
+                    "workflow_id": "flow",
+                    "task_id": "root",
+                    "needs": [],
+                },
+            )
+            controller.state["jobs"] = {
+                "child": {
+                    "id": "child",
+                    "state": "blocked",
+                    "workflow_id": "flow",
+                    "task_id": "child",
+                    "needs": [{"task_id": "root", "condition": "succeeded"}],
+                    "blockers": [],
+                    "dependency_gate_passed": False,
+                }
+            }
+
+            with mock.patch(
+                "scruffy.storage.read_json",
+                side_effect=TransientStorageError("ESTALE"),
+            ):
+                _refresh_dependencies(controller)
+
+            self.assertEqual("blocked", controller.state["jobs"]["child"]["state"])
+            _refresh_dependencies(controller)
+            self.assertEqual("queued", controller.state["jobs"]["child"]["state"])
+
     def test_batch_admission_never_snapshots_undecided_later_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "queue"
@@ -818,6 +934,51 @@ class AsyncCommandRaceTests(unittest.TestCase):
             batch = _report_batch(controller, 2)
 
             self.assertEqual({"job-a", "job-b"}, {item[0].parent.name for item in batch})
+
+    def test_transient_report_read_is_retried_without_rejection_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            controller.state["jobs"]["job-report"] = {
+                "id": "job-report",
+                "name": "report",
+                "state": "running",
+            }
+            report = {
+                "job_id": "job-report",
+                "event_id": "transient-progress",
+                "kind": "workload.progress",
+                "data": {"step": 1},
+            }
+            publish_event(root, **report)
+
+            with mock.patch(
+                "scruffy.storage.read_json",
+                side_effect=TransientStorageError("ESTALE"),
+            ):
+                _ingest_reports(controller)
+
+            self.assertEqual(1, len(list_reports(root)))
+            self.assertTrue(publish_event(root, **report)["deduplicated"])
+            _ingest_reports(controller)
+
+            self.assertEqual([], list_reports(root))
+            self.assertEqual(
+                1,
+                sum(
+                    event.get("source_event_id") == "transient-progress"
+                    for event in read_events(root)
+                ),
+            )
 
     def test_report_batch_has_one_journal_commit_and_one_state_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1106,6 +1267,41 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 if event["kind"] == "job.cancelled"
             ]
             self.assertEqual(cancellation["request_id"], cancelled[-1]["data"]["request_id"])
+
+    def test_cancel_of_archived_job_is_ignored_not_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            archive_terminal_job(
+                root,
+                {
+                    "id": "job-archived-cancel",
+                    "name": "archived",
+                    "state": "succeeded",
+                    "queue_order": 1,
+                    "request_digest": "a" * 64,
+                },
+            )
+            cancellation = cancel_job(root, "job-archived-cancel")
+
+            _ingest_commands(controller)
+
+            outcome = next(
+                event
+                for event in read_events(root)
+                if event["kind"] == "job.cancel_ignored"
+                and event["data"]["request_id"] == cancellation["request_id"]
+            )
+            self.assertEqual("job_is_succeeded", outcome["data"]["reason"])
 
 
 class SlurmReleaseBarrierTests(unittest.TestCase):

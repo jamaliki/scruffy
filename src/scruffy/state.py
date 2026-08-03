@@ -32,6 +32,7 @@ from .storage import (
     queue_id,
     read_event_page,
     remove_cold_job_directories,
+    StorageError,
     sync_file,
     sync_report_inboxes,
     utc_now,
@@ -198,6 +199,7 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
                 "task_id": task_id,
                 "needs": copy.deepcopy(needs),
                 "blockers": [],
+                "dependency_gate_passed": False,
             }
         )
     return job
@@ -346,11 +348,29 @@ def compact_journal(
     )
     archived_counts = controller.state.setdefault("archived_counts", {})
     retain_count = len(terminal) if max_terminal_jobs < 0 else max_terminal_jobs
-    for job in terminal[retain_count:]:
-        archive_terminal_job(controller.root, job)
+    remaining = len(terminal)
+    for job in reversed(terminal):
+        if remaining <= retain_count:
+            break
+        try:
+            archive_terminal_job(controller.root, job)
+        except (OSError, StorageError) as exc:
+            emit(
+                controller,
+                "notice",
+                data={
+                    "kind": "storage.item_skipped",
+                    "operation": "archive_terminal_job",
+                    "item": str(job.get("id", "unknown")),
+                    "error": str(exc),
+                },
+                snapshot=False,
+            )
+            continue
         state_name = str(job.get("state", "unknown"))
         archived_counts[state_name] = int(archived_counts.get(state_name, 0)) + 1
         del controller.state["jobs"][job["id"]]
+        remaining -= 1
     controller.state["archived_jobs"] = sum(
         int(count) for count in archived_counts.values()
     )

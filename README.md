@@ -100,6 +100,9 @@ returns the original job ID, while changing it raises a conflict. Without a
 request ID, every call creates a new job. Exact request idempotency survives hot
 job eviction through a compact receipt in the archive.
 
+Transient shared-filesystem read failures leave requests and reports pending for
+the next controller poll. They are never converted into rejection receipts.
+
 CLI defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per GPU. Requests
 are rectangular: every selected node receives the same resource shape and runs
 the same argv once. Distributed rendezvous and application ranks remain the
@@ -212,6 +215,8 @@ Cancellation and drain requests are asynchronous and return a `request_id` that
 appears on their journal outcome. `drain` disables new launches for the current
 allocation; running jobs continue and queued jobs remain durable. The drain
 survives controller restarts and clears when a replacement allocation starts.
+Cancelling an archived terminal job produces `job.cancel_ignored`, just like
+cancelling a terminal job still in hot state.
 
 The hot snapshot keeps every nonterminal job and, after compaction, the newest
 1,000 terminal jobs. Older terminal jobs remain addressable by job ID with

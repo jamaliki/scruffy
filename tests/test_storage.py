@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import multiprocessing
 import tempfile
 import traceback
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scruffy.storage import (
     ControllerAlreadyRunning,
     ReportConflict,
     RequestConflict,
+    TransientStorageError,
+    accept_known_requests,
     accept_request,
     accept_reports,
     activate_journal_generation,
@@ -264,6 +268,19 @@ class SubmitRequestTests(StorageTestCase):
         with self.assertRaises(RequestConflict):
             submit_request(self.root, _job_spec("job-corrupt"))
 
+    def test_transient_request_read_is_deferred_without_burning_its_id(self) -> None:
+        spec = _job_spec("job-transient")
+        submit_request(self.root, spec)
+
+        with mock.patch(
+            "scruffy.storage.read_json",
+            side_effect=TransientStorageError("ESTALE"),
+        ):
+            self.assertEqual([], list_requests(self.root))
+
+        self.assertEqual(spec, dict(list_requests(self.root))[spec["job_id"]])
+        self.assertEqual((spec["job_id"], True), submit_request(self.root, spec))
+
     def test_request_listing_does_not_trust_client_timestamps(self) -> None:
         submit_request(
             self.root,
@@ -292,6 +309,25 @@ class SubmitRequestTests(StorageTestCase):
         lock_files = list((self.root / "requests" / ".locks").glob("*.lock"))
         self.assertLessEqual(len(lock_files), 64)
 
+    def test_known_request_receipt_conflict_is_contained_per_item(self) -> None:
+        spec = _job_spec("job-known")
+        submit_request(self.root, spec)
+        reject_request(self.root, spec["job_id"])
+        request_directory = self.root / "requests" / spec["job_id"]
+        request_directory.mkdir()
+        (request_directory / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        errors: list[str] = []
+
+        accepted = accept_known_requests(
+            self.root,
+            {spec["job_id"]},
+            on_error=lambda job_id, _exc: errors.append(job_id),
+        )
+
+        self.assertEqual(0, accepted)
+        self.assertEqual([spec["job_id"]], errors)
+        self.assertTrue(request_directory.exists())
+
     def test_terminal_archive_preserves_request_and_workflow_lookup(self) -> None:
         spec = _job_spec("job-archived")
         submit_request(self.root, spec)
@@ -317,6 +353,51 @@ class SubmitRequestTests(StorageTestCase):
             [item["id"] for item in list_archived_workflow(self.root, "flow-1")],
         )
         self.assertEqual((job["id"], True), submit_request(self.root, spec))
+
+    def test_legacy_job_without_identity_archives_fail_closed(self) -> None:
+        job = {
+            "id": "job-legacy",
+            "name": "legacy",
+            "state": "failed",
+            "submitted_at": "2026-08-03T12:00:00+00:00",
+            "finished_at": "2026-08-03T12:01:00+00:00",
+            "queue_order": 1,
+        }
+
+        archive_terminal_job(self.root, job)
+
+        self.assertEqual("failed", find_archived_job(self.root, job["id"])["state"])
+        with self.assertRaises(RequestConflict):
+            submit_request(self.root, _job_spec(job["id"]))
+
+    def test_corrupt_workflow_archive_entry_is_skipped_and_reported(self) -> None:
+        job = {
+            "id": "job-workflow",
+            "name": "workflow",
+            "state": "succeeded",
+            "queue_order": 1,
+            "request_digest": "a" * 64,
+            "workflow_id": "flow-corrupt",
+            "task_id": "train",
+            "needs": [],
+        }
+        archive_terminal_job(self.root, job)
+        workflow_directory = next(
+            source.parent
+            for source in (self.root / "requests" / ".workflows").rglob("*.json")
+        )
+        corrupt = workflow_directory / "corrupt.json"
+        corrupt.write_text("{broken", encoding="utf-8")
+        errors: list[Path] = []
+
+        jobs = list_archived_workflow(
+            self.root,
+            "flow-corrupt",
+            on_error=lambda source, _exc: errors.append(source),
+        )
+
+        self.assertEqual([job["id"]], [item["id"] for item in jobs])
+        self.assertEqual([corrupt.resolve()], errors)
 
 
 class SubmitReportTests(StorageTestCase):
@@ -386,6 +467,29 @@ class SubmitReportTests(StorageTestCase):
 
         self.assertEqual(("current-event", True), submit_report(self.root, current))
         self.assertEqual(("old-event", False), submit_report(self.root, old))
+
+    def test_rejected_receipt_never_claims_a_retry_was_applied(self) -> None:
+        report = _workload_report("rejected-event")
+        submit_report(self.root, report)
+        source, _ = list_reports(self.root)[0]
+        accept_reports(((source, None),), generation=0)
+
+        with self.assertRaises(ReportConflict):
+            submit_report(self.root, report)
+
+    def test_transient_report_read_leaves_the_only_copy_pending(self) -> None:
+        report = _workload_report("transient-event")
+        submit_report(self.root, report)
+        source = list_reports(self.root)[0][0]
+
+        with mock.patch(
+            "scruffy.storage.read_json",
+            side_effect=TransientStorageError("ESTALE"),
+        ):
+            self.assertEqual([], list_reports(self.root))
+
+        self.assertTrue(source.exists())
+        self.assertEqual(report, list_reports(self.root)[0][1])
 
     def test_legacy_receipts_migrate_valid_and_rejected_identities(self) -> None:
         valid = _workload_report("legacy-valid")

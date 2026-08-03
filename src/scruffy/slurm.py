@@ -119,6 +119,14 @@ def build_srun_argv(
     ]
 
 
+def build_srun_environment() -> dict[str, str]:
+    """Return the controller environment without a stale worker node override."""
+
+    environment = os.environ.copy()
+    environment.pop("SCRUFFY_NODE", None)
+    return environment
+
+
 def live_steps(slurm_job_id: str) -> tuple[SlurmStep, ...]:
     """Return an error-checked live snapshot for one outer allocation.
 
