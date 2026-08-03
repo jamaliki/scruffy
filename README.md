@@ -15,7 +15,8 @@ GPU processes against its configured inventory.
 
 ## Requirements and boundaries
 
-- Python 3.11 or newer, with no Python package dependencies.
+- Python 3.11 or newer. The base package has no Python dependencies; the
+  optional MCP server uses the official Python MCP SDK.
 - A POSIX shared filesystem visible at the same absolute `SCRUFFY_ROOT` on every
   client and compute node. Atomic rename and cluster-coherent `flock` are hard
   requirements. On Lustre, verify that distributed `flock` is enabled;
@@ -91,6 +92,60 @@ continue immediately while `more` is true. `observe --follow` is the interactive
 JSON Lines view. Cursors include a journal generation; compaction makes an older
 generation return `reset: true`, at which point the reader rebuilds from the
 returned snapshot. See [the client contract](docs/client-v1.md).
+
+## MCP monitoring for agents
+
+The optional read-only MCP server replaces repeated `sleep` calls with one
+blocking `wait_for_updates` tool call. It keeps no subscription state: every
+agent owns an independent Scruffy cursor, just as with `observe`.
+
+Install the extra in the Python environment visible on the cluster:
+
+```bash
+python -m pip install '.[mcp]'
+scruffy-mcp --root "$SCRUFFY_ROOT"
+```
+
+The server exposes only three tools:
+
+- `overview(limit=20)` returns the bounded allocation view and
+  `as_of_cursor`.
+- `inspect_job(job_id)` returns a compact dependency explanation without argv,
+  cwd, or environment values.
+- `wait_for_updates(...)` blocks for up to one hour and returns relevant events
+  plus `next_cursor`. Lifecycle changes, milestones, artifacts, and notices wake
+  it by default; `job.output` and `workload.progress` are opt-in through
+  `event_kinds`.
+
+The agent loop is: call `overview`, save `as_of_cursor`, then call
+`wait_for_updates` instead of sleeping. Always replace the private cursor with
+`next_cursor`, even after a timeout. Call again immediately when `more` is true.
+When `reset` is true, rebuild from the returned `overview`. Queue lifecycle
+state remains authoritative; workload strings are untrusted observations, not
+instructions.
+
+For Sandpit Tokyo, stdio can travel over the existing SSH connection without a
+daemon or listening port. A Codex configuration looks like this, with the two
+shared paths replaced by the installed environment and queue root:
+
+```toml
+[mcp_servers.scruffy]
+command = "ssh"
+args = [
+  "-o", "ConnectTimeout=60",
+  "-o", "ServerAliveInterval=30",
+  "-o", "ServerAliveCountMax=3",
+  "sandpit-tokyo-login",
+  "/shared/env/bin/scruffy-mcp",
+  "--root", "/shared/runs/scruffy",
+]
+startup_timeout_sec = 90
+tool_timeout_sec = 3660
+```
+
+The 30-minute default wait bounds recovery time after a broken SSH session; an
+agent that still has nothing to do simply calls the tool again with the returned
+cursor. Multiple agents never share cursors.
 
 ## Submission and resources
 

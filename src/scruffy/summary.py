@@ -22,10 +22,13 @@ def _parse_time(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _job_view(job: dict[str, Any], now: datetime) -> dict[str, Any]:
+def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Return the bounded job projection shared by summaries and observers."""
+
+    current = now or datetime.now(timezone.utc)
     workload = job.get("workload") if isinstance(job.get("workload"), dict) else None
     updated = _parse_time(workload.get("last_update_at")) if workload else None
-    progress_age = max(0.0, (now - updated).total_seconds()) if updated else None
+    progress_age = max(0.0, (current - updated).total_seconds()) if updated else None
     return {
         "id": job["id"],
         "name": job.get("name"),
@@ -107,11 +110,11 @@ def build_summary(
         key=_recent_key,
         reverse=True,
     )
-    submitted = [_job_view(job, current) for job in submitted_jobs]
-    active = [_job_view(job, current) for job in active_jobs]
-    queued = [_job_view(job, current) for job in queued_jobs]
-    blocked = [_job_view(job, current) for job in blocked_jobs]
-    attention = [_job_view(job, current) for job in attention_jobs]
+    submitted = [job_view(job, current) for job in submitted_jobs]
+    active = [job_view(job, current) for job in active_jobs]
+    queued = [job_view(job, current) for job in queued_jobs]
+    blocked = [job_view(job, current) for job in blocked_jobs]
+    attention = [job_view(job, current) for job in attention_jobs]
     recent = sorted(
         (job for job in jobs if job.get("state") in TERMINAL_JOB_STATES),
         key=lambda job: str(job.get("finished_at") or ""),
@@ -137,7 +140,7 @@ def build_summary(
         "queued": queued[:limit],
         "blocked": blocked[:limit],
         "requires_attention": attention[:limit],
-        "recent_terminal": [_job_view(job, current) for job in recent[:limit]],
+        "recent_terminal": [job_view(job, current) for job in recent[:limit]],
         "truncated": {
             "submitted": len(submitted) > limit,
             "active": len(active) > limit,

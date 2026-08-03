@@ -23,8 +23,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.28.1,<2"]
+
 [project.scripts]
 scruffy = "scruffy.cli:main"
+scruffy-mcp = "scruffy.mcp_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
