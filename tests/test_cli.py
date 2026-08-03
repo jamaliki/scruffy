@@ -306,6 +306,7 @@ class ObserveFollowCliTests(unittest.TestCase):
             "snapshot": {"allocation": None, "jobs": {}},
             "events": [],
             "next_cursor": "queue-test:0:0",
+            "reset": False,
         }
         with (
             mock.patch("scruffy.cli.observe", return_value=response),
@@ -317,6 +318,43 @@ class ObserveFollowCliTests(unittest.TestCase):
         print_output.assert_called_once_with(
             '{"kind": "snapshot", "data": {"allocation": null, "jobs": {}}}',
             flush=True,
+        )
+
+    def test_follow_prints_a_replacement_snapshot_after_cursor_reset(self) -> None:
+        initial = {
+            "snapshot": {"jobs": {"old": {}}},
+            "events": [],
+            "next_cursor": "queue-test:0:1:10",
+            "reset": False,
+        }
+        replacement = {
+            "snapshot": {"jobs": {"new": {}}},
+            "events": [],
+            "next_cursor": "queue-test:1:2:0",
+            "reset": True,
+        }
+        with (
+            mock.patch(
+                "scruffy.cli.observe",
+                side_effect=[initial, replacement, KeyboardInterrupt],
+            ),
+            mock.patch("builtins.print") as print_output,
+        ):
+            result = main(["--root", "/tmp/scruffy-test", "observe", "--follow"])
+
+        self.assertEqual(130, result)
+        self.assertEqual(
+            [
+                mock.call(
+                    '{"kind": "snapshot", "data": {"jobs": {"old": {}}}}',
+                    flush=True,
+                ),
+                mock.call(
+                    '{"kind": "snapshot", "data": {"jobs": {"new": {}}}}',
+                    flush=True,
+                ),
+            ],
+            print_output.call_args_list,
         )
 
 

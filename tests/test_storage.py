@@ -12,16 +12,28 @@ from scruffy.storage import (
     ControllerAlreadyRunning,
     ReportConflict,
     RequestConflict,
+    accept_request,
+    accept_reports,
+    activate_journal_generation,
     append_event,
+    archive_terminal_job,
+    compact_report_receipts,
     controller_lock,
+    create_journal_generation,
+    find_archived_job,
     find_request,
-    journal_tail,
+    job_identity_digest,
+    latest_checkpoint,
+    list_archived_workflow,
     list_reports,
     list_requests,
     open_journal,
+    next_journal_generation,
     read_event_page,
     read_events,
-    remove_report,
+    report_identity_digest,
+    report_was_accepted,
+    prune_report_receipts,
     submit_report,
     submit_request,
     tail_bytes,
@@ -225,6 +237,45 @@ class SubmitRequestTests(StorageTestCase):
         for spec in specs:
             self.assertEqual(spec, stored[spec["job_id"]])
 
+    def test_admitted_request_keeps_exact_compact_idempotency(self) -> None:
+        spec = _job_spec("job-admitted")
+        submit_request(self.root, spec)
+
+        self.assertTrue(accept_request(self.root, spec["job_id"]))
+
+        self.assertEqual([], list_requests(self.root))
+        self.assertEqual((spec["job_id"], True), submit_request(self.root, spec))
+        with self.assertRaises(RequestConflict):
+            submit_request(self.root, _job_spec("job-admitted", variant="changed"))
+        lock_files = list((self.root / "requests" / ".locks").glob("*.lock"))
+        self.assertLessEqual(len(lock_files), 64)
+
+    def test_terminal_archive_preserves_request_and_workflow_lookup(self) -> None:
+        spec = _job_spec("job-archived")
+        submit_request(self.root, spec)
+        accept_request(self.root, spec["job_id"])
+        job = {
+            "id": spec["job_id"],
+            "name": "train",
+            "state": "succeeded",
+            "submitted_at": spec["submitted_at"],
+            "finished_at": "2026-08-03T12:00:00+00:00",
+            "queue_order": 7,
+            "request_digest": job_identity_digest(spec),
+            "workflow_id": "flow-1",
+            "task_id": "train",
+            "needs": [],
+        }
+
+        archive_terminal_job(self.root, job)
+
+        self.assertEqual("succeeded", find_archived_job(self.root, job["id"])["state"])
+        self.assertEqual(
+            [job["id"]],
+            [item["id"] for item in list_archived_workflow(self.root, "flow-1")],
+        )
+        self.assertEqual((job["id"], True), submit_request(self.root, spec))
+
 
 class SubmitReportTests(StorageTestCase):
     def test_concurrent_retries_create_one_durable_report(self) -> None:
@@ -255,16 +306,66 @@ class SubmitReportTests(StorageTestCase):
         expected_name = hashlib.sha256(event_id.encode()).hexdigest() + ".json"
         self.assertEqual(expected_name, source.name)
 
-        remove_report(source)
+        accept_reports(
+            ((source, report_identity_digest(report)),),
+            generation=0,
+        )
 
         self.assertEqual([], list_reports(self.root))
-        receipt = self.root / "reports" / ".accepted" / report["job_id"] / expected_name
-        self.assertTrue(receipt.exists())
+        retained, digest = report_was_accepted(self.root, source)
+        self.assertTrue(retained)
+        self.assertEqual(report_identity_digest(report), digest)
+        receipts = list((self.root / "reports" / ".accepted" / ".g000000").iterdir())
+        self.assertEqual(1, len(receipts))
+        self.assertTrue(receipts[0].is_symlink())
         retried = {**report, "occurred_at": "2026-08-03T12:05:00.000+00:00"}
         self.assertEqual((event_id, True), submit_report(self.root, retried))
         self.assertEqual([], list_reports(self.root))
         with self.assertRaises(ReportConflict):
             submit_report(self.root, {**report, "data": {"step": 2}})
+
+    def test_report_receipts_expire_with_journal_generations(self) -> None:
+        old = _workload_report("old-event")
+        current = _workload_report("current-event")
+        submit_report(self.root, old)
+        old_source, _ = list_reports(self.root)[0]
+        accept_reports(
+            ((old_source, report_identity_digest(old)),),
+            generation=0,
+        )
+        submit_report(self.root, current)
+        current_source = list_reports(self.root)[0][0]
+        accept_reports(
+            ((current_source, report_identity_digest(current)),),
+            generation=1,
+        )
+
+        prune_report_receipts(self.root, keep={1})
+
+        self.assertEqual(("current-event", True), submit_report(self.root, current))
+        self.assertEqual(("old-event", False), submit_report(self.root, old))
+
+    def test_legacy_receipts_migrate_valid_and_rejected_identities(self) -> None:
+        valid = _workload_report("legacy-valid")
+        submit_report(self.root, valid)
+        valid_source = list_reports(self.root)[0][0]
+        valid_legacy = self.root / "reports" / ".accepted" / valid["job_id"]
+        valid_legacy.mkdir(parents=True)
+        valid_source.rename(valid_legacy / valid_source.name)
+
+        event_digest = hashlib.sha256(b"bad-event").hexdigest()
+        rejected_legacy = self.root / "reports" / ".accepted" / "job-bad"
+        rejected_legacy.mkdir(parents=True)
+        (rejected_legacy / f"{event_digest}.json").write_text("not json")
+        (rejected_legacy / "keep.txt").write_text("unrecognized survivor")
+
+        self.assertEqual(2, compact_report_receipts(self.root))
+
+        pending_source = self.root / "reports" / "job-bad" / f"{event_digest}.json"
+        self.assertEqual((True, None), report_was_accepted(self.root, pending_source))
+        self.assertEqual(("legacy-valid", True), submit_report(self.root, valid))
+        self.assertFalse(valid_legacy.exists())
+        self.assertEqual(["keep.txt"], [source.name for source in rejected_legacy.iterdir()])
 
     def test_one_corrupt_or_oversized_report_does_not_hide_valid_reports(self) -> None:
         submit_report(self.root, _workload_report("valid-event"))
@@ -330,7 +431,6 @@ class EventJournalTests(StorageTestCase):
             self.assertEqual(self.EVENTS, events)
         self.assertEqual(self.EVENTS, read_events(self.root))
         self.assertEqual(self.EVENTS[1:], read_events(self.root, after=1))
-        self.assertEqual(3, journal_tail(self.root)[0])
 
     def test_incomplete_trailing_event_is_ignored(self) -> None:
         complete = self.EVENTS[:2]
@@ -342,23 +442,22 @@ class EventJournalTests(StorageTestCase):
 
         self.assertEqual(complete, read_events(self.root))
         self.assertEqual([], read_events(self.root, after=2))
-        self.assertEqual(2, journal_tail(self.root)[0])
 
     def test_torn_first_record_does_not_advance_byte_cursor(self) -> None:
         journal = self.root / "events.jsonl"
         journal.parent.mkdir(parents=True)
         journal.write_bytes(b'{"seq":1,"kind":"' + b"x" * 9000 + b'"')
 
-        self.assertEqual((0, 0), journal_tail(self.root))
+        events, offset, more = read_event_page(self.root, offset=0, limit=1)
+        self.assertEqual([], events)
+        self.assertEqual(0, offset)
+        self.assertFalse(more)
 
         with journal.open("ab") as handle:
             handle.write(b"}\n")
-        sequence, offset = journal_tail(self.root)
         events, next_offset, more = read_event_page(self.root, offset=0, limit=1)
-        self.assertEqual(1, sequence)
-        self.assertEqual(journal.stat().st_size, offset)
         self.assertEqual([1], [event["seq"] for event in events])
-        self.assertEqual(offset, next_offset)
+        self.assertEqual(journal.stat().st_size, next_offset)
         self.assertFalse(more)
 
     def test_event_pages_resume_at_byte_offsets(self) -> None:
@@ -375,7 +474,17 @@ class EventJournalTests(StorageTestCase):
         self.assertTrue(more)
         self.assertEqual([3], [event["seq"] for event in second])
         self.assertFalse(final_more)
-        self.assertEqual((3, final_offset), journal_tail(self.root))
+        self.assertEqual((self.root / "events.jsonl").stat().st_size, final_offset)
+
+    def test_orphan_rotation_never_supersedes_the_active_checkpoint(self) -> None:
+        active = {"queue_id": "queue-test", "journal_generation": 1, "jobs": {}}
+        orphan = {"queue_id": "queue-test", "journal_generation": 2, "jobs": {}}
+        create_journal_generation(self.root, 1, active)
+        activate_journal_generation(self.root, 1)
+        create_journal_generation(self.root, 2, orphan)
+
+        self.assertEqual((1, active), latest_checkpoint(self.root))
+        self.assertEqual(3, next_journal_generation(self.root, 1))
 
 
 class TailBytesTests(StorageTestCase):

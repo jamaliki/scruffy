@@ -17,12 +17,13 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import AbstractSet, Any, BinaryIO, Iterator, TextIO
+from typing import AbstractSet, Any, BinaryIO, Iterator, Sequence, TextIO
 
 from .protocol import MAX_EVENT_BYTES, validate_event
 
 
 LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports")
+LOCK_SHARDS = 64
 
 
 class StorageError(RuntimeError):
@@ -77,12 +78,15 @@ def _fsync_directory(directory: Path) -> None:
 
     try:
         descriptor = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+            return
+        raise
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+            raise
     finally:
         os.close(descriptor)
 
@@ -125,6 +129,12 @@ def canonical_job_identity(spec: dict[str, Any]) -> bytes:
     ).encode()
 
 
+def job_identity_digest(spec: dict[str, Any]) -> str:
+    """Return the stable fingerprint retained after request admission."""
+
+    return hashlib.sha256(canonical_job_identity(spec)).hexdigest()
+
+
 def create_job_id(request_id: str | None = None) -> str:
     if request_id:
         digest = hashlib.sha256(request_id.encode()).hexdigest()[:20]
@@ -140,6 +150,31 @@ def _existing_request(root: Path, job_id: str) -> dict[str, Any] | None:
     return read_json(source)
 
 
+def _key_lock(storage_root: Path, key: str) -> BinaryIO:
+    """Open one of a fixed number of locks for a stable identity."""
+
+    lock_root = storage_root / ".locks"
+    _mkdir(lock_root)
+    digest = hashlib.sha256(key.encode()).digest()
+    shard = int.from_bytes(digest[:4], "big") % LOCK_SHARDS
+    return (lock_root / f"{shard:02d}.lock").open("a+b")
+
+
+def _request_receipt(request_root: Path, job_id: str) -> Path:
+    digest = hashlib.sha256(job_id.encode()).hexdigest()
+    return request_root / ".accepted" / digest[:2] / f"{digest}.json"
+
+
+def _read_request_receipt(request_root: Path, job_id: str) -> dict[str, Any] | None:
+    source = _request_receipt(request_root, job_id)
+    if not source.exists():
+        return None
+    receipt = read_json(source)
+    if not isinstance(receipt, dict) or receipt.get("job_id") != job_id:
+        raise StorageError(f"invalid request receipt for {job_id}")
+    return receipt
+
+
 def submit_request(root: Path, spec: dict[str, Any]) -> tuple[str, bool]:
     """Durably enqueue a job without contacting or waiting for the controller.
 
@@ -150,28 +185,33 @@ def submit_request(root: Path, spec: dict[str, Any]) -> tuple[str, bool]:
 
     root = ensure_layout(root)
     job_id = str(spec["job_id"])
-    destination = root / "requests" / job_id
-    temporary = root / "requests" / f".{job_id}.{uuid.uuid4().hex}.tmp"
+    request_root = root / "requests"
+    destination = request_root / job_id
+    identity_digest = job_identity_digest(spec)
+    temporary = request_root / f".{job_id}.{uuid.uuid4().hex}.tmp"
     temporary.mkdir()
     try:
         atomic_write_json(temporary / "spec.json", spec)
         _fsync_directory(temporary)
-        try:
+        with _key_lock(request_root, job_id) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            existing = _existing_request(root, job_id)
+            if existing is not None:
+                if canonical_job_identity(existing) != canonical_job_identity(spec):
+                    raise RequestConflict(
+                        f"request ID for {job_id} was already used for a different job"
+                    )
+                return job_id, True
+            receipt = _read_request_receipt(request_root, job_id)
+            if receipt is not None:
+                if receipt.get("digest") == identity_digest:
+                    return job_id, True
+                raise RequestConflict(
+                    f"request ID for {job_id} was already used for a different job"
+                )
             os.rename(temporary, destination)
             _fsync_directory(destination.parent)
             return job_id, False
-        except OSError as exc:
-            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                raise
-
-        existing = _existing_request(root, job_id)
-        if existing is None:
-            raise StorageError(f"request {job_id} raced but is not readable")
-        if canonical_job_identity(existing) != canonical_job_identity(spec):
-            raise RequestConflict(
-                f"request ID for {job_id} was already used for a different job"
-            )
-        return job_id, True
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
@@ -199,6 +239,154 @@ def find_request(root: Path, job_id: str) -> dict[str, Any] | None:
     return _existing_request(ensure_layout(root), job_id)
 
 
+def accept_request(root: Path, job_id: str) -> bool:
+    """Replace one admitted request spec with a compact idempotency receipt."""
+
+    request_root = ensure_layout(root) / "requests"
+    with _key_lock(request_root, job_id) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        source = request_root / job_id
+        spec_file = source / "spec.json"
+        if not spec_file.exists():
+            return False
+        spec = read_json(spec_file)
+        digest = job_identity_digest(spec)
+        receipt = _request_receipt(request_root, job_id)
+        existing = _read_request_receipt(request_root, job_id)
+        if existing is not None and existing.get("digest") != digest:
+            raise StorageError(f"conflicting request receipt for {job_id}")
+        if existing is None:
+            _mkdir(receipt.parent.parent)
+            _mkdir(receipt.parent)
+            atomic_write_json(
+                receipt,
+                {"v": 1, "job_id": job_id, "digest": digest},
+            )
+        # An earlier attempt may have created but not durably published the
+        # receipt. Re-sync its parent before deleting the only full request.
+        _fsync_directory(receipt.parent)
+        shutil.rmtree(source)
+        _fsync_directory(request_root)
+        return True
+
+
+def accept_known_requests(root: Path, known_job_ids: AbstractSet[str]) -> int:
+    """Archive legacy request specs already represented in controller state."""
+
+    accepted = 0
+    for spec in list_requests(root):
+        job_id = str(spec.get("job_id", ""))
+        if job_id in known_job_ids and accept_request(root, job_id):
+            accepted += 1
+    return accepted
+
+
+_ARCHIVED_JOB_FIELDS = (
+    "id",
+    "name",
+    "state",
+    "submitted_at",
+    "queue_order",
+    "started_at",
+    "finished_at",
+    "exit_code",
+    "signal",
+    "reason",
+    "error",
+    "workflow_id",
+    "task_id",
+    "needs",
+    "workflow_invalid",
+)
+
+
+def _archived_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Keep only terminal and workflow fields needed after hot retention."""
+
+    return {
+        **{key: job[key] for key in _ARCHIVED_JOB_FIELDS if key in job},
+        "archived": True,
+    }
+
+
+def _workflow_archive(root: Path, workflow_id: str) -> Path:
+    digest = hashlib.sha256(workflow_id.encode()).hexdigest()
+    return ensure_layout(root) / "requests" / ".workflows" / digest[:2] / digest
+
+
+def archive_terminal_job(root: Path, job: dict[str, Any]) -> None:
+    """Durably move one terminal job's compact identity into the cold index."""
+
+    job_id = str(job["id"])
+    request_root = ensure_layout(root) / "requests"
+    with _key_lock(request_root, job_id) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        receipt_file = _request_receipt(request_root, job_id)
+        receipt = _read_request_receipt(request_root, job_id)
+        digest = (receipt or {}).get("digest") or job.get("request_digest")
+        if not isinstance(digest, str):
+            raise StorageError(f"job {job_id} has no request identity")
+        _mkdir(receipt_file.parent.parent)
+        _mkdir(receipt_file.parent)
+        archived = _archived_job(job)
+        atomic_write_json(
+            receipt_file,
+            {"v": 1, "job_id": job_id, "digest": digest, "job": archived},
+        )
+
+        workflow_id = archived.get("workflow_id")
+        task_id = archived.get("task_id")
+        if isinstance(workflow_id, str) and isinstance(task_id, str):
+            workflow_directory = _workflow_archive(root, workflow_id)
+            _mkdir(workflow_directory.parent.parent)
+            _mkdir(workflow_directory.parent)
+            _mkdir(workflow_directory)
+            job_digest = hashlib.sha256(job_id.encode()).hexdigest()
+            atomic_write_json(
+                workflow_directory / f"{job_digest}.json",
+                {"v": 1, "workflow_id": workflow_id, "job": archived},
+            )
+
+
+def find_archived_job(root: Path, job_id: str) -> dict[str, Any] | None:
+    """Return an evicted terminal job's compact record, if retained."""
+
+    receipt = _read_request_receipt(ensure_layout(root) / "requests", job_id)
+    job = receipt.get("job") if receipt else None
+    return job if isinstance(job, dict) else None
+
+
+def list_archived_workflow(root: Path, workflow_id: str) -> list[dict[str, Any]]:
+    """Load compact terminal tasks for one workflow, never the whole archive."""
+
+    directory = _workflow_archive(root, workflow_id)
+    if not directory.exists():
+        return []
+    jobs: list[dict[str, Any]] = []
+    for source in directory.glob("*.json"):
+        document = read_json(source)
+        if not isinstance(document, dict) or document.get("workflow_id") != workflow_id:
+            continue
+        job = document.get("job")
+        if isinstance(job, dict):
+            jobs.append(job)
+    return sorted(jobs, key=lambda job: int(job.get("queue_order", 0)))
+
+
+def remove_cold_job_directories(root: Path, hot_job_ids: AbstractSet[str]) -> int:
+    """Delete log directories for terminal jobs already moved out of hot state."""
+
+    jobs_root = ensure_layout(root) / "jobs"
+    removed = 0
+    for directory in jobs_root.iterdir():
+        if directory.is_dir() and directory.name not in hot_job_ids:
+            shutil.rmtree(directory)
+            removed += 1
+    if removed:
+        _fsync_directory(jobs_root)
+    return removed
+
+
 def _canonical_report_identity(report: dict[str, Any]) -> bytes:
     """Ignore retry time while detecting reuse of one producer event ID."""
 
@@ -208,36 +396,85 @@ def _canonical_report_identity(report: dict[str, Any]) -> bytes:
     ).encode()
 
 
-def _report_directory(root: Path, job_id: str) -> Path:
-    report_root = ensure_layout(root) / "reports"
-    directory = report_root / job_id
+def report_identity_digest(report: dict[str, Any]) -> str:
+    """Return the compact identity retained after a report is accepted."""
+
+    return hashlib.sha256(_canonical_report_identity(report)).hexdigest()
+
+
+def _mkdir(directory: Path) -> None:
+    """Create and durably publish one directory, tolerating concurrent creators."""
+
     try:
         directory.mkdir()
     except FileExistsError:
         if not directory.is_dir():
-            raise StorageError(f"report inbox {directory} is not a directory")
+            raise StorageError(f"{directory} is not a directory")
     else:
-        _fsync_directory(report_root)
-    return directory
+        _fsync_directory(directory.parent)
+
+
+def _report_receipt_key(job_id: str, event_digest: str) -> str:
+    return hashlib.sha256(f"{job_id}\0{event_digest}".encode()).hexdigest()
+
+
+def _report_receipt_directory(report_root: Path, generation: int) -> Path:
+    return report_root / ".accepted" / f".g{generation:06d}"
+
+
+def _report_receipt_identity(
+    report_root: Path, job_id: str, event_digest: str
+) -> tuple[bool, str | None]:
+    """Return a retained identity without scanning historical event keys."""
+
+    accepted_root = report_root / ".accepted"
+    if not accepted_root.exists():
+        return False, None
+    key = _report_receipt_key(job_id, event_digest)
+    identities: set[str] = set()
+    for directory in accepted_root.glob(".g[0-9]*"):
+        receipt = directory / key
+        if receipt.is_symlink():
+            try:
+                identities.add(os.readlink(receipt))
+            except FileNotFoundError:
+                continue
+        elif os.path.lexists(receipt):
+            raise StorageError(f"invalid report receipt {receipt}")
+    if len(identities) > 1:
+        raise StorageError(f"conflicting retained receipts for {job_id}/{event_digest}")
+    if not identities:
+        return False, None
+    identity = identities.pop()
+    return True, None if identity == "-" else identity
+
+
+def report_was_accepted(root: Path, source: Path) -> tuple[bool, str | None]:
+    """Check whether an inbox file is a stale copy of a committed report."""
+
+    report_root = ensure_layout(root) / "reports"
+    return _report_receipt_identity(report_root, source.parent.name, source.stem)
 
 
 def submit_report(root: Path, report: dict[str, Any]) -> tuple[str, bool]:
-    """Durably spool one validated producer event, idempotently by event ID."""
+    """Spool an event; its ID deduplicates across retained generations."""
 
     document = validate_event(report)
     event_id = document["event_id"]
-    directory = _report_directory(root, document["job_id"])
-    digest = hashlib.sha256(event_id.encode()).hexdigest()
-    destination = directory / f"{digest}.json"
-    accepted = directory.parent / ".accepted" / document["job_id"] / destination.name
+    report_root = ensure_layout(root) / "reports"
+    directory = report_root / document["job_id"]
+    event_digest = hashlib.sha256(event_id.encode()).hexdigest()
+    identity_digest = report_identity_digest(document)
+    destination = directory / f"{event_digest}.json"
+    accepted_directory = report_root / ".accepted" / document["job_id"]
+    legacy_receipt = accepted_directory / destination.name
 
-    # A short per-job lock lets us use the existing write+replace primitive
-    # without a check/replace race between concurrent publishers. Different
-    # jobs never contend with one another.
-    with (directory / ".inbox.lock").open("a+b") as lock:
+    # The lock lives outside the transient inbox, so the controller can remove
+    # empty job directories without racing a concurrent publisher.
+    with _key_lock(report_root, document["job_id"]) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        existing_source = destination if destination.exists() else accepted
-        if existing_source.exists():
+        if destination.exists() or legacy_receipt.exists():
+            existing_source = destination if destination.exists() else legacy_receipt
             existing = read_json(existing_source)
             try:
                 previous = validate_event(existing)
@@ -252,6 +489,16 @@ def submit_report(root: Path, report: dict[str, Any]) -> tuple[str, bool]:
                     f"event ID {event_id!r} was already used for a different report"
                 )
             return event_id, True
+        retained, previous_digest = _report_receipt_identity(
+            report_root, document["job_id"], event_digest
+        )
+        if retained:
+            if previous_digest in {None, identity_digest}:
+                return event_id, True
+            raise ReportConflict(
+                f"event ID {event_id!r} was already used for a different report"
+            )
+        _mkdir(directory)
         atomic_write_json(destination, document)
         return event_id, False
 
@@ -305,35 +552,155 @@ def report_streams(
     ]
 
 
-def remove_report(source: Path) -> None:
-    """Acknowledge a report while retaining its durable idempotency receipt."""
+def accept_reports(
+    reports: Sequence[tuple[Path, str | None]], *, generation: int = 0
+) -> None:
+    """Retain one batch's identities with a single directory sync.
 
-    directory = source.parent
-    accepted_root = directory.parent / ".accepted"
-    accepted_directory = accepted_root / directory.name
-    with (directory / ".inbox.lock").open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if not source.exists():
-            return
+    Symlink targets hold identity digests without a file-content fsync. Inbox
+    deletions need not be synced individually: a durable receipt makes a stale
+    source harmless and lets a later controller remove it again.
+    """
+
+    by_root: dict[Path, list[tuple[Path, str | None]]] = {}
+    for source, identity_digest in reports:
+        by_root.setdefault(source.parent.parent, []).append((source, identity_digest))
+
+    for report_root, items in by_root.items():
+        accepted_root = report_root / ".accepted"
+        receipt_directory = _report_receipt_directory(report_root, generation)
+        _mkdir(accepted_root)
+        _mkdir(receipt_directory)
+        sources: list[Path] = []
+        for source, identity_digest in items:
+            job_id = source.parent.name
+            with _key_lock(report_root, job_id) as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                if not source.exists():
+                    continue
+                receipt = receipt_directory / _report_receipt_key(job_id, source.stem)
+                target = "-" if identity_digest is None else identity_digest
+                if receipt.is_symlink():
+                    if os.readlink(receipt) != target:
+                        raise StorageError(
+                            f"conflicting receipt for report {source.name!r}"
+                        )
+                elif os.path.lexists(receipt):
+                    raise StorageError(f"invalid report receipt {receipt}")
+                else:
+                    os.symlink(target, receipt)
+                sources.append(source)
+
+        # This commits every receipt in the batch, including receipts found
+        # after an interrupted earlier attempt, before any inbox source goes.
+        if sources:
+            _fsync_directory(receipt_directory)
+        for source in sources:
+            with _key_lock(report_root, source.parent.name) as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                source.unlink(missing_ok=True)
+                legacy_lock = source.parent / ".inbox.lock"
+                legacy_lock.unlink(missing_ok=True)
+                try:
+                    source.parent.rmdir()
+                except OSError as exc:
+                    if exc.errno not in {errno.ENOTEMPTY, errno.ENOENT}:
+                        raise
+        if sources:
+            _fsync_directory(report_root)
+
+
+def compact_report_receipts(root: Path) -> int:
+    """Migrate legacy full receipts to the generation-scoped direct index."""
+
+    report_root = ensure_layout(root) / "reports"
+    marker = report_root / ".compact-receipts-v1.json"
+    if marker.exists():
+        return 0
+    accepted_root = report_root / ".accepted"
+    if not accepted_root.exists():
+        atomic_write_json(marker, {"v": 1})
+        return 0
+    receipt_directory = _report_receipt_directory(report_root, 0)
+    _mkdir(receipt_directory)
+    migrated: list[tuple[Path, list[Path]]] = []
+    for directory in sorted(accepted_root.iterdir()):
+        if directory.name.startswith(".") or not directory.is_dir():
+            continue
+        entries: list[Path] = []
+        with _key_lock(report_root, directory.name) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for source in directory.iterdir():
+                if source.suffix == ".json" and source.is_file():
+                    event_digest = source.stem
+                    try:
+                        document = validate_event(read_json(source))
+                        identity_digest = report_identity_digest(document)
+                    except (StorageError, TypeError, ValueError):
+                        # Older controllers retained rejected input verbatim.
+                        identity_digest = "-"
+                else:
+                    continue
+                receipt = receipt_directory / _report_receipt_key(
+                    directory.name, event_digest
+                )
+                if not receipt.is_symlink():
+                    os.symlink(identity_digest, receipt)
+                elif os.readlink(receipt) != identity_digest:
+                    raise StorageError(f"conflicting legacy receipt {source}")
+                entries.append(source)
+        if entries:
+            migrated.append((directory, entries))
+
+    if migrated:
+        _fsync_directory(receipt_directory)
+    compacted = 0
+    for directory, entries in migrated:
+        with _key_lock(report_root, directory.name) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for source in entries:
+                source.unlink(missing_ok=True)
+                compacted += 1
+            # Commit entry removal even if another file prevents the rmdir.
+            _fsync_directory(directory)
+            try:
+                directory.rmdir()
+            except OSError as exc:
+                if exc.errno != errno.ENOTEMPTY:
+                    raise
+    if migrated:
+        _fsync_directory(accepted_root)
+    atomic_write_json(marker, {"v": 1})
+    return compacted
+
+
+def prune_report_receipts(root: Path, keep: AbstractSet[int]) -> None:
+    """Expire telemetry idempotency together with old journal generations."""
+
+    accepted_root = ensure_layout(root) / "reports" / ".accepted"
+    if not accepted_root.exists():
+        return
+    changed = False
+    for directory in accepted_root.glob(".g[0-9]*"):
         try:
-            accepted_root.mkdir()
-        except FileExistsError:
-            pass
-        else:
-            _fsync_directory(accepted_root.parent)
-        try:
-            accepted_directory.mkdir()
-        except FileExistsError:
-            pass
-        else:
-            _fsync_directory(accepted_root)
-        destination = accepted_directory / source.name
-        if destination.exists():
-            source.unlink()
-        else:
-            os.replace(source, destination)
-            _fsync_directory(accepted_directory)
-        _fsync_directory(directory)
+            generation = int(directory.name[2:])
+        except ValueError:
+            continue
+        if generation not in keep:
+            shutil.rmtree(directory)
+            changed = True
+    if changed:
+        _fsync_directory(accepted_root)
+
+
+def sync_report_inboxes(root: Path) -> None:
+    """Commit deferred inbox deletions before their receipts can expire."""
+
+    report_root = ensure_layout(root) / "reports"
+    for directory in report_root.iterdir():
+        if not directory.name.startswith(".") and directory.is_dir():
+            _fsync_directory(directory)
+    _fsync_directory(report_root)
 
 
 def submit_command(root: Path, command: dict[str, Any]) -> str:
@@ -368,8 +735,116 @@ def write_state(root: Path, state: dict[str, Any]) -> None:
     atomic_write_json(ensure_layout(root) / "state.json", state)
 
 
-def open_journal(root: Path) -> TextIO:
-    journal = ensure_layout(root) / "events.jsonl"
+def journal_path(root: Path, generation: int = 0) -> Path:
+    root = ensure_layout(root)
+    if generation == 0:
+        return root / "events.jsonl"
+    return root / "journal" / f"events-{generation:06d}.jsonl"
+
+
+def checkpoint_path(root: Path, generation: int) -> Path:
+    return ensure_layout(root) / "journal" / f"checkpoint-{generation:06d}.json"
+
+
+def latest_checkpoint(root: Path) -> tuple[int, dict[str, Any]] | None:
+    journal_root = ensure_layout(root) / "journal"
+    active = journal_root / "active.json"
+    if not active.exists():
+        return None
+    marker = read_json(active)
+    if not isinstance(marker, dict) or type(marker.get("generation")) is not int:
+        raise StorageError(f"invalid journal activation marker {active}")
+    generation = marker["generation"]
+    source = checkpoint_path(root, generation)
+    checkpoint = read_json(source) if source.exists() else None
+    if not isinstance(checkpoint, dict) or not journal_path(root, generation).exists():
+        raise StorageError(f"active journal generation {generation} is incomplete")
+    return generation, checkpoint
+
+
+def activate_journal_generation(root: Path, generation: int) -> None:
+    """Publish which complete checkpoint may recover a missing state file."""
+
+    if not checkpoint_path(root, generation).exists() or not journal_path(
+        root, generation
+    ).exists():
+        raise StorageError(f"journal generation {generation} is incomplete")
+    atomic_write_json(
+        ensure_layout(root) / "journal" / "active.json",
+        {"v": 1, "generation": generation},
+    )
+
+
+def create_journal_generation(
+    root: Path, generation: int, checkpoint: dict[str, Any]
+) -> None:
+    """Durably stage a checkpoint and empty journal before state points to them."""
+
+    journal_root = ensure_layout(root) / "journal"
+    _mkdir(journal_root)
+    event_file = journal_path(root, generation)
+    checkpoint_file = checkpoint_path(root, generation)
+    if event_file.exists() or checkpoint_file.exists():
+        raise StorageError(f"journal generation {generation} already exists")
+    atomic_write_json(checkpoint_file, checkpoint)
+    temporary = event_file.with_name(f".{event_file.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, event_file)
+        _fsync_directory(journal_root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def next_journal_generation(root: Path, current: int) -> int:
+    """Choose a fresh generation even after an interrupted rotation."""
+
+    journal_root = ensure_layout(root) / "journal"
+    generations = [current]
+    if journal_root.exists():
+        for source in journal_root.iterdir():
+            try:
+                generations.append(int(source.stem.rsplit("-", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+    return max(generations) + 1
+
+
+def prune_journal_generations(root: Path, keep: AbstractSet[int]) -> None:
+    """Keep only the active journal and its reader-race fallback."""
+
+    root = ensure_layout(root)
+    root_changed = False
+    journal_changed = False
+    if 0 not in keep:
+        legacy = root / "events.jsonl"
+        if legacy.exists():
+            legacy.unlink()
+            root_changed = True
+    journal_root = root / "journal"
+    if not journal_root.exists():
+        if root_changed:
+            _fsync_directory(root)
+        return
+    for source in journal_root.iterdir():
+        try:
+            generation = int(source.stem.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if generation not in keep:
+            source.unlink()
+            journal_changed = True
+    if root_changed:
+        _fsync_directory(root)
+    if journal_changed:
+        _fsync_directory(journal_root)
+
+
+def open_journal(root: Path, generation: int = 0) -> TextIO:
+    journal = journal_path(root, generation)
+    journal.parent.mkdir(parents=True, exist_ok=True)
     if journal.exists() and journal.stat().st_size:
         with journal.open("rb+") as repair:
             repair.seek(-1, os.SEEK_END)
@@ -391,18 +866,31 @@ def append_event(handle: TextIO, event: dict[str, Any], *, sync: bool) -> None:
         os.fsync(handle.fileno())
 
 
+def sync_file(handle: TextIO) -> None:
+    """Flush and durably commit every prior write to an open file."""
+
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 def read_event_page(
     root: Path,
     *,
     after: int = 0,
     offset: int = 0,
     limit: int | None = None,
+    end_offset: int | None = None,
+    generation: int = 0,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """Read a bounded page and return its byte cursor and continuation flag."""
 
-    if offset < 0 or (limit is not None and limit <= 0):
+    if (
+        offset < 0
+        or (limit is not None and limit <= 0)
+        or (end_offset is not None and end_offset < 0)
+    ):
         raise ValueError("event offset must be non-negative and limit positive")
-    journal = ensure_layout(root) / "events.jsonl"
+    journal = journal_path(root, generation)
     if not journal.exists():
         return [], offset, False
     if offset > journal.stat().st_size:
@@ -412,7 +900,10 @@ def read_event_page(
     more = False
     with journal.open("rb") as handle:
         handle.seek(offset)
-        while line := handle.readline():
+        while end_offset is None or handle.tell() < end_offset:
+            line = handle.readline()
+            if not line or (end_offset is not None and handle.tell() > end_offset):
+                break
             if not line.endswith(b"\n"):
                 break
             try:
@@ -431,48 +922,12 @@ def read_event_page(
     return events, next_offset, more
 
 
-def read_events(root: Path, after: int = 0) -> list[dict[str, Any]]:
+def read_events(
+    root: Path, after: int = 0, *, offset: int = 0, generation: int = 0
+) -> list[dict[str, Any]]:
     """Read complete journal records, ignoring a torn final line after a crash."""
 
-    return read_event_page(root, after=after)[0]
-
-
-def journal_size(root: Path) -> int:
-    source = ensure_layout(root) / "events.jsonl"
-    return source.stat().st_size if source.exists() else 0
-
-
-def journal_tail(root: Path) -> tuple[int, int]:
-    """Find the last valid sequence by reading backward from the journal tail."""
-
-    source = ensure_layout(root) / "events.jsonl"
-    if not source.exists():
-        return 0, 0
-    end = source.stat().st_size
-    position = end
-    buffer = b""
-    with source.open("rb") as handle:
-        while position > 0:
-            size = min(8192, position)
-            position -= size
-            handle.seek(position)
-            buffer = handle.read(size) + buffer
-            latest: tuple[int, int] | None = None
-            line_end = position
-            for line in buffer.splitlines(keepends=True):
-                line_end += len(line)
-                if not line.endswith(b"\n"):
-                    continue
-                try:
-                    event = json.loads(line)
-                    latest = int(event["seq"]), line_end
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-            if latest is not None:
-                return latest
-    # A cursor may only advance past complete records. In particular, do not
-    # skip a torn first record that a concurrent writer may still complete.
-    return 0, 0
+    return read_event_page(root, after=after, offset=offset, generation=generation)[0]
 
 
 def job_directory(root: Path, job_id: str) -> Path:

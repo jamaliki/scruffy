@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import signal
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -27,28 +28,41 @@ from .scheduler import request_can_ever_fit
 from .slurm import allocation_metadata
 from .state import (
     apply_workload_event,
+    compact_journal,
+    commit_snapshot,
     emit,
     job_from_spec,
     load_recovered_state,
-    refresh_nodes,
 )
 from .storage import (
+    accept_known_requests,
+    accept_request,
+    accept_reports,
+    compact_report_receipts,
     controller_lock,
     ensure_layout,
     find_request,
     list_commands,
+    list_archived_workflow,
     list_reports,
     list_requests,
     open_journal,
     read_events,
+    report_identity_digest,
+    report_was_accepted,
     report_streams,
     remove_command,
-    remove_report,
+    remove_cold_job_directories,
     UnsafeRecovery,
     utc_now,
-    write_state,
+    job_identity_digest,
 )
-from .workflows import WorkflowError, resolve_dependencies, validate_workflows
+from .workflows import (
+    WorkflowError,
+    resolve_blocked_jobs,
+    resolve_dependencies,
+    validate_workflows,
+)
 
 
 MAX_REPORTS_PER_TICK = 128
@@ -84,7 +98,7 @@ def _initialize_controller(
             "unresolved active jobs could still be running; refusing unsafe recovery"
         )
 
-    journal = open_journal(root)
+    journal = open_journal(root, int(state.get("journal_generation", 0)))
     messages: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
     controller = Controller(
         root=root,
@@ -150,6 +164,7 @@ def _rejected_job(
         "state": "rejected",
         "submitted_at": str(spec.get("submitted_at", utc_now())),
         "queue_order": queue_order,
+        "request_digest": job_identity_digest(spec),
         "request": spec.get("resources"),
         "assignment": None,
         "finished_at": utc_now(),
@@ -167,12 +182,12 @@ def _mark_workflow_rejected(job: dict[str, Any], exc: Exception) -> None:
 
 
 def _resolution_workflow_jobs(
-    jobs: dict[str, dict[str, Any]], workflow_id: str
+    jobs: Iterable[dict[str, Any]], workflow_id: str
 ) -> list[dict[str, Any]]:
-    """Keep rejected task identities while removing their invalid edges."""
+    """Select one workflow, removing invalid edges from rejected task records."""
 
     selected: dict[str, dict[str, Any]] = {}
-    for candidate in jobs.values():
+    for candidate in jobs:
         if candidate.get("workflow_id") != workflow_id:
             continue
         task_id = candidate.get("task_id")
@@ -265,7 +280,9 @@ def _admit_job(
         emit(controller, "job.queued", job=job)
         return
 
-    workflow_jobs = _resolution_workflow_jobs(prospective, job["workflow_id"])
+    workflow_jobs = _resolution_workflow_jobs(
+        prospective.values(), job["workflow_id"]
+    )
     resolution = resolve_dependencies(job, workflow_jobs)
     job["blockers"] = resolution["blockers"]
     if resolution["decision"] == "ready":
@@ -284,7 +301,11 @@ def _admit_job(
 def _ingest_requests(controller: Controller) -> None:
     known = controller.state["jobs"]
     next_order = max(
-        (int(job.get("queue_order", 0)) for job in known.values()), default=0
+        int(controller.state.get("next_queue_order", 0)),
+        max(
+            (int(job.get("queue_order", 0)) for job in known.values()),
+            default=0,
+        ),
     )
     # Directory timestamps are not a safe admission signal on every shared
     # filesystem. Listing names each poll is cheap; only unknown specs are read.
@@ -296,7 +317,20 @@ def _ingest_requests(controller: Controller) -> None:
     # Otherwise an earlier emit could snapshot a later task before its
     # dependency decision, and a crash could make that task runnable.
     staged: list[dict[str, Any]] = []
-    prospective = dict(known)
+    prospective: dict[str, dict[str, Any]] = {}
+    workflow_ids = {
+        str(spec["workflow_id"])
+        for spec in specs
+        if isinstance(spec.get("workflow_id"), str)
+    }
+    for workflow_id in workflow_ids:
+        prospective.update(
+            {
+                job["id"]: job
+                for job in list_archived_workflow(controller.root, workflow_id)
+            }
+        )
+    prospective.update(known)
     for spec in specs:
         job_id = str(spec.get("job_id", ""))
         if job_id in prospective:
@@ -306,27 +340,89 @@ def _ingest_requests(controller: Controller) -> None:
         staged.append(job)
         prospective[job_id] = job
 
+    controller.state["next_queue_order"] = next_order
     for job in staged:
         _admit_job(controller, job, prospective)
+        accept_request(controller.root, job["id"])
+
+
+def _workflow_groups(
+    jobs: dict[str, dict[str, Any]],
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, tuple[tuple[str, object], ...]],
+]:
+    """Group jobs and cheap change signatures in one allocation-wide scan."""
+
+    workflows: dict[str, list[dict[str, Any]]] = {}
+    blocked: dict[str, list[dict[str, Any]]] = {}
+    signatures: dict[str, list[tuple[str, object]]] = {}
+    for job in jobs.values():
+        workflow_id = job.get("workflow_id")
+        task_id = job.get("task_id")
+        if not isinstance(workflow_id, str) or not isinstance(task_id, str):
+            continue
+        signatures.setdefault(workflow_id, []).append((job["id"], job.get("state")))
+        workflows.setdefault(workflow_id, []).append(job)
+        if job.get("state") == "blocked" and not job.get("workflow_invalid"):
+            blocked.setdefault(workflow_id, []).append(job)
+    return (
+        workflows,
+        blocked,
+        {workflow_id: tuple(items) for workflow_id, items in signatures.items()},
+    )
 
 
 def _refresh_dependencies(controller: Controller) -> None:
-    """Release or skip blocked work after upstream lifecycle transitions."""
+    """Refresh dirty workflows, including terminal dependency cascades."""
 
     jobs = controller.state["jobs"]
-    while True:
-        transitioned = False
-        for job in list(jobs.values()):
-            if job.get("state") != "blocked" or job.get("workflow_invalid"):
-                continue
-            workflow_jobs = _resolution_workflow_jobs(jobs, job["workflow_id"])
-            try:
-                resolution = resolve_dependencies(job, workflow_jobs)
-            except WorkflowError as exc:
-                _mark_workflow_rejected(job, exc)
-                emit(controller, "job.rejected", job=job)
-                transitioned = True
-                continue
+    workflows, blocked_by_workflow, signatures = _workflow_groups(jobs)
+    previous = controller.workflow_signatures
+    dirty = (
+        list(signatures)
+        if previous is None
+        else [
+            workflow_id
+            for workflow_id, signature in signatures.items()
+            if previous.get(workflow_id) != signature
+        ]
+    )
+    if not dirty:
+        controller.workflow_signatures = signatures
+        return
+
+    retry_invalid: set[str] = set()
+    for workflow_id in dirty:
+        blocked_jobs = blocked_by_workflow.get(workflow_id, [])
+        if not blocked_jobs:
+            continue
+        try:
+            resolution_jobs = _resolution_workflow_jobs(
+                [
+                    *list_archived_workflow(controller.root, workflow_id),
+                    *workflows[workflow_id],
+                ],
+                workflow_id,
+            )
+            resolutions = resolve_blocked_jobs(resolution_jobs)
+        except WorkflowError as exc:
+            # Repair invalid persisted graphs one task at a time. Leaving the
+            # cache dirty retries the remaining graph on the next tick.
+            job = blocked_jobs[0]
+            _mark_workflow_rejected(job, exc)
+            emit(controller, "job.rejected", job=job)
+            retry_invalid.add(workflow_id)
+            continue
+
+        jobs_by_key = {
+            (workflow_id, job["task_id"]): job for job in blocked_jobs
+        }
+        # The batch resolver returns topological order, so predicted upstream
+        # queued/skipped states become real before dependent events are emitted.
+        for key, resolution in resolutions.items():
+            job = jobs_by_key[key]
             blockers = resolution["blockers"]
             decision = resolution["decision"]
             if decision == "ready":
@@ -334,19 +430,24 @@ def _refresh_dependencies(controller: Controller) -> None:
                 job["reason"] = None
                 job["blockers"] = []
                 emit(controller, "job.queued", job=job)
-                transitioned = True
             elif decision == "skipped":
                 job["state"] = "skipped"
                 job["finished_at"] = utc_now()
                 job["reason"] = "dependency_unsatisfied"
                 job["blockers"] = blockers
                 emit(controller, "job.skipped", job=job)
-                transitioned = True
             elif blockers != job.get("blockers"):
                 job["blockers"] = blockers
                 emit(controller, "job.blocked", job=job)
-        if not transitioned:
-            return
+
+    # Cache each workflow independently: an unrelated job transition must not
+    # revalidate every blocked graph in the allocation.
+    _, _, current = _workflow_groups(jobs)
+    controller.workflow_signatures = {
+        workflow_id: signature
+        for workflow_id, signature in current.items()
+        if workflow_id not in retry_invalid
+    }
 
 
 def _ingest_commands(controller: Controller) -> None:
@@ -400,28 +501,63 @@ def _ingest_commands(controller: Controller) -> None:
 
 
 def _discard_journaled_reports(controller: Controller) -> None:
-    """Close the append/remove crash window without retaining a global ID set."""
+    """Acknowledge pending files whose batch outcomes survived a crash.
 
-    pending = {
+    New report outcomes carry a tiny acknowledgement map in the committed
+    snapshot. The journal scan below is only a compatibility path for an
+    interrupted controller from before that map existed.
+    """
+
+    listed = list_reports(controller.root)
+    pending = {_report_id(source): (source, document) for source, document in listed}
+    acknowledged: dict[Path, str | None] = {}
+    report_acks = controller.state.setdefault("report_acks", {})
+    legacy_format = controller.state.get("report_ack_v") != 1
+    changed_snapshot = bool(report_acks) or legacy_format
+    for report_id, digest in list(report_acks.items()):
+        item = pending.pop(report_id, None)
+        if item is not None:
+            source, _ = item
+            acknowledged[source] = digest if isinstance(digest, str) else None
+        report_acks.pop(report_id, None)
+    if acknowledged:
+        accept_reports(
+            tuple(acknowledged.items()),
+            generation=int(controller.state.get("journal_generation", 0)),
+        )
+    if not pending or not legacy_format:
+        controller.state["report_ack_v"] = 1
+        if changed_snapshot:
+            commit_snapshot(controller)
+        return
+    legacy = {
         (str(document.get("job_id")), str(document.get("event_id"))): source
-        for source, document in list_reports(controller.root)
+        for source, document in pending.values()
         if isinstance(document, dict)
         and document.get("job_id")
         and document.get("event_id")
     }
-    if not pending:
-        return
-    for event in read_events(controller.root):
-        job_id = event.get("job_id")
-        source_event_id = event.get("source_event_id")
-        if not isinstance(job_id, str) or not isinstance(source_event_id, str):
-            continue
-        key = (job_id, source_event_id)
-        source = pending.pop(key, None)
+    acknowledged = {}
+    generation = int(controller.state.get("journal_generation", 0))
+    for event in read_events(controller.root, generation=generation):
+        key = (event.get("job_id"), event.get("source_event_id"))
+        source = legacy.pop(key, None)
         if source is not None:
-            remove_report(source)
+            _, document = pending.pop(_report_id(source))
+            try:
+                digest = report_identity_digest(validate_event(document))
+            except (TypeError, ValueError):
+                digest = None
+            acknowledged[source] = digest
         if not pending:
-            return
+            break
+    accept_reports(
+        tuple(acknowledged.items()),
+        generation=int(controller.state.get("journal_generation", 0)),
+    )
+    controller.state["report_ack_v"] = 1
+    if changed_snapshot:
+        commit_snapshot(controller)
 
 
 def _discard_journaled_commands(controller: Controller) -> None:
@@ -434,7 +570,8 @@ def _discard_journaled_commands(controller: Controller) -> None:
     }
     if not pending:
         return
-    for event in read_events(controller.root):
+    generation = int(controller.state.get("journal_generation", 0))
+    for event in read_events(controller.root, generation=generation):
         if event.get("kind") not in COMMAND_OUTCOME_KINDS:
             continue
         data = event.get("data")
@@ -448,17 +585,33 @@ def _discard_journaled_commands(controller: Controller) -> None:
             return
 
 
-def _reject_report(controller: Controller, source: Path, reason: str) -> None:
+def _report_id(source: Path) -> str:
+    return f"{source.parent.name}/{source.name}"
+
+
+def _reject_report(
+    controller: Controller,
+    source: Path,
+    reason: str,
+    *,
+    digest: str | None = None,
+) -> None:
+    report_id = _report_id(source)
     emit(
         controller,
         "notice",
         data={
             "kind": "workload.report_rejected",
             "report": source.name,
+            "report_id": report_id,
             "reason": reason,
         },
+        report_id=report_id,
+        report_digest=digest,
+        durable=False,
+        snapshot=False,
     )
-    remove_report(source)
+    controller.state.setdefault("report_acks", {})[report_id] = digest
 
 
 def _report_batch(
@@ -508,20 +661,38 @@ def _report_batch(
 def _ingest_reports(
     controller: Controller, limit: int = MAX_REPORTS_PER_TICK
 ) -> None:
-    """Validate and sequence a bounded batch of non-authoritative job reports."""
+    """Validate and commit one bounded report batch with one state rewrite."""
 
+    acknowledged: list[tuple[Path, str | None]] = []
+    new_report_ids: list[str] = []
     for source, document in _report_batch(controller, limit):
+        retained, retained_digest = report_was_accepted(controller.root, source)
+        if retained:
+            acknowledged.append((source, retained_digest))
+            continue
         if document is None:
             _reject_report(controller, source, "unreadable_report")
+            acknowledged.append((source, None))
+            new_report_ids.append(_report_id(source))
             continue
         try:
             event = validate_event(document)
         except (TypeError, ValueError) as exc:
             _reject_report(controller, source, str(exc))
+            acknowledged.append((source, None))
+            new_report_ids.append(_report_id(source))
             continue
         job_id = event["job_id"]
+        digest = report_identity_digest(event)
         if source.parent.name != job_id:
-            _reject_report(controller, source, "job_id does not match report directory")
+            _reject_report(
+                controller,
+                source,
+                "job_id does not match report directory",
+                digest=digest,
+            )
+            acknowledged.append((source, digest))
+            new_report_ids.append(_report_id(source))
             continue
         job = controller.state["jobs"].get(job_id)
         if job is None:
@@ -529,20 +700,46 @@ def _ingest_reports(
             # publisher may win the controller's request-ingestion poll.
             if find_request(controller.root, job_id) is not None:
                 continue
-            _reject_report(controller, source, f"unknown job {job_id}")
+            _reject_report(
+                controller,
+                source,
+                f"unknown job {job_id}",
+                digest=digest,
+            )
+            acknowledged.append((source, digest))
+            new_report_ids.append(_report_id(source))
             continue
-        recorded_at = utc_now()
-        apply_workload_event(job, event, recorded_at=recorded_at)
-        emit(
+        journal_event = emit(
             controller,
             event["kind"],
-            job=job,
+            job_id=job_id,
             data=event["data"],
             occurred_at=event["occurred_at"],
             source_event_id=event["event_id"],
             source=event["source"],
+            report_id=_report_id(source),
+            report_digest=digest,
+            durable=False,
+            snapshot=False,
         )
-        remove_report(source)
+        apply_workload_event(job, event, recorded_at=journal_event["recorded_at"])
+        controller.state.setdefault("report_acks", {})[_report_id(source)] = digest
+        acknowledged.append((source, digest))
+        new_report_ids.append(_report_id(source))
+
+    if not acknowledged:
+        return
+    if new_report_ids:
+        # The inbox is acknowledged only after both the ordered events and
+        # their cumulative workload projection are durable.
+        commit_snapshot(controller)
+    accept_reports(
+        acknowledged,
+        generation=int(controller.state.get("journal_generation", 0)),
+    )
+    report_acks = controller.state.setdefault("report_acks", {})
+    for report_id in new_report_ids:
+        report_acks.pop(report_id, None)
 
 
 def _heartbeat(controller: Controller) -> None:
@@ -551,16 +748,20 @@ def _heartbeat(controller: Controller) -> None:
         return
     controller.last_heartbeat = now
     controller.state["allocation"]["heartbeat_at"] = utc_now()
-    refresh_nodes(controller.state, controller.inventory)
-    write_state(controller.root, controller.state)
+    # Output events are intentionally group-committed by the heartbeat or the
+    # next durable lifecycle event. Never publish their watermark first.
+    commit_snapshot(controller)
 
 
 def _serve(controller: Controller) -> None:
     def stop(_signum: int, _frame: Any) -> None:
         controller.stopping = True
 
+    accept_known_requests(controller.root, controller.state["jobs"].keys())
+    compact_report_receipts(controller.root)
     _discard_journaled_reports(controller)
     _discard_journaled_commands(controller)
+    remove_cold_job_directories(controller.root, controller.state["jobs"].keys())
     previous_term = signal.signal(signal.SIGTERM, stop)
     previous_int = signal.signal(signal.SIGINT, stop)
     try:
@@ -571,6 +772,7 @@ def _serve(controller: Controller) -> None:
             poll_processes(controller)
             _ingest_reports(controller)
             _refresh_dependencies(controller)
+            compact_journal(controller)
             if controller.stopping:
                 begin_shutdown(controller)
                 if not controller.running:

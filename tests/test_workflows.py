@@ -4,6 +4,7 @@ import unittest
 
 from scruffy.workflows import (
     WorkflowError,
+    resolve_blocked_jobs,
     resolve_dependencies,
     validate_workflows,
 )
@@ -125,6 +126,32 @@ class WorkflowValidationTests(unittest.TestCase):
 
 
 class WorkflowResolutionTests(unittest.TestCase):
+    def test_batch_resolver_reaches_a_fixed_point_in_topological_order(self) -> None:
+        jobs = [
+            task("consumer", state="blocked", needs=[need("cleanup")]),
+            task(
+                "cleanup",
+                state="blocked",
+                needs=[need("child", "terminal")],
+            ),
+            task("child", state="blocked", needs=[need("root")]),
+            task("root", state="failed"),
+        ]
+
+        resolutions = resolve_blocked_jobs(jobs)
+
+        self.assertEqual(
+            ["child", "cleanup", "consumer"],
+            [task_id for _, task_id in resolutions],
+        )
+        self.assertEqual("skipped", resolutions[("pipeline", "child")]["decision"])
+        self.assertEqual("ready", resolutions[("pipeline", "cleanup")]["decision"])
+        self.assertEqual("blocked", resolutions[("pipeline", "consumer")]["decision"])
+        self.assertEqual(
+            "queued",
+            resolutions[("pipeline", "consumer")]["blockers"][0]["state"],
+        )
+
     def test_open_workflow_treats_not_yet_submitted_task_as_pending(self) -> None:
         child = task(
             "infer",

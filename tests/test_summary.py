@@ -83,7 +83,7 @@ class SummaryTests(unittest.TestCase):
             result["requires_attention"][0]["started_at"],
         )
         self.assertEqual({"gpus": 1}, result["requires_attention"][0]["request"])
-        self.assertEqual("queue-test:9:123", result["as_of_cursor"])
+        self.assertEqual("queue-test:0:9:123", result["as_of_cursor"])
 
     def test_explain_resolves_task_dependencies(self) -> None:
         state = {

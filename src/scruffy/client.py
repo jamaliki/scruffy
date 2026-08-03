@@ -13,9 +13,9 @@ from .models import ResourceRequest, TERMINAL_JOB_STATES
 from .protocol import validate_event
 from .storage import (
     create_job_id,
+    find_archived_job,
     find_request,
-    journal_size,
-    journal_tail,
+    list_archived_workflow,
     list_requests,
     load_state,
     queue_id,
@@ -99,7 +99,7 @@ def publish_event(
     occurred_at: str | None = None,
     source: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Durably spool a validated workload event; retries may reuse ``event_id``."""
+    """Spool an event; ``event_id`` deduplicates across retained generations."""
 
     document = validate_event(
         {
@@ -159,7 +159,7 @@ def _submitted_from_spec(job_id: str, spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
-    """Return one job or the complete queue, including unadmitted submissions."""
+    """Return one job or hot queue state, including unadmitted submissions."""
 
     state = load_state(root)
     if state is None:
@@ -167,12 +167,20 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
             "v": 1,
             "queue_id": queue_id(root),
             "last_seq": 0,
+            "journal_generation": 0,
             "journal_offset": 0,
             "allocation": None,
             "nodes": {},
             "jobs": {},
+            "report_acks": {},
+            "report_ack_v": 1,
+            "next_queue_order": 0,
+            "archived_jobs": 0,
+            "archived_counts": {},
             "draining": False,
         }
+    state.pop("report_acks", None)
+    state.pop("report_ack_v", None)
     if job_id is None:
         jobs = state["jobs"]
         for spec in list_requests(root, exclude=set(jobs)):
@@ -185,36 +193,52 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
     spec = find_request(root, job_id)
     if spec is not None:
         return _submitted_from_spec(job_id, spec)
+    archived = find_archived_job(root, job_id)
+    if archived is not None:
+        return archived
     raise KeyError(f"unknown job {job_id}")
 
 
-def _snapshot_cursor(root: Path) -> tuple[int, int]:
+def _snapshot_cursor(root: Path) -> tuple[int, int, int]:
     snapshot = load_state(root)
     if snapshot is None:
-        return 0, 0
-    return int(snapshot.get("last_seq", 0)), int(snapshot.get("journal_offset", 0))
+        return 0, 0, 0
+    return (
+        int(snapshot.get("journal_generation", 0)),
+        int(snapshot.get("last_seq", 0)),
+        int(snapshot.get("journal_offset", 0)),
+    )
 
 
-def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, bool]:
-    """Return sequence, byte offset, and whether a foreign cursor was reset."""
+def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, bool]:
+    """Return generation, sequence, offset, and whether the cursor reset."""
 
+    current_generation, current_sequence, current_offset = _snapshot_cursor(root)
     if cursor is None:
-        sequence, offset = _snapshot_cursor(root)
-        return sequence, offset, False
+        return current_generation, current_sequence, current_offset, False
     if isinstance(cursor, int):
-        return cursor, 0, False
+        if current_generation:
+            return current_generation, current_sequence, current_offset, True
+        return current_generation, cursor, 0, False
     if ":" not in cursor:
-        return int(cursor), 0, False
-    parts = cursor.rsplit(":", 2)
+        if current_generation:
+            return current_generation, current_sequence, current_offset, True
+        return current_generation, int(cursor), 0, False
+    parts = cursor.split(":")
     if len(parts) == 2:
         cursor_queue, sequence = parts
+        generation = 0
         offset = 0
-    else:
+    elif len(parts) == 3:  # v1 cursor, before journal generations.
         cursor_queue, sequence, offset = parts
-    if cursor_queue != queue_id(root):
-        sequence_value, offset_value = _snapshot_cursor(root)
-        return sequence_value, offset_value, True
-    return int(sequence), int(offset), False
+        generation = 0
+    elif len(parts) == 4:
+        cursor_queue, generation, sequence, offset = parts
+    else:
+        raise ValueError("invalid cursor")
+    if cursor_queue != queue_id(root) or int(generation) != current_generation:
+        return current_generation, current_sequence, current_offset, True
+    return current_generation, int(sequence), int(offset), False
 
 
 def observe(
@@ -225,27 +249,44 @@ def observe(
     include_output: bool = False,
     limit: int = 1000,
 ) -> dict[str, Any]:
-    """Return a queue snapshot and one non-destructive page after ``after``."""
+    """Return a queue snapshot and one non-consuming page after ``after``."""
 
     if limit <= 0:
         raise ValueError("limit must be positive")
-    sequence, offset, reset = parse_cursor(root, after)
+    generation, sequence, offset, reset = parse_cursor(root, after)
     page_limit = min(limit, 64) if include_output else limit
     deadline = time.monotonic() + max(wait_seconds, 0)
-    observed_size = journal_size(root)
+    committed = _snapshot_cursor(root)
+    if committed[0] != generation:
+        generation, sequence, offset = committed
+        reset = True
     page, offset, more = read_event_page(
-        root, after=sequence, offset=offset, limit=page_limit
+        root,
+        after=sequence,
+        offset=offset,
+        limit=page_limit,
+        end_offset=committed[2],
+        generation=generation,
     )
     while True:
         if page or more or time.monotonic() >= deadline:
             break
         time.sleep(min(0.2, max(deadline - time.monotonic(), 0)))
-        current_size = journal_size(root)
-        if current_size == observed_size:
+        current = _snapshot_cursor(root)
+        if current == committed:
             continue
-        observed_size = current_size
+        if current[0] != generation:
+            generation, sequence, offset = current
+            page, more, reset = [], False, True
+            break
+        committed = current
         page, offset, more = read_event_page(
-            root, after=sequence, offset=offset, limit=page_limit
+            root,
+            after=sequence,
+            offset=offset,
+            limit=page_limit,
+            end_offset=committed[2],
+            generation=generation,
         )
 
     next_sequence = max((int(item["seq"]) for item in page), default=sequence)
@@ -263,13 +304,24 @@ def observe(
         visible.append(event)
     snapshot = status(root)
     identity = queue_id(root)
-    cursor = f"{identity}:{next_sequence}:{offset}"
-    latest_sequence, latest_offset = journal_tail(root)
+    snapshot_generation = int(snapshot.get("journal_generation", 0))
+    latest_sequence = int(snapshot.get("last_seq", 0))
+    latest_offset = int(snapshot.get("journal_offset", 0))
+    if snapshot_generation != generation:
+        generation = snapshot_generation
+        next_sequence = latest_sequence
+        offset = latest_offset
+        visible = []
+        more = False
+        reset = True
+    cursor = f"{identity}:{generation}:{next_sequence}:{offset}"
     return {
         "snapshot": snapshot,
         "events": visible,
         "next_cursor": cursor,
-        "latest_cursor": f"{identity}:{latest_sequence}:{latest_offset}",
+        "latest_cursor": (
+            f"{identity}:{snapshot_generation}:{latest_sequence}:{latest_offset}"
+        ),
         "more": more,
         "reset": reset,
     }
@@ -299,4 +351,13 @@ def summary(root: Path, *, limit: int = 20) -> dict[str, Any]:
 def explain(root: Path, job_id: str) -> dict[str, Any]:
     """Explain one job's state and dependency chain."""
 
-    return explain_job(status(root), job_id)
+    state = status(root)
+    job = state["jobs"].get(job_id)
+    if job is None:
+        job = status(root, job_id)
+        state["jobs"][job_id] = job
+    workflow_id = job.get("workflow_id")
+    if isinstance(workflow_id, str):
+        for archived in list_archived_workflow(root, workflow_id):
+            state["jobs"].setdefault(archived["id"], archived)
+    return explain_job(state, job_id)

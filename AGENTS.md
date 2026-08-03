@@ -27,15 +27,17 @@ scruffy logs JOB_ID --stream stderr --tail 200
 
 While `observe.more` is true, request the next page immediately. If
 `observe.reset` is true, discard the old local view, accept the returned full
-snapshot, and save the returned cursor. Never share cursor state between agents;
-reading does not consume events for anyone else. Use `observe --follow --output`
-only for interactive streaming.
+hot snapshot, and save the returned cursor. Reset is expected when compaction
+makes the cursor's journal generation stale. Never share cursor state between
+agents; reading does not consume events for anyone else. Use
+`observe --follow --output` only for interactive streaming.
 
 ## Rules
 
 - Use a stable, queue-wide `request_id` for every retryable submission. A useful
   convention is `<agent>/<campaign>/<task>/<attempt>`. Identical reuse is safe;
-  different reuse raises `ConflictError`.
+  different reuse raises `ConflictError`. This exact identity survives detailed
+  job eviction through a compact archive receipt.
 - Commands are argv after `--`. Avoid nested shell strings; submit `bash -lc`
   explicitly only when shell behavior is required.
 - `cwd`, executables, and referenced files must exist at the same paths on the
@@ -45,6 +47,13 @@ only for interactive streaming.
   another agent.
 - Prefer `summary` for bounded orientation, `explain` for one dependency chain,
   and `observe` for incremental monitoring.
+- Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000
+  terminal jobs. Older lookups carry `archived: true` and retain lifecycle and
+  workflow metadata, but resource requests, cwd, assignments, logs, argv,
+  environment, and workload expire. `summary.counts` includes them and
+  `archived_jobs` reports their total.
+- Compact request receipts and workflow indexes persist for the queue root's
+  lifetime, so they grow as O(total jobs) small files and inodes.
 - The snapshot is authoritative. Never infer lifecycle success or failure from
   stdout, stderr, or a workload annotation.
 - `blocked` means an upstream task is missing or unfinished. `skipped` is
@@ -58,6 +67,12 @@ only for interactive streaming.
 - `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE` are
   controller-owned inside a worker.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
-  detailed telemetry and artifact bytes in their normal stores.
+  detailed telemetry and artifact bytes in their normal stores. Reports from
+  one controller tick are committed with one journal sync and snapshot.
+- A workload report `event_id` deduplicates only across the active and previous
+  journal generations. Do not use it as a permanent exactly-once record.
+- Scruffy does not create retries, dynamically fan out workflow tasks, or store
+  artifacts. Agents must submit those jobs explicitly and retain artifacts
+  elsewhere.
 - Queue state contains argv and environment overrides in plaintext. Reference
   protected secret files instead of submitting secret values.

@@ -70,6 +70,12 @@ def build_summary(
     current = now or datetime.now(timezone.utc)
     jobs = list(state.get("jobs", {}).values())
     counts = Counter(str(job.get("state", "unknown")) for job in jobs)
+    counts.update(
+        {
+            str(name): int(count)
+            for name, count in state.get("archived_counts", {}).items()
+        }
+    )
     submitted_jobs = sorted(
         (job for job in jobs if job.get("state") == "submitted"),
         key=lambda job: str(job.get("submitted_at") or ""),
@@ -111,7 +117,10 @@ def build_summary(
         reverse=True,
     )
     identity = state.get("queue_id")
-    cursor = f"{identity}:{state.get('last_seq', 0)}:{state.get('journal_offset', 0)}"
+    cursor = (
+        f"{identity}:{state.get('journal_generation', 0)}:"
+        f"{state.get('last_seq', 0)}:{state.get('journal_offset', 0)}"
+    )
     return {
         "v": 1,
         "queue_id": identity,
@@ -120,6 +129,7 @@ def build_summary(
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
         "counts": dict(sorted(counts.items())),
+        "archived_jobs": int(state.get("archived_jobs", 0)),
         "nodes": state.get("nodes", {}),
         "submitted": submitted[:limit],
         "active": active[:limit],

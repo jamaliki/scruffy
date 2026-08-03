@@ -7,11 +7,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy.client import cancel_job, publish_event, submit_job
+import scruffy.state as state_module
+import scruffy.storage as storage_module
+from scruffy.client import cancel_job, observe, publish_event, status, submit_job
 from scruffy.controller import (
     _discard_journaled_commands,
     _discard_journaled_reports,
     _ingest_commands,
+    _ingest_reports,
     _ingest_requests,
     _initialize_controller,
     _refresh_dependencies,
@@ -27,11 +30,15 @@ from scruffy.models import (
 from scruffy.runtime import Controller, OutputNotifier, RunningProcess
 from scruffy.slurm import SlurmStep
 from scruffy.slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
-from scruffy.state import load_recovered_state
+from scruffy.state import compact_journal, emit, load_recovered_state
 from scruffy.storage import (
     append_event,
+    archive_terminal_job,
+    create_journal_generation,
     list_commands,
     list_reports,
+    load_state,
+    job_directory,
     open_journal,
     queue_id,
     read_events,
@@ -39,6 +46,7 @@ from scruffy.storage import (
     utc_now,
     write_state,
 )
+from scruffy.workflows import resolve_blocked_jobs
 
 
 REQUEST = ResourceRequest(1, 1, 1, 1)
@@ -170,13 +178,215 @@ class RecoverySafetyTests(unittest.TestCase):
             poll_interval=0.01,
             cancel_grace=0,
         )
-        self.addCleanup(controller.journal.close)
+        self.addCleanup(lambda: controller.journal.close())
 
         self.assertEqual({"new-node"}, set(controller.state["nodes"]))
         for job in controller.state["jobs"].values():
             self.assertEqual("lost", job["state"])
             self.assertIsNone(job["assignment"])
             self.assertIsNotNone(job["last_assignment"])
+
+    def test_compaction_bounds_hot_history_and_keeps_late_workflows(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+        train = submit_job(
+            self.root,
+            argv=["true"],
+            name="train",
+            cwd=Path.cwd(),
+            environment={},
+            request=REQUEST,
+            request_id="retention/train",
+            workflow_id="retention-flow",
+            task_id="train",
+        )
+        recent = submit_job(
+            self.root,
+            argv=["true"],
+            name="recent",
+            cwd=Path.cwd(),
+            environment={},
+            request=REQUEST,
+            request_id="retention/recent",
+        )
+        _ingest_requests(controller)
+        for job_id, finished_at in (
+            (train["job_id"], "2026-08-03T10:00:00+00:00"),
+            (recent["job_id"], "2026-08-03T11:00:00+00:00"),
+        ):
+            job = controller.state["jobs"][job_id]
+            job["state"] = "succeeded"
+            job["finished_at"] = finished_at
+            emit(controller, "job.succeeded", job=job)
+            (job_directory(self.root, job_id) / "stdout.log").write_text("done")
+
+        self.assertTrue(
+            compact_journal(
+                controller,
+                max_bytes=1,
+                max_terminal_jobs=1,
+                terminal_slack=0,
+            )
+        )
+
+        self.assertNotIn(train["job_id"], controller.state["jobs"])
+        self.assertIn(recent["job_id"], controller.state["jobs"])
+        self.assertEqual("succeeded", status(self.root, train["job_id"])["state"])
+        self.assertFalse((self.root / "jobs" / train["job_id"]).exists())
+        self.assertTrue((self.root / "jobs" / recent["job_id"]).exists())
+        self.assertEqual(1, status(self.root)["archived_jobs"])
+
+        infer = submit_job(
+            self.root,
+            argv=["true"],
+            name="infer",
+            cwd=Path.cwd(),
+            environment={},
+            request=REQUEST,
+            request_id="retention/infer",
+            workflow_id="retention-flow",
+            task_id="infer",
+            needs=({"task_id": "train", "condition": "succeeded"},),
+        )
+        _ingest_requests(controller)
+        self.assertEqual("queued", controller.state["jobs"][infer["job_id"]]["state"])
+
+    def test_checkpoint_recovery_replays_newer_workload_deltas(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+        job = {
+            "id": "job-delta",
+            "name": "delta",
+            "state": "succeeded",
+            "queue_order": 1,
+            "submitted_at": utc_now(),
+            "finished_at": utc_now(),
+        }
+        controller.state["jobs"][job["id"]] = job
+        emit(controller, "job.succeeded", job=job)
+        self.assertTrue(
+            compact_journal(
+                controller,
+                max_bytes=1,
+                max_terminal_jobs=-1,
+            )
+        )
+        publish_event(
+            self.root,
+            job_id=job["id"],
+            event_id="delta-1",
+            kind="workload.progress",
+            data={"step": 9},
+        )
+        _ingest_reports(controller)
+        (self.root / "state.json").unlink()
+        controller.journal.close()
+
+        recovered = load_recovered_state(self.root)
+
+        self.assertEqual(9, recovered["jobs"][job["id"]]["workload"]["progress"]["step"])
+        self.assertEqual(1, len(recovered["report_acks"]))
+
+    def test_two_rotations_keep_one_fallback_and_recover_active_generation(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+        submitted = submit_job(
+            self.root,
+            argv=["true"],
+            name="rotate",
+            cwd=Path.cwd(),
+            environment={},
+            request=REQUEST,
+            request_id="rotation/job",
+        )
+        _ingest_requests(controller)
+        job_id = submitted["job_id"]
+        job = controller.state["jobs"][job_id]
+        job["state"] = "succeeded"
+        job["finished_at"] = utc_now()
+        emit(controller, "job.succeeded", job=job)
+
+        def report(step: int) -> None:
+            publish_event(
+                self.root,
+                job_id=job_id,
+                event_id=f"step-{step}",
+                kind="workload.progress",
+                data={"step": step},
+            )
+            _ingest_reports(controller)
+
+        report(0)
+        old_cursor = observe(self.root)["latest_cursor"]
+        self.assertTrue(
+            compact_journal(controller, max_bytes=1, max_terminal_jobs=-1)
+        )
+        report(1)
+        create_journal_generation(
+            self.root,
+            2,
+            {"queue_id": queue_id(self.root), "journal_generation": 2, "jobs": {}},
+        )
+        self.assertTrue(
+            compact_journal(controller, max_bytes=1, max_terminal_jobs=-1)
+        )
+        report(2)
+
+        journal_names = {source.name for source in (self.root / "journal").iterdir()}
+        self.assertEqual(
+            {
+                "active.json",
+                "checkpoint-000001.json",
+                "checkpoint-000003.json",
+                "events-000001.jsonl",
+                "events-000003.jsonl",
+            },
+            journal_names,
+        )
+        self.assertFalse((self.root / "events.jsonl").exists())
+        receipt_generations = {
+            source.name
+            for source in (self.root / "reports" / ".accepted").iterdir()
+            if source.is_dir()
+        }
+        self.assertEqual({".g000001", ".g000003"}, receipt_generations)
+        reset = observe(self.root, after=old_cursor)
+        self.assertTrue(reset["reset"])
+        self.assertEqual(3, reset["snapshot"]["journal_generation"])
+
+        controller.journal.close()
+        (self.root / "state.json").unlink()
+        recovered = load_recovered_state(self.root)
+
+        self.assertEqual(3, recovered["journal_generation"])
+        self.assertEqual(
+            2,
+            recovered["jobs"][job_id]["workload"]["progress"]["step"],
+        )
 
     def test_replacement_rejects_recovered_jobs_that_no_longer_fit(self) -> None:
         queued = job_image("job-too-large", "old-node")
@@ -308,10 +518,198 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 },
             }
 
-            _refresh_dependencies(controller)
+            with mock.patch(
+                "scruffy.controller.resolve_blocked_jobs", wraps=resolve_blocked_jobs
+            ) as resolve:
+                _refresh_dependencies(controller)
+                _refresh_dependencies(controller)
 
             self.assertEqual("skipped", controller.state["jobs"]["child"]["state"])
             self.assertEqual("queued", controller.state["jobs"]["grandchild"]["state"])
+            self.assertEqual(1, resolve.call_count)
+            self.assertEqual(
+                ["child", "grandchild"],
+                [
+                    event["job_id"]
+                    for event in read_events(root)
+                    if event.get("kind") in {"job.skipped", "job.queued"}
+                ],
+            )
+
+    def test_dependency_refresh_caches_clean_graphs_and_refreshes_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            controller.state["jobs"] = {
+                child_id: {
+                    "id": child_id,
+                    "state": "blocked",
+                    "workflow_id": "flow",
+                    "task_id": child_id,
+                    "needs": [{"task_id": "root", "condition": "succeeded"}],
+                    "blockers": [],
+                }
+                for child_id in ("child-a", "child-b")
+            }
+
+            with mock.patch(
+                "scruffy.controller.resolve_blocked_jobs", wraps=resolve_blocked_jobs
+            ) as resolve:
+                _refresh_dependencies(controller)
+                _refresh_dependencies(controller)
+                self.assertEqual(1, resolve.call_count)
+                self.assertTrue(
+                    all(
+                        job["blockers"][0]["reason"] == "dependency_missing"
+                        for job in controller.state["jobs"].values()
+                    )
+                )
+
+                controller.state["jobs"]["root"] = {
+                    "id": "root",
+                    "state": "running",
+                    "workflow_id": "flow",
+                    "task_id": "root",
+                    "needs": [],
+                }
+                _refresh_dependencies(controller)
+                self.assertEqual(2, resolve.call_count)
+                self.assertTrue(
+                    all(
+                        job["blockers"][0]["state"] == "running"
+                        for job_id, job in controller.state["jobs"].items()
+                        if job_id.startswith("child-")
+                    )
+                )
+
+                controller.state["jobs"]["root"]["state"] = "finishing"
+                _refresh_dependencies(controller)
+                self.assertEqual(3, resolve.call_count)
+                self.assertTrue(
+                    all(
+                        job["blockers"][0]["state"] == "finishing"
+                        for job_id, job in controller.state["jobs"].items()
+                        if job_id.startswith("child-")
+                    )
+                )
+
+                controller.state["jobs"]["root"]["state"] = "succeeded"
+                _refresh_dependencies(controller)
+                _refresh_dependencies(controller)
+
+            self.assertEqual(4, resolve.call_count)
+            self.assertEqual(
+                {"queued"},
+                {
+                    job["state"]
+                    for job_id, job in controller.state["jobs"].items()
+                    if job_id.startswith("child-")
+                },
+            )
+
+    def test_dependency_refresh_resolves_only_the_dirty_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            controller.state["jobs"] = {}
+            for workflow_id in ("flow-a", "flow-b"):
+                controller.state["jobs"][f"{workflow_id}-root"] = {
+                    "id": f"{workflow_id}-root",
+                    "state": "running",
+                    "workflow_id": workflow_id,
+                    "task_id": "root",
+                    "needs": [],
+                }
+                controller.state["jobs"][f"{workflow_id}-child"] = {
+                    "id": f"{workflow_id}-child",
+                    "state": "blocked",
+                    "workflow_id": workflow_id,
+                    "task_id": "child",
+                    "needs": [{"task_id": "root", "condition": "succeeded"}],
+                    "blockers": [],
+                }
+
+            with mock.patch(
+                "scruffy.controller.resolve_blocked_jobs", wraps=resolve_blocked_jobs
+            ) as resolve:
+                _refresh_dependencies(controller)
+                self.assertEqual(2, resolve.call_count)
+                resolve.reset_mock()
+
+                controller.state["jobs"]["flow-a-root"]["state"] = "finishing"
+                _refresh_dependencies(controller)
+
+            self.assertEqual(1, resolve.call_count)
+            resolved_jobs = resolve.call_args.args[0]
+            self.assertEqual(
+                {"flow-a"},
+                {job["workflow_id"] for job in resolved_jobs},
+            )
+            self.assertEqual(
+                "running",
+                controller.state["jobs"]["flow-b-child"]["blockers"][0]["state"],
+            )
+
+    def test_dependency_refresh_sanitizes_archived_invalid_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            archive_terminal_job(
+                root,
+                {
+                    "id": "bad",
+                    "name": "bad",
+                    "state": "rejected",
+                    "request_digest": "a" * 64,
+                    "workflow_id": "flow",
+                    "task_id": "bad",
+                    "needs": [{"task_id": "bad", "condition": "succeeded"}],
+                    "workflow_invalid": True,
+                },
+            )
+            controller.state["jobs"] = {
+                "child": {
+                    "id": "child",
+                    "state": "blocked",
+                    "workflow_id": "flow",
+                    "task_id": "child",
+                    "needs": [{"task_id": "root", "condition": "succeeded"}],
+                    "blockers": [],
+                }
+            }
+
+            _refresh_dependencies(controller)
+
+            child = controller.state["jobs"]["child"]
+            self.assertEqual("blocked", child["state"])
+            self.assertEqual("dependency_missing", child["blockers"][0]["reason"])
 
     def test_batch_admission_never_snapshots_undecided_later_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -381,6 +779,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 },
                 sync=True,
             )
+            controller.state.pop("report_ack_v", None)
 
             _discard_journaled_reports(controller)
 
@@ -419,6 +818,215 @@ class AsyncCommandRaceTests(unittest.TestCase):
             batch = _report_batch(controller, 2)
 
             self.assertEqual({"job-a", "job-b"}, {item[0].parent.name for item in batch})
+
+    def test_report_batch_has_one_journal_commit_and_one_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            for index in range(128):
+                job_id = f"job-{index:03d}"
+                controller.state["jobs"][job_id] = {
+                    "id": job_id,
+                    "name": job_id,
+                    "state": "succeeded",
+                }
+                publish_event(
+                    root,
+                    job_id=job_id,
+                    event_id="progress-1",
+                    kind="workload.progress",
+                    data={"step": 1},
+                )
+
+            with (
+                mock.patch(
+                    "scruffy.state.sync_file", wraps=state_module.sync_file
+                ) as sync,
+                mock.patch(
+                    "scruffy.state.write_state", wraps=storage_module.write_state
+                ) as snapshot,
+                mock.patch(
+                    "scruffy.storage._fsync_directory",
+                    wraps=storage_module._fsync_directory,
+                ) as directory_sync,
+            ):
+                _ingest_reports(controller, limit=128)
+
+            self.assertEqual(1, sync.call_count)
+            self.assertEqual(1, snapshot.call_count)
+            self.assertLessEqual(directory_sync.call_count, 6)
+            workload_events = [
+                event
+                for event in read_events(root)
+                if event.get("kind") == "workload.progress"
+            ]
+            self.assertEqual(128, len(workload_events))
+            self.assertTrue(all("job" not in event for event in workload_events))
+
+    def test_report_recovers_after_journal_sync_but_snapshot_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            job = {
+                "id": "job-recovery",
+                "name": "recovery",
+                "state": "succeeded",
+                "queue_order": 1,
+                "submitted_at": utc_now(),
+                "finished_at": utc_now(),
+            }
+            controller.state["jobs"][job["id"]] = job
+            emit(controller, "job.succeeded", job=job)
+            publish_event(
+                root,
+                job_id=job["id"],
+                event_id="step-1",
+                kind="workload.progress",
+                data={"step": 1},
+            )
+
+            with mock.patch("scruffy.state.write_state", side_effect=OSError("disk")):
+                with self.assertRaises(OSError):
+                    _ingest_reports(controller)
+            recorded_at = controller.state["jobs"][job["id"]]["workload"][
+                "last_recorded_at"
+            ]
+            controller.journal.close()
+
+            restarted = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation-2",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(restarted.journal.close)
+            self.assertEqual(
+                1,
+                restarted.state["jobs"][job["id"]]["workload"]["progress"]["step"],
+            )
+            self.assertEqual(
+                recorded_at,
+                restarted.state["jobs"][job["id"]]["workload"]["last_recorded_at"],
+            )
+            _discard_journaled_reports(restarted)
+
+            self.assertEqual([], list_reports(root))
+            workload_events = [
+                event
+                for event in read_events(root)
+                if event.get("kind") == "workload.progress"
+            ]
+            self.assertEqual(1, len(workload_events))
+
+    def test_report_recovers_after_snapshot_before_inbox_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            job = {
+                "id": "job-ack-crash",
+                "name": "ack-crash",
+                "state": "succeeded",
+                "queue_order": 1,
+                "submitted_at": utc_now(),
+                "finished_at": utc_now(),
+            }
+            controller.state["jobs"][job["id"]] = job
+            emit(controller, "job.succeeded", job=job)
+            publish_event(
+                root,
+                job_id=job["id"],
+                event_id="step-1",
+                kind="workload.progress",
+                data={"step": 1},
+            )
+
+            with mock.patch(
+                "scruffy.controller.accept_reports", side_effect=OSError("crash")
+            ):
+                with self.assertRaises(OSError):
+                    _ingest_reports(controller)
+            self.assertEqual(1, len(load_state(root)["report_acks"]))
+            controller.journal.close()
+
+            restarted = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation-2",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(restarted.journal.close)
+            _discard_journaled_reports(restarted)
+
+            self.assertEqual([], list_reports(root))
+            self.assertEqual({}, restarted.state["report_acks"])
+            self.assertEqual(
+                1,
+                sum(
+                    event.get("kind") == "workload.progress"
+                    for event in read_events(root)
+                ),
+            )
+
+    def test_unprocessed_report_backlog_does_not_scan_the_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("local", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local-allocation",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+            )
+            self.addCleanup(controller.journal.close)
+            publish_event(
+                root,
+                job_id="job-backlog",
+                event_id="pending",
+                kind="workload.progress",
+                data={"step": 1},
+            )
+
+            with mock.patch(
+                "scruffy.controller.read_events",
+                side_effect=AssertionError("journal scan"),
+            ):
+                _discard_journaled_reports(controller)
+
+            self.assertEqual(1, len(list_reports(root)))
+            self.assertEqual(1, load_state(root)["report_ack_v"])
 
     def test_command_recovery_discards_a_durably_journaled_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

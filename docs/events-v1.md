@@ -1,6 +1,6 @@
 # Workload events v1
 
-Scruffy jobs may publish bounded semantic updates into the same non-destructive
+Scruffy jobs may publish bounded semantic updates into the same non-consuming
 journal as queue lifecycle and output-reference events. Queue and Slurm state
 remain authoritative for execution outcomes and GPU ownership.
 
@@ -42,7 +42,16 @@ metric histories elsewhere and publish only bounded summaries or references.
 `event_id` is an idempotency key scoped to one job. Reusing it with the same
 job, kind, source, and data is safe; the first occurrence timestamp is retained,
 so a retry may provide a newly generated timestamp. Reusing an ID for different
-content is an error.
+content is an error while its receipt is retained. Receipts span the active and
+immediately previous journal generations. After that horizon, the same report
+may be accepted again, so this is recent retry protection rather than a
+permanent exactly-once ledger.
+
+With `deduplicated: false`, a successful `scruffy report` or
+`publish_event(...)` call means a new immutable report is durably spooled. With
+`deduplicated: true`, a matching pending report or durable retained receipt was
+found, so no new report was written. Neither result proves that the job exists
+or that the controller has accepted and published the report yet.
 
 ## Controller envelope
 
@@ -50,9 +59,15 @@ The controller validates and sequences a report, then adds its queue identity,
 allocation identity, global sequence, recording timestamp, canonical event ID,
 and the original `event_id` as `source_event_id`. Every observer has an
 independent cursor; reading never consumes an event for another observer.
-Every report is preserved in the journal, while the bounded current projection
-compares producer timestamps and does not let a late older report regress newer
-progress.
+Every accepted report is preserved in the retained journal generations, while
+the bounded current projection compares producer timestamps and does not let a
+late older report regress newer progress.
+
+Reports accepted during one controller tick are appended as a batch, followed
+by one journal sync and one cumulative snapshot commit. Observers see only data
+at or before that committed snapshot watermark, never a partially committed
+batch. The active and immediately previous journal generations are retained;
+an observer cursor from any earlier generation resets to the current snapshot.
 
 ## Authority
 

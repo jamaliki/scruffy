@@ -2,7 +2,7 @@
 
 Scruffy is a small, cooperative GPU queue that runs inside one multi-node Slurm
 allocation. One controller divides the allocation while any number of humans or
-agents submit work asynchronously and observe the same non-destructive event
+agents submit work asynchronously and observe the same non-consuming event
 journal.
 
 It is named after the quiet caretaker from *Futurama*. This project is not
@@ -86,14 +86,17 @@ scruffy --root "$SCRUFFY_ROOT" observe --follow --output
 One-shot `observe` returns the full current snapshot, journal events after its
 cursor, and a `next_cursor`. Each reader must persist its own opaque cursor and
 continue immediately while `more` is true. `observe --follow` is the interactive
-JSON Lines view. See [the client contract](docs/client-v1.md).
+JSON Lines view. Cursors include a journal generation; compaction makes an older
+generation return `reset: true`, at which point the reader rebuilds from the
+returned snapshot. See [the client contract](docs/client-v1.md).
 
 ## Submission and resources
 
 `submit` returns after its immutable request is durable. A stable `request_id`
 is an idempotency key scoped to the queue: retrying the same specification
 returns the original job ID, while changing it raises a conflict. Without a
-request ID, every call creates a new job.
+request ID, every call creates a new job. Exact request idempotency survives hot
+job eviction through a compact receipt in the archive.
 
 CLI defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per GPU. Requests
 are rectangular: every selected node receives the same resource shape and runs
@@ -170,6 +173,11 @@ status, assignments, or GPU ownership. Keep raw logs, metric histories,
 configuration, and artifact bytes elsewhere. See
 [the workload event contract](docs/events-v1.md).
 
+Reports accepted in one controller tick are group-committed with one journal
+sync and one cumulative snapshot. Report `event_id` receipts follow journal
+retention: the active and immediately previous generations are retained, so
+this key is for recent retry safety rather than permanent exactly-once delivery.
+
 Raw output is stored once in per-job files. Journal events contain ordered byte
 ranges; `observe --output` expands those references into text. For direct
 diagnosis:
@@ -197,11 +205,25 @@ appears on their journal outcome. `drain` disables new launches for the current
 controller; running jobs continue and queued jobs remain durable. Restart the
 controller to resume scheduling.
 
+The hot snapshot keeps every nonterminal job and, after compaction, the newest
+1,000 terminal jobs. Older terminal jobs remain addressable by job ID with
+`archived: true`; compact records keep lifecycle and workflow metadata, but
+resource requests, cwd, assignments, logs, argv, environment, and workload state
+expire. `summary.counts` includes archived terminal jobs;
+`summary.archived_jobs` and `status.archived_counts` expose the archived totals.
+The active and immediately previous journal generations are retained.
+Compact request receipts and workflow indexes last for the queue root's lifetime,
+so archive storage grows as O(total jobs) small files and inodes.
+
 Placement is deterministic best-fit with simple backfilling, but does not
 guarantee fairness for a large queued request. Queued and dependency-blocked jobs
 can survive a replacement allocation. Active jobs from a replaced allocation
 become `lost` and are never retried automatically. Resource assignments remain
 reserved whenever Slurm reconciliation is uncertain.
+
+The controller deliberately runs one submitted argv per job. It is not a retry
+engine, dynamic workflow fan-out engine, or artifact store: submit retries and
+new tasks explicitly, and keep artifacts in their normal storage.
 
 The shared queue stores argv, working directories, environment overrides, state,
 events, and logs in plaintext. Protect its permissions and pass paths to secret

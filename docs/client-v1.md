@@ -45,11 +45,13 @@ Never infer a terminal result from output text or workload progress.
 
 ## State views
 
-`status(root)` returns the full current state, including durable `submitted`
-requests not yet admitted by the controller. `status(root, job_id)` returns one
-job or raises `KeyError` if it does not exist.
+`status(root)` returns the full hot state, including durable `submitted`
+requests not yet admitted by the controller. `status(root, job_id)` also looks
+up compactly archived terminal jobs, and raises `KeyError` if the ID does not
+exist. An archived result carries `"archived": true` and has the reduced field
+set described under Retention.
 
-Important job fields are:
+Important hot-job fields are:
 
 - `id`, `name`, `state`, and `submitted_at`.
 - `request` and, while resources are held, `assignment`.
@@ -58,14 +60,17 @@ Important job fields are:
 - Optional bounded `workload` projection.
 - Optional `stdout` and `stderr` paths relative to the queue root.
 
-The full job image may contain argv and environment overrides. Treat it as
+The hot job image may contain argv and environment overrides. Treat it as
 sensitive. `summary(root, limit=20)` deliberately returns smaller job views,
 grouped as `submitted`, `active`, `queued`, `blocked`, `requires_attention`, and
-`recent_terminal`. It also returns exact state `counts`, node availability, and
-an `as_of_cursor` suitable for starting incremental observation.
+`recent_terminal`. It also returns exact state `counts`, including archived
+terminal jobs, an `archived_jobs` total, node availability, and an
+`as_of_cursor` suitable for starting incremental observation.
 
 `explain(root, job_id)` returns the job, its resolved upstream job IDs and
-states, current blockers, and a short explanation.
+states, current blockers, and a short explanation. Compact archived job and
+workflow metadata remains sufficient for older terminal-job lookup and
+dependency explanation.
 
 ## Submission
 
@@ -79,14 +84,17 @@ A successful submission returns:
 }
 ```
 
-The response means the immutable request is durable, not that a controller or
-GPU is available. Submission never waits for admission, dependencies, earlier
-jobs, or startup.
+With `deduplicated: false`, the response means a new immutable request is
+durable. With `deduplicated: true`, an identical pending request or persistent
+identity receipt was found; `state: "submitted"` is an acknowledgement, not the
+job's current lifecycle state. Query `status` when that distinction matters.
+Submission never waits for admission, dependencies, earlier jobs, or startup.
 
 `request_id` is an idempotency key scoped to the queue. Reusing it with an
 identical specification returns the same job ID with `deduplicated: true`.
 Reusing it with a different specification raises `ConflictError`. Omitting it
-creates a new job on every call.
+creates a new job on every call. Its exact identity digest is retained in the
+compact archive even after detailed job state expires.
 
 CLI resource defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per
 GPU. Python callers provide an explicit `ResourceRequest`.
@@ -99,8 +107,8 @@ One-shot `observe` returns:
 {
   "snapshot": {"jobs": {}, "nodes": {}},
   "events": [],
-  "next_cursor": "queue-...:42:12345",
-  "latest_cursor": "queue-...:47:13789",
+  "next_cursor": "queue-...:3:42:12345",
+  "latest_cursor": "queue-...:3:47:13789",
   "more": false,
   "reset": false
 }
@@ -109,21 +117,25 @@ One-shot `observe` returns:
 Cursors are opaque and private to one reader:
 
 1. Start from `summary.as_of_cursor`, or call `observe` without `after` to begin
-   at the current journal tail.
+   at the current committed journal tail.
 2. Process returned events in sequence order, then persist `next_cursor`.
 3. While `more` is true, request the next page immediately with that cursor.
 4. Otherwise, long-poll with `wait_seconds` or CLI `--wait`.
-5. If `reset` is true, the cursor belongs to another queue. Rebuild from the
-   returned full snapshot and save the new cursor.
+5. If `reset` is true, the cursor belongs to another queue or to an expired
+   journal generation. Rebuild from the returned full hot snapshot and save the
+   new cursor.
 
 Calling `observe` without a cursor returns current state but does not replay old
-journal events. `latest_cursor` indicates the journal tail at response time.
+journal events. `latest_cursor` indicates the committed journal tail at response time.
 `next_cursor == latest_cursor` with `more: false` means the reader is caught up.
+The active and immediately previous journal generations are retained, but
+observation never replays across a generation boundary; a stale cursor resets.
 
 `include_output=True` or CLI `--output` expands each `job.output` reference by
 adding `data.text`. `observe --follow` maintains its cursor internally and emits
-an initial snapshot followed by events as JSON Lines; use one-shot observation
-when the caller must persist resumable state.
+an initial snapshot followed by events as JSON Lines. It emits another snapshot
+after a cursor reset. Use one-shot observation when the caller must persist
+resumable state.
 
 ## Journal events
 
@@ -150,6 +162,24 @@ Workload events additionally preserve producer `occurred_at`, `source`, and
 `source_event_id`; their contract is [events-v1.md](events-v1.md). Consumers
 must ignore unknown fields and event kinds so compatible additions do not break
 v1 readers.
+
+## Retention
+
+After compaction, hot state contains every nonterminal job and the newest 1,000
+terminal jobs. Older terminal jobs move to records marked `archived: true`.
+These retain identity, lifecycle results and timestamps, and workflow metadata;
+they drop the resource request, cwd, argv, environment, assignments, blockers,
+workload projection, output paths, and per-job logs. The state exposes per-state
+`archived_counts`; `summary.counts` combines these with hot counts, while
+detailed summary lists and unqualified `status(root)` remain hot views.
+
+Journal history and workload-report idempotency receipts retain the active and
+immediately previous generations. Request idempotency is different: its compact
+receipt persists after the full job image is evicted.
+
+Compact request receipts and workflow archive entries persist for the lifetime
+of the queue root. They therefore grow as O(total jobs) small files and inodes,
+even though retained terminal-job detail and journal history are bounded.
 
 ## Commands and process exit
 
@@ -189,3 +219,7 @@ Clients only create immutable requests, commands, and workload reports. The
 controller alone assigns resources and appends globally sequenced events. Queue
 contents, argv, environment overrides, output, and annotations are plaintext;
 protect filesystem access and pass secret-file paths rather than secret values.
+
+The controller deliberately executes submitted jobs; it does not invent
+retries, dynamically fan out workflow tasks, or store artifact bytes. Clients
+must submit those jobs explicitly and keep artifacts elsewhere.

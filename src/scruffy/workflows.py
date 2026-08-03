@@ -89,7 +89,7 @@ def _materialize(jobs: Iterable[Job]) -> tuple[Job, ...]:
     return result
 
 
-def _validate_cycles(needs: Mapping[TaskKey, tuple[Need, ...]]) -> None:
+def _validate_cycles(needs: Mapping[TaskKey, tuple[Need, ...]]) -> tuple[TaskKey, ...]:
     # Missing tasks are allowed while a workflow is being submitted piecemeal.
     # They cannot participate in a cycle until their task request exists.
     indegree = {
@@ -105,19 +105,20 @@ def _validate_cycles(needs: Mapping[TaskKey, tuple[Need, ...]]) -> None:
                 dependents[dependency_key].append(key)
 
     ready = deque(key for key, count in indegree.items() if count == 0)
-    visited = 0
+    ordered: list[TaskKey] = []
     while ready:
         key = ready.popleft()
-        visited += 1
+        ordered.append(key)
         for dependent in dependents[key]:
             indegree[dependent] -= 1
             if indegree[dependent] == 0:
                 ready.append(dependent)
 
-    if visited != len(needs):
+    if len(ordered) != len(needs):
         cyclic = sorted(key for key, count in indegree.items() if count > 0)
         details = ", ".join(f"{workflow_id}/{task_id}" for workflow_id, task_id in cyclic)
         raise WorkflowError(f"dependency cycle involving: {details}")
+    return tuple(ordered)
 
 
 def _validate_self_dependencies(
@@ -137,6 +138,7 @@ def _validated_graph(
 ) -> tuple[
     dict[TaskKey, Job],
     dict[TaskKey, tuple[Need, ...]],
+    tuple[TaskKey, ...],
 ]:
     ordered = _materialize(jobs)
     by_key: dict[TaskKey, Job] = {}
@@ -161,8 +163,8 @@ def _validated_graph(
         needs[key] = dependencies
 
     _validate_self_dependencies(needs)
-    _validate_cycles(needs)
-    return by_key, needs
+    order = _validate_cycles(needs)
+    return by_key, needs, order
 
 
 def validate_workflows(jobs: Iterable[Job]) -> None:
@@ -178,12 +180,16 @@ def validate_workflows(jobs: Iterable[Job]) -> None:
 
 
 def _blockers(
-    key: TaskKey, by_key: Mapping[TaskKey, Job], needs: Mapping[TaskKey, tuple[Need, ...]]
+    key: TaskKey,
+    by_key: Mapping[TaskKey, Job],
+    needs: Mapping[TaskKey, tuple[Need, ...]],
+    states: Mapping[TaskKey, object] | None = None,
 ) -> list[dict[str, object]]:
     workflow_id, _ = key
     blockers: list[dict[str, object]] = []
     for task_id, condition in needs[key]:
-        dependency = by_key.get((workflow_id, task_id))
+        dependency_key = (workflow_id, task_id)
+        dependency = by_key.get(dependency_key)
         if dependency is None:
             blockers.append(
                 {
@@ -194,7 +200,7 @@ def _blockers(
                 }
             )
             continue
-        state = dependency.get("state")
+        state = dependency.get("state") if states is None else states[dependency_key]
         is_terminal = isinstance(state, str) and state in TERMINAL_JOB_STATES
         if condition == "terminal" and is_terminal:
             continue
@@ -238,8 +244,9 @@ def _resolution(
     key: TaskKey | None,
     by_key: Mapping[TaskKey, Job],
     needs: Mapping[TaskKey, tuple[Need, ...]],
+    states: Mapping[TaskKey, object] | None = None,
 ) -> dict[str, object]:
-    blockers = [] if key is None else _blockers(key, by_key, needs)
+    blockers = [] if key is None else _blockers(key, by_key, needs, states)
     unsatisfied = any(
         blocker["reason"] == "dependency_unsatisfied" for blocker in blockers
     )
@@ -255,8 +262,26 @@ def _resolution(
     return {"decision": decision, "reason": reason, "blockers": blockers}
 
 
+def resolve_blocked_jobs(jobs: Iterable[Job]) -> dict[TaskKey, dict[str, object]]:
+    """Resolve all blocked tasks to a fixed point from one graph build."""
+
+    by_key, needs, order = _validated_graph(jobs)
+    states = {key: job.get("state") for key, job in by_key.items()}
+    resolutions: dict[TaskKey, dict[str, object]] = {}
+    for key in order:
+        if states[key] != "blocked":
+            continue
+        resolution = _resolution(key, by_key, needs, states)
+        resolutions[key] = resolution
+        if resolution["decision"] == "ready":
+            states[key] = "queued"
+        elif resolution["decision"] == "skipped":
+            states[key] = "skipped"
+    return resolutions
+
+
 def resolve_dependencies(job: Job, jobs: Iterable[Job]) -> dict[str, object]:
     """Resolve one job to ``ready``, ``blocked``, or ``skipped``."""
 
-    by_key, needs = _validated_graph(jobs)
+    by_key, needs, _ = _validated_graph(jobs)
     return _resolution(_target_key(job, by_key), by_key, needs)

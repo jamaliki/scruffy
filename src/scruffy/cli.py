@@ -220,7 +220,7 @@ def _observe(arguments: argparse.Namespace) -> int:
             include_output=arguments.output,
             limit=arguments.limit,
         )
-        if first:
+        if first or response["reset"]:
             print(
                 json.dumps({"kind": "snapshot", "data": response["snapshot"]}),
                 flush=True,
@@ -434,7 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="read or follow the shared allocation event stream",
         description=(
             "Return a snapshot and one event page. Without --after, start at the "
-            "current tail. --follow emits snapshot/event JSON lines continuously."
+            "committed tail. --follow emits snapshot/event JSON lines continuously."
         ),
     )
     observe_parser.add_argument(

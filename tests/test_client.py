@@ -6,7 +6,15 @@ from pathlib import Path
 from unittest import mock
 
 from scruffy import ConflictError, publish_event as public_publish_event
-from scruffy.client import explain, observe, publish_event, status, submit_job, summary
+from scruffy.client import (
+    explain,
+    observe,
+    parse_cursor,
+    publish_event,
+    status,
+    submit_job,
+    summary,
+)
 from scruffy.models import ResourceRequest
 from scruffy.protocol import ProtocolError
 from scruffy.storage import (
@@ -61,10 +69,12 @@ class ObserveTests(unittest.TestCase):
             "jobs": {job_id: {"id": job_id, "state": "succeeded"}},
             "draining": False,
         }
-        write_state(self.root, state)
         with open_journal(self.root) as journal:
             for event in events:
                 append_event(journal, event, sync=True)
+            state["journal_generation"] = 0
+            state["journal_offset"] = journal.tell()
+        write_state(self.root, state)
 
         reader_a = observe(
             self.root, after=0, include_output=False, limit=2
@@ -76,13 +86,13 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual([1, 2], [event["seq"] for event in reader_a["events"]])
         self.assertNotIn("text", reader_a["events"][1]["data"])
         self.assertTrue(reader_a["more"])
-        self.assertTrue(reader_a["next_cursor"].startswith(f"{identity}:2:"))
+        self.assertTrue(reader_a["next_cursor"].startswith(f"{identity}:0:2:"))
         self.assertEqual([1, 2, 3], [event["seq"] for event in reader_b["events"]])
         expanded = next(
             event for event in reader_b["events"] if event["kind"] == "job.output"
         )
         self.assertEqual(payload.decode(), expanded["data"]["text"])
-        self.assertTrue(reader_b["next_cursor"].startswith(f"{identity}:3:"))
+        self.assertTrue(reader_b["next_cursor"].startswith(f"{identity}:0:3:"))
         self.assertEqual(state, reader_a["snapshot"])
 
         resumed_a = observe(
@@ -265,7 +275,10 @@ class ObserveTests(unittest.TestCase):
         with (
             mock.patch("scruffy.client.time.monotonic", return_value=0),
             mock.patch("scruffy.client.time.sleep"),
-            mock.patch("scruffy.client.journal_size", side_effect=[0, 1]),
+            mock.patch(
+                "scruffy.client._snapshot_cursor",
+                side_effect=[(0, 0, 0), (0, 0, 0), (0, 1, 10)],
+            ),
             mock.patch(
                 "scruffy.client.read_event_page",
                 side_effect=[([], 0, False), ([event], 10, False)],
@@ -275,6 +288,54 @@ class ObserveTests(unittest.TestCase):
 
         self.assertEqual([event], response["events"])
         self.assertEqual(2, read_page.call_count)
+
+    def test_observe_never_crosses_the_committed_state_watermark(self) -> None:
+        identity = queue_id(self.root)
+        event = {"v": 1, "queue_id": identity, "seq": 1, "kind": "job.queued"}
+        state = {
+            "v": 1,
+            "queue_id": identity,
+            "last_seq": 0,
+            "journal_generation": 0,
+            "journal_offset": 0,
+            "allocation": None,
+            "nodes": {},
+            "jobs": {},
+            "draining": False,
+        }
+        with open_journal(self.root) as journal:
+            append_event(journal, event, sync=True)
+            committed_offset = journal.tell()
+        write_state(self.root, state)
+
+        self.assertEqual([], observe(self.root, after=0)["events"])
+        state["last_seq"] = 1
+        state["journal_offset"] = committed_offset
+        write_state(self.root, state)
+        self.assertEqual([event], observe(self.root, after=0)["events"])
+
+    def test_generationless_cursor_resets_after_compaction(self) -> None:
+        identity = queue_id(self.root)
+        write_state(
+            self.root,
+            {
+                "queue_id": identity,
+                "journal_generation": 2,
+                "last_seq": 40,
+                "journal_offset": 123,
+                "jobs": {},
+                "nodes": {},
+                "allocation": None,
+                "draining": False,
+            },
+        )
+
+        self.assertEqual((2, 40, 123, True), parse_cursor(self.root, 0))
+        self.assertEqual((2, 40, 123, True), parse_cursor(self.root, "0"))
+        self.assertEqual(
+            (2, 40, 123, True),
+            parse_cursor(self.root, f"{identity}:0:39:99"),
+        )
 
 
 if __name__ == "__main__":

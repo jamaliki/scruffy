@@ -108,6 +108,7 @@ class Controller:
     last_slurm_query: float = 0.0
     slurm_query_error: str | None = None
     report_cursor: str | None = None
+    workflow_signatures: dict[str, tuple[tuple[str, object], ...]] | None = None
 
 
 def copy_stream(

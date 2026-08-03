@@ -7,18 +7,41 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import ACTIVE_JOB_STATES, Assignment, NodeInventory, ResourceRequest
+from .models import (
+    ACTIVE_JOB_STATES,
+    TERMINAL_JOB_STATES,
+    Assignment,
+    NodeInventory,
+    ResourceRequest,
+)
+from .protocol import EVENT_KINDS
 from .runtime import Controller
 from .scheduler import available_resources
 from .storage import (
+    activate_journal_generation,
     append_event,
-    journal_tail,
+    archive_terminal_job,
+    create_journal_generation,
+    job_identity_digest,
+    latest_checkpoint,
     load_state,
+    next_journal_generation,
+    open_journal,
+    prune_journal_generations,
+    prune_report_receipts,
     queue_id,
-    read_events,
+    read_event_page,
+    remove_cold_job_directories,
+    sync_file,
+    sync_report_inboxes,
     utc_now,
     write_state,
 )
+
+
+MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+MAX_TERMINAL_JOBS = 1000
+TERMINAL_COMPACTION_SLACK = 100
 
 
 def _event_key(occurred_at: str, event_id: str) -> tuple[datetime, str]:
@@ -146,6 +169,7 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
         "state": "queued",
         "submitted_at": str(spec["submitted_at"]),
         "queue_order": queue_order,
+        "request_digest": job_identity_digest(spec),
         "argv": argv,
         "cwd": str(cwd),
         "env": environment,
@@ -219,14 +243,21 @@ def emit(
     kind: str,
     *,
     job: dict[str, Any] | None = None,
+    job_id: str | None = None,
     data: dict[str, Any] | None = None,
     durable: bool = True,
     snapshot: bool = True,
     occurred_at: str | None = None,
     source_event_id: str | None = None,
     source: dict[str, str] | None = None,
+    report_id: str | None = None,
+    report_digest: str | None = None,
 ) -> dict[str, Any]:
-    """Append one ordered event, then atomically publish the new snapshot."""
+    """Append one ordered event, then optionally publish the new snapshot.
+
+    Lifecycle events carry a complete ``job`` image for recovery. High-rate
+    output and workload events should pass only ``job_id`` and a small delta.
+    """
 
     state = controller.state
     state["last_seq"] += 1
@@ -247,8 +278,17 @@ def emit(
         event["source_event_id"] = source_event_id
     if source is not None:
         event["source"] = dict(source)
+    if report_id is not None:
+        event["report_id"] = report_id
+    if report_digest is not None:
+        event["report_digest"] = report_digest
     if job is not None:
-        event["job_id"] = job["id"]
+        if job_id is not None and job_id != job["id"]:
+            raise ValueError("job and job_id refer to different jobs")
+        job_id = str(job["id"])
+    if job_id is not None:
+        event["job_id"] = job_id
+    if job is not None:
         # Complete images let a missing or stale snapshot be rebuilt.
         event["job"] = copy.deepcopy(job)
     if data is not None:
@@ -263,24 +303,115 @@ def emit(
     return event
 
 
+def commit_snapshot(controller: Controller) -> None:
+    """Durably commit prior events, then publish one cumulative state image."""
+
+    sync_file(controller.journal)
+    refresh_nodes(controller.state, controller.inventory)
+    write_state(controller.root, controller.state)
+
+
+def compact_journal(
+    controller: Controller,
+    *,
+    max_bytes: int = MAX_JOURNAL_BYTES,
+    max_terminal_jobs: int = MAX_TERMINAL_JOBS,
+    terminal_slack: int = TERMINAL_COMPACTION_SLACK,
+) -> bool:
+    """Rotate history and move old terminal details out of the hot snapshot."""
+
+    terminal = [
+        job
+        for job in controller.state["jobs"].values()
+        if job.get("state") in TERMINAL_JOB_STATES
+    ]
+    oversized = max_bytes > 0 and controller.journal.tell() > max_bytes
+    overfull = (
+        max_terminal_jobs >= 0
+        and len(terminal) > max_terminal_jobs + max(terminal_slack, 0)
+    )
+    if not oversized and not overfull:
+        return False
+    commit_snapshot(controller)
+    terminal.sort(
+        key=lambda job: (
+            str(job.get("finished_at") or job.get("submitted_at") or ""),
+            int(job.get("queue_order", 0)),
+        ),
+        reverse=True,
+    )
+    archived_counts = controller.state.setdefault("archived_counts", {})
+    retain_count = len(terminal) if max_terminal_jobs < 0 else max_terminal_jobs
+    for job in terminal[retain_count:]:
+        archive_terminal_job(controller.root, job)
+        state_name = str(job.get("state", "unknown"))
+        archived_counts[state_name] = int(archived_counts.get(state_name, 0)) + 1
+        del controller.state["jobs"][job["id"]]
+    controller.state["archived_jobs"] = sum(
+        int(count) for count in archived_counts.values()
+    )
+    current = int(controller.state.get("journal_generation", 0))
+    generation = next_journal_generation(controller.root, current)
+    checkpoint = copy.deepcopy(controller.state)
+    checkpoint["journal_generation"] = generation
+    checkpoint["journal_offset"] = 0
+    create_journal_generation(controller.root, generation, checkpoint)
+
+    old_journal = controller.journal
+    controller.state["journal_generation"] = generation
+    controller.state["journal_offset"] = 0
+    write_state(controller.root, controller.state)
+    activate_journal_generation(controller.root, generation)
+    controller.journal = open_journal(controller.root, generation)
+    old_journal.close()
+    # Keep one prior generation briefly so a reader which raced the atomic
+    # state replacement can finish; older cursors reset from the new snapshot.
+    retained_generations = {current, generation}
+    prune_journal_generations(controller.root, retained_generations)
+    sync_report_inboxes(controller.root)
+    prune_report_receipts(controller.root, retained_generations)
+    remove_cold_job_directories(controller.root, controller.state["jobs"].keys())
+    return True
+
+
 def load_recovered_state(root: Path) -> dict[str, Any]:
     """Load a snapshot and replay newer complete job images from the journal."""
 
     state = load_state(root)
     rebuilding = state is None
     if rebuilding:
-        state = {
-            "v": 1,
-            "queue_id": queue_id(root),
-            "last_seq": 0,
-            "journal_offset": 0,
-            "allocation": None,
-            "nodes": {},
-            "jobs": {},
-            "draining": False,
-            "updated_at": utc_now(),
-        }
-    for event in read_events(root, after=int(state.get("last_seq", 0))):
+        recovered = latest_checkpoint(root)
+        if recovered is not None:
+            _, state = recovered
+            rebuilding = False
+        else:
+            state = {
+                "v": 1,
+                "queue_id": queue_id(root),
+                "last_seq": 0,
+                "journal_generation": 0,
+                "journal_offset": 0,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "report_acks": {},
+                "report_ack_v": 1,
+                "next_queue_order": 0,
+                "archived_jobs": 0,
+                "archived_counts": {},
+                "draining": False,
+                "updated_at": utc_now(),
+            }
+    generation = int(state.get("journal_generation", 0))
+    if not rebuilding and generation > 0:
+        activate_journal_generation(root, generation)
+    events, journal_offset, _ = read_event_page(
+        root,
+        after=int(state.get("last_seq", 0)),
+        offset=0 if rebuilding else int(state.get("journal_offset", 0)),
+        generation=generation,
+    )
+    for event in events:
         allocation_id = event.get("allocation_id")
         if allocation_id and (
             rebuilding or event.get("kind") == "allocation.started"
@@ -289,7 +420,40 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
         job = event.get("job")
         if isinstance(job, dict) and "id" in job:
             state.setdefault("jobs", {})[str(job["id"])] = job
+        elif event.get("kind") in EVENT_KINDS:
+            current = state.setdefault("jobs", {}).get(event.get("job_id"))
+            if (
+                isinstance(current, dict)
+                and isinstance(event.get("source_event_id"), str)
+                and isinstance(event.get("occurred_at"), str)
+                and isinstance(event.get("data"), dict)
+            ):
+                apply_workload_event(
+                    current,
+                    {
+                        "event_id": event["source_event_id"],
+                        "occurred_at": event["occurred_at"],
+                        "kind": event["kind"],
+                        "data": event["data"],
+                    },
+                    recorded_at=str(event.get("recorded_at") or event.get("at") or ""),
+                )
+        report_id = event.get("report_id")
+        if isinstance(report_id, str):
+            digest = event.get("report_digest")
+            state.setdefault("report_acks", {})[report_id] = (
+                digest if isinstance(digest, str) else None
+            )
         state["last_seq"] = max(int(state.get("last_seq", 0)), int(event["seq"]))
-    if rebuilding or int(state.get("last_seq", 0)) > 0:
-        _, state["journal_offset"] = journal_tail(root)
+    state["journal_offset"] = journal_offset
+    state.setdefault("report_acks", {})
+    state["next_queue_order"] = max(
+        int(state.get("next_queue_order", 0)),
+        max(
+            (int(job.get("queue_order", 0)) for job in state["jobs"].values()),
+            default=0,
+        ),
+    )
+    state.setdefault("archived_jobs", 0)
+    state.setdefault("archived_counts", {})
     return state
