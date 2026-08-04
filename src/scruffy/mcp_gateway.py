@@ -97,6 +97,7 @@ async def call_remote(
         process = await asyncio.create_subprocess_exec(
             *connect_command,
             shlex.join(remote_argv),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,

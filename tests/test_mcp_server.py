@@ -361,9 +361,13 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             """\
 import os
 import shlex
+import stat
 from pathlib import Path
 import sys
 
+if not stat.S_ISCHR(os.fstat(0).st_mode):
+    print("connector inherited MCP stdin", file=sys.stderr)
+    raise SystemExit(64)
 counter = Path(os.environ["SCRUFFY_TEST_CONNECTOR_COUNT"])
 count = int(counter.read_text() if counter.exists() else "0") + 1
 counter.write_text(str(count))
