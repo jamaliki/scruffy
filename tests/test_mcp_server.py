@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -352,6 +353,82 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["job.succeeded"], [event["kind"] for event in result["events"]])
         self.assertFalse(result["timed_out"])
         self.assertNotIn("argv", result["events"][0]["job"])
+
+    async def test_local_gateway_survives_remote_failure_and_cancellation(self) -> None:
+        connector = self.root.parent / "connector.py"
+        counter = self.root.parent / "connector-count"
+        connector.write_text(
+            """\
+import os
+import shlex
+from pathlib import Path
+import sys
+
+counter = Path(os.environ["SCRUFFY_TEST_CONNECTOR_COUNT"])
+count = int(counter.read_text() if counter.exists() else "0") + 1
+counter.write_text(str(count))
+if count == 1:
+    print("simulated SSH disconnect", file=sys.stderr)
+    raise SystemExit(255)
+command = shlex.split(sys.argv[1])
+os.execv(command[0], command)
+"""
+        )
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(source_root), environment.get("PYTHONPATH")))
+        )
+        environment["SCRUFFY_TEST_CONNECTOR_COUNT"] = str(counter)
+        connect_command = " ".join((shlex.quote(sys.executable), shlex.quote(str(connector))))
+        remote_command = f"{shlex.quote(sys.executable)} -m scruffy.mcp_server"
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m",
+                "scruffy.mcp_server",
+                "--root",
+                str(self.root),
+                "--connect-command",
+                connect_command,
+                "--remote-command",
+                remote_command,
+            ],
+            env=environment,
+        )
+
+        async with (
+            stdio_client(parameters) as (reader, writer),
+            ClientSession(reader, writer) as session,
+        ):
+            await session.initialize()
+            failed = await session.call_tool("overview", {})
+            failure_text = "".join(item.text for item in failed.content if item.type == "text")
+            self.assertTrue(failed.isError)
+            self.assertIn("retry this tool call", failure_text)
+
+            recovered = self.structured(await session.call_tool("overview", {}))
+            self.assertEqual(self.identity, recovered["queue_id"])
+
+            pending = asyncio.create_task(
+                session.call_tool(
+                    "wait_for_updates",
+                    {
+                        "after": recovered["as_of_cursor"],
+                        "timeout_seconds": 600,
+                        "event_kinds": ["diagnostic.never"],
+                    },
+                )
+            )
+            await asyncio.sleep(0.2)
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+
+            after_cancel = self.structured(await session.call_tool("overview", {}))
+            self.assertEqual(self.identity, after_cancel["queue_id"])
+
+        self.assertGreaterEqual(int(counter.read_text()), 4)
 
 
 if __name__ == "__main__":

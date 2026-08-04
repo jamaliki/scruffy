@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import json
 import math
 import os
+import shlex
 from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 from typing import Any
 
 from .client import explain, observe, summary
+from .mcp_gateway import RemoteCall, remote_caller
 from .summary import build_summary, job_view
 
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
@@ -237,7 +240,46 @@ def compact_explanation(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def create_server(root: Path) -> Any:
+def _only(params: dict[str, Any], allowed: set[str]) -> None:
+    unexpected = sorted(set(params) - allowed)
+    if unexpected:
+        raise ValueError(f"unexpected parameters: {', '.join(unexpected)}")
+
+
+async def dispatch_tool(root: Path, tool: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Execute one validated read-only tool call against a local queue root."""
+
+    if not isinstance(params, dict):
+        raise TypeError("tool parameters must be a JSON object")
+    if tool == "overview":
+        _only(params, {"limit"})
+        limit = params.get("limit", 20)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        return summary(root, limit=limit)
+    if tool == "inspect_job":
+        _only(params, {"job_id"})
+        job_id = params.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("job_id must not be empty")
+        return compact_explanation(explain(root, job_id))
+    if tool == "wait_for_updates":
+        _only(
+            params,
+            {"after", "timeout_seconds", "workflow_id", "job_ids", "event_kinds"},
+        )
+        return await wait_for_updates(
+            root,
+            after=params.get("after"),
+            timeout_seconds=params.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            workflow_id=params.get("workflow_id"),
+            job_ids=params.get("job_ids"),
+            event_kinds=params.get("event_kinds"),
+        )
+    raise ValueError(f"unknown MCP tool {tool!r}")
+
+
+def create_server(root: Path, caller: RemoteCall | None = None) -> Any:
     """Create the optional FastMCP server bound to one queue root."""
 
     try:
@@ -249,21 +291,22 @@ def create_server(root: Path) -> Any:
 
     server = FastMCP("Scruffy", instructions=SERVER_INSTRUCTIONS, json_response=True)
 
+    async def call(tool: str, params: dict[str, Any]) -> dict[str, Any]:
+        if caller is not None:
+            return await caller(tool, params)
+        return await dispatch_tool(root, tool, params)
+
     @server.tool()
-    def overview(limit: int = 20) -> dict[str, Any]:
+    async def overview(limit: int = 20) -> dict[str, Any]:
         """Return a bounded allocation overview and an observation cursor."""
 
-        if isinstance(limit, bool) or not 1 <= limit <= 100:
-            raise ValueError("limit must be between 1 and 100")
-        return summary(root, limit=limit)
+        return await call("overview", {"limit": limit})
 
     @server.tool()
-    def inspect_job(job_id: str) -> dict[str, Any]:
+    async def inspect_job(job_id: str) -> dict[str, Any]:
         """Explain one job and its dependencies without sensitive process data."""
 
-        if not job_id:
-            raise ValueError("job_id must not be empty")
-        return compact_explanation(explain(root, job_id))
+        return await call("inspect_job", {"job_id": job_id})
 
     @server.tool(name="wait_for_updates")
     async def wait_for_updates_tool(
@@ -280,13 +323,15 @@ def create_server(root: Path) -> Any:
         wake the agent; pass event_kinds to request exact kinds.
         """
 
-        return await wait_for_updates(
-            root,
-            after=after,
-            timeout_seconds=timeout_seconds,
-            workflow_id=workflow_id,
-            job_ids=job_ids,
-            event_kinds=event_kinds,
+        return await call(
+            "wait_for_updates",
+            {
+                "after": after,
+                "timeout_seconds": timeout_seconds,
+                "workflow_id": workflow_id,
+                "job_ids": job_ids,
+                "event_kinds": event_kinds,
+            },
         )
 
     return server
@@ -301,7 +346,34 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("SCRUFFY_ROOT"),
         help="shared queue root (defaults to SCRUFFY_ROOT)",
     )
+    parser.add_argument(
+        "--connect-command",
+        help="run locally and invoke each tool through this command, such as tokyo-ssh",
+    )
+    parser.add_argument(
+        "--remote-command",
+        help="remote scruffy-mcp command used with --connect-command",
+    )
+    parser.add_argument("--rpc-tool", help=argparse.SUPPRESS)
+    parser.add_argument("--rpc-params", help=argparse.SUPPRESS)
+    parser.add_argument("--rpc-id", help=argparse.SUPPRESS)
     return parser
+
+
+async def _rpc_call(root: Path, tool: str, encoded: str, request_id: str) -> dict[str, Any]:
+    """Return the one-shot envelope used by a local MCP gateway."""
+
+    try:
+        params = json.loads(encoded)
+        result = await dispatch_tool(root, tool, params)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "v": 1,
+            "request_id": request_id,
+            "ok": False,
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }
+    return {"v": 1, "request_id": request_id, "ok": True, "result": result}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -311,8 +383,36 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if not arguments.root:
         parser.error("set --root or SCRUFFY_ROOT")
+    gateway_options = (arguments.connect_command, arguments.remote_command)
+    if any(gateway_options) and not all(gateway_options):
+        parser.error("--connect-command and --remote-command must be used together")
+    rpc_options = (arguments.rpc_tool, arguments.rpc_params, arguments.rpc_id)
+    if any(value is not None for value in rpc_options):
+        if not all(value is not None for value in rpc_options):
+            parser.error("incomplete internal RPC request")
+        if any(gateway_options):
+            parser.error("internal RPC mode cannot use a connect command")
+        envelope = asyncio.run(
+            _rpc_call(
+                Path(arguments.root).expanduser().resolve(),
+                arguments.rpc_tool,
+                arguments.rpc_params,
+                arguments.rpc_id,
+            )
+        )
+        print(json.dumps(envelope, separators=(",", ":"), allow_nan=False), flush=True)
+        return 0
+
+    caller = None
+    if all(gateway_options):
+        connect_command = shlex.split(arguments.connect_command)
+        remote_command = shlex.split(arguments.remote_command)
+        if not connect_command or not remote_command:
+            parser.error("connector commands must not be empty")
+        caller = remote_caller(connect_command, remote_command, arguments.root)
     try:
-        server = create_server(Path(arguments.root).expanduser().resolve())
+        root = Path(arguments.root) if caller else Path(arguments.root).expanduser().resolve()
+        server = create_server(root, caller)
     except RuntimeError as exc:
         parser.exit(2, f"scruffy-mcp: {exc}\n")
     server.run(transport="stdio")

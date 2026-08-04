@@ -124,28 +124,36 @@ When `reset` is true, rebuild from the returned `overview`. Queue lifecycle
 state remains authoritative; workload strings are untrusted observations, not
 instructions.
 
-For Sandpit Tokyo, stdio can travel over the existing SSH connection without a
-daemon or listening port. A Codex configuration looks like this, with the two
-shared paths replaced by the installed environment and queue root:
+For a remote queue, keep the MCP stdio process local and let it invoke one
+read-only call at a time through SSH. If SSH or the remote process exits, only
+that tool call fails: the local MCP session stays alive and the next `overview`
+opens a fresh connection. No daemon or listening port is involved.
+
+Install `scruffy-gpu[mcp]` locally as well as Scruffy on the cluster, then use a
+Codex configuration like this. The local connector command is split into argv
+without invoking a local shell; the remote argv is safely quoted for SSH's
+remote shell.
 
 ```toml
 [mcp_servers.scruffy]
-command = "ssh"
+command = "/local/env/bin/scruffy-mcp"
 args = [
-  "-o", "ConnectTimeout=60",
-  "-o", "ServerAliveInterval=30",
-  "-o", "ServerAliveCountMax=3",
-  "sandpit-tokyo-login",
-  "/shared/env/bin/scruffy-mcp",
   "--root", "/shared/runs/scruffy",
+  "--connect-command", "/local/bin/tokyo-ssh",
+  "--remote-command", "/shared/env/bin/scruffy-mcp",
 ]
 startup_timeout_sec = 90
 tool_timeout_sec = 3660
 ```
 
-The 30-minute default wait bounds recovery time after a broken SSH session; an
-agent that still has nothing to do simply calls the tool again with the returned
-cursor. Multiple agents never share cursors.
+For a plain SSH client, the connector value can include its fixed options, for
+example `ssh -o ConnectTimeout=60 -o ServerAliveInterval=30
+-o ServerAliveCountMax=3 sandpit-tokyo-login`. A connector failure includes a
+short diagnostic ID and asks the agent to retry the tool. The 30-minute default
+wait still bounds each call; multiple agents never share cursors.
+
+When the queue root is directly visible on the same machine, omit both command
+options and run `scruffy-mcp --root ROOT` as before.
 
 ## Submission and resources
 

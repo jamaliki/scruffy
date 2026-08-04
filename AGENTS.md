@@ -69,6 +69,9 @@ agents; reading does not consume events for anyone else. Use
   and `observe` for incremental monitoring.
 - Prefer MCP `wait_for_updates` whenever it is available. Do not spend agent
   turns repeatedly invoking shell `sleep` while waiting for queue activity.
+- A remote MCP connector error affects only the current read-only call. Retry
+  once with `overview`; the local gateway opens a fresh remote process without
+  replaying or duplicating any queue action.
 - Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000
   terminal jobs. Older lookups carry `archived: true` and retain lifecycle and
   workflow metadata, but resource requests, cwd, assignments, logs, argv,
