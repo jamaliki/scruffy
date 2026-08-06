@@ -117,6 +117,36 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual("old-allocation", state["allocation"]["id"])
         self.assertEqual("succeeded", state["jobs"]["job-replayed"]["state"])
 
+    def test_durable_boundaries_replace_the_journal_handle(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        previous = controller.journal
+        emit(controller, "notice", data={"message": "durable"})
+        self.assertTrue(previous.closed)
+        self.assertIsNot(previous, controller.journal)
+
+        previous = controller.journal
+        emit(
+            controller,
+            "notice",
+            data={"message": "batched"},
+            durable=False,
+            snapshot=False,
+        )
+        self.assertIs(previous, controller.journal)
+        state_module.commit_snapshot(controller)
+        self.assertTrue(previous.closed)
+        self.assertIsNot(previous, controller.journal)
+
     def test_same_slurm_allocation_reattaches_active_jobs(self) -> None:
         job = job_image("job-active", "gpu-3")
         job["launch_token"] = "scruffy-token"
@@ -143,7 +173,7 @@ class RecoverySafetyTests(unittest.TestCase):
             poll_interval=0.1,
             cancel_grace=30,
         )
-        self.addCleanup(controller.journal.close)
+        self.addCleanup(lambda: controller.journal.close())
 
         running = controller.running["job-active"]
         self.assertIsNone(running.process)
@@ -201,7 +231,7 @@ class RecoverySafetyTests(unittest.TestCase):
             poll_interval=0.1,
             cancel_grace=30,
         )
-        self.addCleanup(controller.journal.close)
+        self.addCleanup(lambda: controller.journal.close())
 
         _refresh_dependencies(controller)
         self.assertEqual("queued", controller.state["jobs"]["job-blocked"]["state"])
@@ -607,7 +637,7 @@ class RecoverySafetyTests(unittest.TestCase):
             poll_interval=0.1,
             cancel_grace=30,
         )
-        self.addCleanup(controller.journal.close)
+        self.addCleanup(lambda: controller.journal.close())
 
         rejected = controller.state["jobs"]["job-too-large"]
         self.assertEqual("rejected", rejected["state"])
@@ -628,7 +658,7 @@ class LaunchCleanupTests(unittest.TestCase):
             poll_interval=0.01,
             cancel_grace=0,
         )
-        self.addCleanup(self.controller.journal.close)
+        self.addCleanup(lambda: self.controller.journal.close())
 
     def test_post_popen_reader_failure_holds_gpu_until_child_exit(self) -> None:
         job = {
@@ -685,7 +715,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             controller.state["jobs"] = {
                 "grandchild": {
                     "id": "grandchild",
@@ -742,7 +772,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             controller.state["jobs"] = {
                 child_id: {
                     "id": child_id,
@@ -822,7 +852,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             controller.state["jobs"] = {}
             for workflow_id in ("flow-a", "flow-b"):
                 controller.state["jobs"][f"{workflow_id}-root"] = {
@@ -874,7 +904,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             archive_terminal_job(
                 root,
                 {
@@ -917,7 +947,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             archive_terminal_job(
                 root,
                 {
@@ -965,7 +995,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             for request_id in ("batch-a", "batch-b"):
                 submit_job(
                     root,
@@ -1002,7 +1032,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             for job_id in ("job-a", "job-b"):
                 publish_event(
                     root,
@@ -1040,7 +1070,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             for event_id in ("a-1", "a-2", "a-3"):
                 publish_event(
                     root,
@@ -1073,7 +1103,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             controller.state["jobs"]["job-report"] = {
                 "id": "job-report",
                 "name": "report",
@@ -1118,7 +1148,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             for index in range(128):
                 job_id = f"job-{index:03d}"
                 controller.state["jobs"][job_id] = {
@@ -1206,7 +1236,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(restarted.journal.close)
+            self.addCleanup(lambda: restarted.journal.close())
             self.assertEqual(
                 1,
                 restarted.state["jobs"][job["id"]]["workload"]["progress"]["step"],
@@ -1272,7 +1302,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(restarted.journal.close)
+            self.addCleanup(lambda: restarted.journal.close())
             _discard_journaled_reports(restarted)
 
             self.assertEqual([], list_reports(root))
@@ -1297,7 +1327,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             publish_event(
                 root,
                 job_id="job-backlog",
@@ -1327,7 +1357,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             request_id = submit_command(
                 root,
                 {
@@ -1362,7 +1392,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             submitted = submit_job(
                 root,
                 argv=["true"],
@@ -1406,7 +1436,7 @@ class AsyncCommandRaceTests(unittest.TestCase):
                 poll_interval=0.1,
                 cancel_grace=0,
             )
-            self.addCleanup(controller.journal.close)
+            self.addCleanup(lambda: controller.journal.close())
             archive_terminal_job(
                 root,
                 {
@@ -1686,7 +1716,7 @@ class OutputProgressTests(unittest.TestCase):
             poll_interval=0.1,
             cancel_grace=0,
         )
-        self.addCleanup(self.controller.journal.close)
+        self.addCleanup(lambda: self.controller.journal.close())
 
     def test_message_drain_is_bounded_per_controller_tick(self) -> None:
         for index in range(300):

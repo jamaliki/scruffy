@@ -313,7 +313,19 @@ def emit(
     if snapshot:
         refresh_nodes(state, controller.inventory)
         write_state(controller.root, state)
+    if durable:
+        _reopen_journal(controller)
     return event
+
+
+def _reopen_journal(controller: Controller) -> None:
+    """Replace a committed append handle before a network filesystem ages it."""
+
+    replacement = open_journal(
+        controller.root, int(controller.state.get("journal_generation", 0))
+    )
+    controller.journal.close()
+    controller.journal = replacement
 
 
 def commit_snapshot(controller: Controller) -> None:
@@ -322,6 +334,7 @@ def commit_snapshot(controller: Controller) -> None:
     sync_file(controller.journal)
     refresh_nodes(controller.state, controller.inventory)
     write_state(controller.root, controller.state)
+    _reopen_journal(controller)
 
 
 def compact_journal(
