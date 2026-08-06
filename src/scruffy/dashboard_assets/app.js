@@ -34,10 +34,10 @@ function renderMetrics(snapshot, stale) {
   const usedCpus = totals.cpus - totals.freeCpus;
   const usedMemory = totals.memory - totals.freeMemory;
   replace(byId("metrics"), [
-    metric("GPU fabric", `${stale ? "?" : usedGpus} / ${totals.gpus}`, stale ? "availability unknown" : `${totals.freeGpus} free now`),
-    metric("CPU budget", `${stale ? "?" : usedCpus} / ${totals.cpus}`, stale ? "availability unknown" : `${totals.freeCpus} cores free`),
-    metric("Memory", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)} GB`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB free`),
-    metric("Queue depth", String(Number(counts.submitted || 0) + Number(counts.queued || 0)), `${counts.blocked || 0} dependency-blocked`),
+    metric("GPU occupancy", `${stale ? "?" : usedGpus} / ${totals.gpus}`, stale ? "availability unknown" : `${totals.freeGpus} available`),
+    metric("CPU allocation", `${stale ? "?" : usedCpus} / ${totals.cpus}`, stale ? "availability unknown" : `${totals.freeCpus} cores available`),
+    metric("Memory allocation", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)} GB`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB available`),
+    metric("Waiting", String(Number(counts.submitted || 0) + Number(counts.queued || 0)), `${counts.blocked || 0} dependency-blocked`),
   ]);
 }
 
@@ -97,7 +97,7 @@ function renderNodes(snapshot) {
   const stale = !view.connected || allocationIsStale(snapshot);
   replace(byId("nodes"), entries.length ? entries.map(([name, state]) => renderNode(name, state, jobs, stale)) : [empty("No managed nodes are visible.")]);
   const totals = resourceTotals(snapshot.nodes);
-  byId("resource-note").textContent = stale ? `${entries.length} nodes · ${totals.gpus} physical GPUs · availability unknown` : `${entries.length} nodes · ${totals.gpus} physical GPUs · ${totals.freeGpus} currently free`;
+  byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available`;
 }
 
 function projectTag(project) {

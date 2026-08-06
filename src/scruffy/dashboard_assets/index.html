@@ -13,9 +13,14 @@
       <span class="orbit-mark" aria-hidden="true"><i></i></span>
       <div>
         <div class="brand-word">SCRUFFY</div>
-        <div class="brand-sub">Allocation console // read only</div>
+        <div class="brand-sub">GPU allocation telemetry</div>
       </div>
     </div>
+    <nav class="deck-nav" aria-label="Console sections">
+      <a href="#topology"><span>01</span> Topology</a>
+      <a href="#signals"><span>02</span> Signals</a>
+      <a href="#jobs"><span>03</span> Jobs</a>
+    </nav>
     <div class="allocation-identity">
       <span id="connection-dot" class="connection-dot"></span>
       <div>
@@ -34,50 +39,51 @@
 
     <section class="toolbar" aria-label="Dashboard controls">
       <label>
-        <span>Project scope</span>
+        <span>Project</span>
         <select id="project-filter"><option value="all">All projects</option></select>
       </label>
       <label class="search-field">
-        <span>Find a job</span>
+        <span>Search</span>
         <input id="job-search" type="search" placeholder="Name, job, workflow or task">
       </label>
-      <button id="refresh" class="button" type="button">Refresh telemetry</button>
+      <button id="refresh" class="button" type="button">Sync now</button>
       <span id="freshness" class="freshness">No snapshot yet</span>
     </section>
 
     <div class="dashboard-grid">
-      <section class="panel resource-panel">
+      <section id="topology" class="panel resource-panel">
         <header class="panel-header">
           <div>
-            <p class="eyebrow">Physical allocation</p>
-            <h1>Every GPU has one owner.</h1>
+            <p class="eyebrow">01 / Resources</p>
+            <h1>GPU topology</h1>
           </div>
           <p id="resource-note" class="panel-note">Loading node inventory</p>
         </header>
         <div id="nodes" class="nodes"></div>
       </section>
 
-      <aside class="side-stack">
+      <aside id="signals" class="side-stack">
         <section class="panel compact-panel">
           <header class="panel-header small-header">
-            <div><p class="eyebrow">Action rail</p><h2>Needs attention</h2></div>
+            <div><p class="eyebrow">02 / Signals</p><h2>Attention</h2></div>
             <span id="attention-count" class="count-tag">0</span>
           </header>
           <div id="attention" class="job-list compact-list"></div>
         </section>
         <section class="panel compact-panel">
           <header class="panel-header small-header">
-            <div><p class="eyebrow">Journal tail</p><h2>Recent finishes</h2></div>
+            <div><p class="eyebrow">History</p><h2>Recent</h2></div>
+            <span id="recent-count" class="count-tag quiet">0</span>
           </header>
           <div id="recent" class="job-list compact-list"></div>
         </section>
       </aside>
     </div>
 
-    <section class="panel queue-panel">
+    <section id="jobs" class="panel queue-panel">
       <header class="panel-header">
-        <div><p class="eyebrow">Scheduler state</p><h2>Work moves asynchronously.</h2></div>
-        <p class="panel-note">Select a job for dependencies and workload telemetry.</p>
+        <div><p class="eyebrow">03 / Scheduler</p><h2>Jobs</h2></div>
+        <p class="panel-note">Select a row for placement, dependencies and telemetry.</p>
       </header>
       <div class="queue-columns">
         <section><h3>Running <span id="active-count">0</span></h3><div id="active" class="job-list"></div></section>
@@ -96,7 +102,7 @@
   </dialog>
 
   <footer class="footer">
-    <span>SCRUFFY // BORING CONTROLLER, USEFUL VIEW</span>
+    <span>SCRUFFY / READ-ONLY TELEMETRY</span>
     <span id="queue-id">Queue not connected</span>
   </footer>
 
