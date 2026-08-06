@@ -128,6 +128,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b"GPU topology", html)
         self.assertNotIn(b"Every GPU has one owner", html)
         self.assertIn(b"--accent:#f97316", css)
+        self.assertIn(b".queue-columns .job-list { max-height:460px", css)
         self.assertEqual("DENY", headers["X-Frame-Options"])
         self.assertEqual("allocation-1", json.loads(overview)["allocation"]["id"])
         self.assertEqual("job-1", json.loads(job)["job"]["id"])

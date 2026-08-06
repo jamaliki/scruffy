@@ -141,6 +141,7 @@ select:focus,input:focus,.button:focus-visible,.job-row:focus-visible,.gpu:focus
 .queue-columns>section:last-child { border-right:0; }
 .queue-columns h3 { margin:0; padding:12px 15px; display:flex; justify-content:space-between; background:var(--surface-alt); color:var(--muted); font-family:var(--mono); font-size:9px; text-transform:uppercase; letter-spacing:.12em; border-bottom:1px solid var(--rule); }
 .queue-columns h3 span { color:var(--accent-dark); }
+.queue-columns .job-list { max-height:460px; overflow:auto; overscroll-behavior:contain; scrollbar-color:var(--soft) var(--surface-alt); scrollbar-width:thin; }
 
 .job-dialog { width:min(920px,calc(100vw - 36px)); max-height:88vh; padding:0; border:1px solid var(--dark); background:var(--surface); color:var(--ink); }
 .job-dialog::backdrop { background:rgba(15,23,42,.78); }
