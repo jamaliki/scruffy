@@ -25,6 +25,11 @@ GPU processes against its configured inventory.
 - Submitted working directories, executables, and referenced files must exist on
   every selected worker node.
 
+The Slurm controller retries transient shared-filesystem failures without
+releasing its singleton lock or GPU ledger. A blocked filesystem syscall must
+still return before Python can retry, so controller diagnostics should be
+written to a filesystem independent of `SCRUFFY_ROOT`.
+
 GPU IDs are node-local values passed through `CUDA_VISIBLE_DEVICES`. CPU and
 memory values are cooperative admission budgets, not physical isolation. The
 Slurm worker step sees Scruffy's managed node CPU pool so overlapping jobs are

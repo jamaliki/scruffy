@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import signal
+import sys
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -75,6 +76,7 @@ from .workflows import (
 )
 
 MAX_REPORTS_PER_TICK = 128
+STORAGE_RETRY_SECONDS = 5
 COMMAND_OUTCOME_KINDS = {
     "job.cancelled",
     "job.cancelling",
@@ -1077,7 +1079,7 @@ def run_controller(
     poll_interval: float = 0.2,
     cancel_grace: float = 30,
 ) -> None:
-    """Own a queue until interrupted, launching jobs as capacity becomes free."""
+    """Own a queue until interrupted, retrying transient storage failures."""
 
     if launcher not in {"local", "slurm"}:
         raise ValueError(f"unknown launcher {launcher!r}")
@@ -1093,18 +1095,35 @@ def run_controller(
 
     root = ensure_layout(root)
     with controller_lock(root):
-        controller = _initialize_controller(
-            root=root,
-            inventory=inventory,
-            launcher=launcher,
-            allocation_id=allocation_id,
-            slurm_job_id=slurm_job_id,
-            poll_interval=poll_interval,
-            cancel_grace=cancel_grace,
-        )
-        try:
-            _serve(controller)
-        finally:
-            if controller.running:
-                abandon_processes(controller)
-            controller.journal.close()
+        while True:
+            controller: Controller | None = None
+            try:
+                controller = _initialize_controller(
+                    root=root,
+                    inventory=inventory,
+                    launcher=launcher,
+                    allocation_id=allocation_id,
+                    slurm_job_id=slurm_job_id,
+                    poll_interval=poll_interval,
+                    cancel_grace=cancel_grace,
+                )
+                _serve(controller)
+                return
+            except (OSError, TransientStorageError) as exc:
+                if launcher != "slurm":
+                    raise
+                print(
+                    "scruffy: shared storage unavailable; "
+                    f"retrying in {STORAGE_RETRY_SECONDS}s: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                if controller is not None:
+                    if controller.running:
+                        abandon_processes(controller)
+                    try:
+                        controller.journal.close()
+                    except OSError:
+                        pass
+            time.sleep(STORAGE_RETRY_SECONDS)

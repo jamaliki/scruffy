@@ -11,6 +11,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scruffy.client import (
     cancel_job,
@@ -31,6 +32,65 @@ REQUEST = ResourceRequest(
     cpus_per_node=1,
     memory_gb_per_node=1,
 )
+
+
+class ControllerRetryTests(unittest.TestCase):
+    def test_slurm_controller_retries_a_transient_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = mock.Mock(running={})
+            with (
+                mock.patch(
+                    "scruffy.controller._initialize_controller",
+                    side_effect=[OSError("stale file handle"), controller],
+                ) as initialize,
+                mock.patch("scruffy.controller._serve") as serve,
+                mock.patch("scruffy.controller.time.sleep") as sleep,
+            ):
+                run_controller(
+                    root=root,
+                    inventory=(NodeInventory("gpu-0", (0,), 1, 1),),
+                    launcher="slurm",
+                    allocation_id="123",
+                    slurm_job_id="123",
+                )
+
+        self.assertEqual(2, initialize.call_count)
+        serve.assert_called_once_with(controller)
+        sleep.assert_called_once_with(5)
+        controller.journal.close.assert_called_once_with()
+
+    def test_slurm_controller_reloads_after_a_runtime_storage_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            first = mock.Mock(running={"job-1": mock.Mock()})
+            recovered = mock.Mock(running={})
+            with (
+                mock.patch(
+                    "scruffy.controller._initialize_controller",
+                    side_effect=[first, recovered],
+                ) as initialize,
+                mock.patch(
+                    "scruffy.controller._serve",
+                    side_effect=[OSError("I/O error"), None],
+                ) as serve,
+                mock.patch("scruffy.controller.abandon_processes") as abandon,
+                mock.patch("scruffy.controller.time.sleep") as sleep,
+            ):
+                run_controller(
+                    root=root,
+                    inventory=(NodeInventory("gpu-0", (0,), 1, 1),),
+                    launcher="slurm",
+                    allocation_id="123",
+                    slurm_job_id="123",
+                )
+
+        self.assertEqual(2, initialize.call_count)
+        self.assertEqual(2, serve.call_count)
+        abandon.assert_called_once_with(first)
+        first.journal.close.assert_called_once_with()
+        recovered.journal.close.assert_called_once_with()
+        sleep.assert_called_once_with(5)
 
 
 def _controller_worker(
