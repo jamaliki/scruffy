@@ -7,11 +7,45 @@ import os
 import subprocess
 import sys
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .models import NodeInventory, validate_inventory
+
+_STEP_ENVIRONMENT_KEYS = frozenset(
+    {
+        "SLURM_CPUS_ON_NODE",
+        "SLURM_CPUS_PER_GPU",
+        "SLURM_CPUS_PER_TASK",
+        "SLURM_DISTRIBUTION",
+        "SLURM_GPUS",
+        "SLURM_GPU_BIND",
+        "SLURM_GTIDS",
+        "SLURM_LOCALID",
+        "SLURM_MEM_PER_CPU",
+        "SLURM_MEM_PER_GPU",
+        "SLURM_MEM_PER_NODE",
+        "SLURM_NODEID",
+        "SLURM_NPROCS",
+        "SLURM_PROCID",
+        "SLURM_STEPID",  # Legacy spelling of SLURM_STEP_ID.
+        "SLURM_TASKS_PER_NODE",
+        "SLURM_THREADS_PER_CORE",
+        "SLURM_TRES_BIND",
+        "SLURM_TRES_FREQ",
+        "SLURM_TRES_PER_TASK",
+    }
+)
+_STEP_ENVIRONMENT_PREFIXES = (
+    "SLURM_CPU_BIND",
+    "SLURM_GPUS_PER_",
+    "SLURM_MEM_BIND",
+    "SLURM_NTASKS",
+    "SLURM_SRUN_COMM_",
+    "SLURM_STEP_",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,11 +153,23 @@ def build_srun_argv(
     ]
 
 
-def build_srun_environment() -> dict[str, str]:
-    """Return the controller environment without a stale worker node override."""
+def build_srun_environment(
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return allocation-level state safe for launching a nested ``srun``.
 
-    environment = os.environ.copy()
+    The controller normally runs inside a Slurm step. That step's rank,
+    binding, memory, GPU, and task variables become implicit defaults for a
+    child ``srun`` unless they are removed. Preserve outer-allocation identity
+    such as ``SLURM_JOB_ID`` and ``SLURM_JOB_NODELIST`` while dropping only
+    step-scoped context and Scruffy's worker-node override.
+    """
+
+    environment = dict(os.environ if source is None else source)
     environment.pop("SCRUFFY_NODE", None)
+    for key in tuple(environment):
+        if key in _STEP_ENVIRONMENT_KEYS or key.startswith(_STEP_ENVIRONMENT_PREFIXES):
+            del environment[key]
     return environment
 
 
