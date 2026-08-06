@@ -52,13 +52,13 @@ complete template.
 
 ```bash
 export SCRUFFY_ROOT=/shared/runs/scruffy
-scruffy --root "$SCRUFFY_ROOT" serve \
-  --gpus-per-node 8 --cpus-per-node 112 --memory-gb-per-node 1024
+scruffy --root "$SCRUFFY_ROOT" serve
 ```
 
-Automatic inventory discovery reads `SLURM_JOB_NODELIST` and assumes every node
-contributes the same contiguous GPU pool `0..N-1`. Use an explicit inventory for
-selected, non-contiguous, or heterogeneous resources:
+Automatic inventory discovery reads the resources granted to the outer Slurm
+allocation. Per-node resource flags can cap that managed capacity. Discovery
+assumes homogeneous nodes and a contiguous GPU pool `0..N-1`; use an explicit
+inventory for selected, non-contiguous, or heterogeneous resources:
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" serve --inventory inventory.json

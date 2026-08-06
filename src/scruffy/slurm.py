@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,30 +47,141 @@ def load_inventory(source: Path) -> dict[str, NodeInventory]:
     return {node.name: node for node in validate_inventory(nodes)}
 
 
-def discover_slurm_inventory(
-    *, gpus_per_node: int, cpus_per_node: int, memory_gb_per_node: int
-) -> dict[str, NodeInventory]:
-    """Build a homogeneous inventory from the current Slurm allocation."""
+def _allocation_job(slurm_job_id: str) -> Mapping[str, Any]:
+    result = subprocess.run(
+        ["scontrol", "--json", "show", "job", slurm_job_id],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    document = json.loads(result.stdout)
+    if not isinstance(document, dict):
+        raise TypeError("scontrol returned an invalid allocation document")
+    jobs = document.get("jobs")
+    if document.get("errors") or not isinstance(jobs, list) or len(jobs) != 1:
+        raise ValueError("scontrol returned an invalid allocation document")
+    job = jobs[0]
+    if not isinstance(job, dict):
+        raise TypeError("scontrol returned an invalid allocation job")
+    return job
 
-    node_expression = os.environ.get("SLURM_JOB_NODELIST")
-    if not node_expression:
-        raise ValueError("--inventory is required outside a Slurm allocation")
+
+def _tres_values(job: Mapping[str, Any]) -> dict[str, str]:
+    encoded = job.get("tres_alloc_str")
+    if not isinstance(encoded, str):
+        raise TypeError("Slurm allocation has no allocated TRES")
+    values: dict[str, str] = {}
+    for item in encoded.split(","):
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value or key in values:
+            raise ValueError("Slurm allocation has invalid allocated TRES")
+        values[key] = value
+    return values
+
+
+def _positive_count(values: Mapping[str, str], key: str) -> int:
+    value = values.get(key)
+    if value is None or not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise ValueError(f"Slurm allocation has no positive {key} count")
+    return int(value)
+
+
+def _gpu_count(values: Mapping[str, str]) -> int:
+    if "gres/gpu" in values:
+        return _positive_count(values, "gres/gpu")
+    typed = [key for key in values if key.startswith("gres/gpu:")]
+    if not typed:
+        raise ValueError("Slurm allocation has no GPUs")
+    return sum(_positive_count(values, key) for key in typed)
+
+
+def _memory_mib(values: Mapping[str, str]) -> int:
+    value = values.get("mem", "")
+    match = re.fullmatch(r"([0-9]+)([KMGT])", value, re.IGNORECASE)
+    if match is None:
+        raise ValueError("Slurm allocation has invalid memory TRES")
+    units = {"K": 1, "M": 1024, "G": 1024**2, "T": 1024**3}
+    kib = int(match.group(1)) * units[match.group(2).upper()]
+    mib = kib // 1024
+    if mib <= 0:
+        raise ValueError("Slurm allocation has no usable memory")
+    return mib
+
+
+def _per_node(total: int, nodes: int, label: str) -> int:
+    value, remainder = divmod(total, nodes)
+    if value <= 0 or remainder:
+        raise ValueError(
+            f"Slurm allocation has heterogeneous {label}; use --inventory"
+        )
+    return value
+
+
+def _managed_capacity(discovered: int, cap: int | None, option: str) -> int:
+    if cap is None:
+        return discovered
+    if cap <= 0:
+        raise ValueError(f"{option} must be a positive integer")
+    if cap > discovered:
+        raise ValueError(f"{option} exceeds the Slurm allocation")
+    return cap
+
+
+def _allocation_hostnames(job: Mapping[str, Any]) -> list[str]:
+    node_expression = job.get("nodes")
+    if not isinstance(node_expression, str) or not node_expression:
+        raise ValueError("Slurm allocation has no assigned nodes")
     result = subprocess.run(
         ["scontrol", "show", "hostnames", node_expression],
         check=True,
         capture_output=True,
         text=True,
+        timeout=10,
     )
     names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if not names:
         raise ValueError("Slurm returned no nodes for the current allocation")
+    return names
+
+
+def _allocation_capacity(job: Mapping[str, Any], nodes: int) -> tuple[int, int, int]:
+    values = _tres_values(job)
+    gpus = _per_node(_gpu_count(values), nodes, "GPU counts")
+    cpus = _per_node(_positive_count(values, "cpu"), nodes, "CPU counts")
+    memory_gb = _per_node(_memory_mib(values), nodes, "memory") // 1024
+    return gpus, cpus, memory_gb
+
+
+def discover_slurm_inventory(
+    *,
+    slurm_job_id: str | None = None,
+    gpus_per_node: int | None = None,
+    cpus_per_node: int | None = None,
+    memory_gb_per_node: int | None = None,
+) -> dict[str, NodeInventory]:
+    """Build a homogeneous inventory from resources granted by Slurm."""
+
+    job_id = slurm_job_id or os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        raise ValueError("--inventory is required outside a Slurm allocation")
+    job = _allocation_job(job_id)
+    names = _allocation_hostnames(job)
+    discovered_gpus, discovered_cpus, discovered_memory = _allocation_capacity(
+        job, len(names)
+    )
+    gpus = _managed_capacity(discovered_gpus, gpus_per_node, "--gpus-per-node")
+    cpus = _managed_capacity(discovered_cpus, cpus_per_node, "--cpus-per-node")
+    memory = _managed_capacity(
+        discovered_memory, memory_gb_per_node, "--memory-gb-per-node"
+    )
     nodes = validate_inventory(
         tuple(
             NodeInventory(
                 name=name,
-                gpu_ids=tuple(range(gpus_per_node)),
-                cpus=cpus_per_node,
-                memory_gb=memory_gb_per_node,
+                gpu_ids=tuple(range(gpus)),
+                cpus=cpus,
+                memory_gb=memory,
             )
             for name in names
         )

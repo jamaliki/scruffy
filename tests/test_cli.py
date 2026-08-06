@@ -297,7 +297,7 @@ class ServeCliTests(unittest.TestCase):
         self.assertEqual(2, result)
         self.assertEqual("scruffy: gone\n", stderr.getvalue())
 
-    def test_automatic_inventory_requires_an_explicit_gpu_count(self) -> None:
+    def test_automatic_inventory_requires_a_slurm_allocation(self) -> None:
         stderr = io.StringIO()
         with (
             mock.patch.dict(os.environ, {}, clear=True),
@@ -307,8 +307,35 @@ class ServeCliTests(unittest.TestCase):
             result = main(["--root", str(self.root), "serve"])
 
         self.assertEqual(2, result)
-        self.assertIn("--gpus-per-node is required", stderr.getvalue())
+        self.assertIn("--inventory is required outside", stderr.getvalue())
         run_controller.assert_not_called()
+
+    def test_automatic_inventory_uses_the_slurm_allocation(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"SLURM_JOB_ID": "263105"}, clear=True),
+            mock.patch(
+                "scruffy.cli.discover_slurm_inventory", return_value=self.inventory
+            ) as discover,
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+        ):
+            result = main(["--root", str(self.root), "serve"])
+
+        self.assertEqual(0, result)
+        discover.assert_called_once_with(
+            slurm_job_id="263105",
+            gpus_per_node=None,
+            cpus_per_node=None,
+            memory_gb_per_node=None,
+        )
+        run_controller.assert_called_once_with(
+            root=self.root,
+            inventory=tuple(self.inventory.values()),
+            launcher="slurm",
+            allocation_id="263105",
+            slurm_job_id="263105",
+            poll_interval=0.2,
+            cancel_grace=30,
+        )
 
     def test_slurm_launcher_requires_a_job_id_before_starting(self) -> None:
         stderr = io.StringIO()

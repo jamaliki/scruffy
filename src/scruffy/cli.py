@@ -108,26 +108,25 @@ def _json_object(value: str, label: str) -> dict[str, Any]:
 
 def _serve(arguments: argparse.Namespace) -> int:
     root = _root(arguments)
+    slurm_job_id = arguments.slurm_job_id or os.environ.get("SLURM_JOB_ID")
+    launcher = arguments.launcher
+    if launcher == "auto":
+        launcher = "slurm" if slurm_job_id else "local"
+    if launcher == "slurm" and not slurm_job_id:
+        raise ValueError("a Slurm job ID is required for the Slurm launcher")
     if arguments.inventory:
         inventory = tuple(load_inventory(Path(arguments.inventory)).values())
     else:
-        if arguments.gpus_per_node is None:
-            raise ValueError(
-                "--gpus-per-node is required when inventory is discovered"
-            )
+        if launcher != "slurm":
+            raise ValueError("--inventory is required outside a Slurm allocation")
         inventory = tuple(
             discover_slurm_inventory(
+                slurm_job_id=slurm_job_id,
                 gpus_per_node=arguments.gpus_per_node,
                 cpus_per_node=arguments.cpus_per_node,
                 memory_gb_per_node=arguments.memory_gb_per_node,
             ).values()
         )
-    launcher = arguments.launcher
-    if launcher == "auto":
-        launcher = "slurm" if os.environ.get("SLURM_JOB_ID") else "local"
-    slurm_job_id = arguments.slurm_job_id or os.environ.get("SLURM_JOB_ID")
-    if launcher == "slurm" and not slurm_job_id:
-        raise ValueError("a Slurm job ID is required for the Slurm launcher")
     if launcher == "local" and len(inventory) != 1:
         raise ValueError("the local launcher requires a one-node inventory")
     allocation_id = (
@@ -366,19 +365,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--gpus-per-node",
         type=int,
-        help="full-node GPU count for automatic IDs 0..N-1",
+        help="optional managed GPU cap per node (default: allocation)",
     )
     serve.add_argument(
         "--cpus-per-node",
         type=int,
-        default=112,
-        help="managed CPU budget per node (default: 112)",
+        help="optional managed CPU cap per node (default: allocation)",
     )
     serve.add_argument(
         "--memory-gb-per-node",
         type=int,
-        default=1024,
-        help="managed memory budget per node (default: 1024)",
+        help="optional managed memory cap per node (default: allocation)",
     )
     serve.add_argument(
         "--poll-interval",

@@ -12,6 +12,7 @@ from scruffy.slurm import (
     build_srun_argv,
     build_srun_environment,
     cancel_step,
+    discover_slurm_inventory,
     live_steps,
     load_inventory,
 )
@@ -133,6 +134,83 @@ class InventoryTests(unittest.TestCase):
                     }
                 }
             )
+
+    def test_discovers_uniform_capacity_from_the_slurm_allocation(self) -> None:
+        allocation = mock.Mock(
+            stdout=json.dumps(
+                {
+                    "errors": [],
+                    "jobs": [
+                        {
+                            "nodes": "gpu-[0,5,8,13]",
+                            "tres_alloc_str": (
+                                "cpu=448,mem=8160440M,node=4,gres/gpu=32"
+                            ),
+                        }
+                    ],
+                }
+            )
+        )
+        hostnames = mock.Mock(stdout="gpu-0\ngpu-5\ngpu-8\ngpu-13\n")
+        with mock.patch("scruffy.slurm.subprocess.run", side_effect=[allocation, hostnames]):
+            inventory = discover_slurm_inventory(slurm_job_id="263105")
+
+        self.assertEqual({"gpu-0", "gpu-5", "gpu-8", "gpu-13"}, inventory.keys())
+        for node in inventory.values():
+            self.assertEqual(tuple(range(8)), node.gpu_ids)
+            self.assertEqual(112, node.cpus)
+            self.assertEqual(1992, node.memory_gb)
+
+    def test_explicit_resource_values_are_caps_on_discovered_capacity(self) -> None:
+        allocation = mock.Mock(
+            stdout=json.dumps(
+                {
+                    "errors": [],
+                    "jobs": [
+                        {
+                            "nodes": "gpu-0",
+                            "tres_alloc_str": "cpu=112,mem=2040110M,gres/gpu:h100=8",
+                        }
+                    ],
+                }
+            )
+        )
+        hostnames = mock.Mock(stdout="gpu-0\n")
+        with mock.patch("scruffy.slurm.subprocess.run", side_effect=[allocation, hostnames]):
+            inventory = discover_slurm_inventory(
+                slurm_job_id="263105",
+                gpus_per_node=4,
+                cpus_per_node=56,
+                memory_gb_per_node=512,
+            )
+
+        node = inventory["gpu-0"]
+        self.assertEqual(tuple(range(4)), node.gpu_ids)
+        self.assertEqual(56, node.cpus)
+        self.assertEqual(512, node.memory_gb)
+
+    def test_resource_cap_cannot_exceed_the_allocation(self) -> None:
+        allocation = mock.Mock(
+            stdout=json.dumps(
+                {
+                    "errors": [],
+                    "jobs": [
+                        {
+                            "nodes": "gpu-0",
+                            "tres_alloc_str": "cpu=112,mem=2040110M,gres/gpu=8",
+                        }
+                    ],
+                }
+            )
+        )
+        hostnames = mock.Mock(stdout="gpu-0\n")
+        with (
+            mock.patch(
+                "scruffy.slurm.subprocess.run", side_effect=[allocation, hostnames]
+            ),
+            self.assertRaisesRegex(ValueError, "exceeds the Slurm allocation"),
+        ):
+            discover_slurm_inventory(slurm_job_id="263105", gpus_per_node=9)
 
 
 class SlurmReconciliationTests(unittest.TestCase):
