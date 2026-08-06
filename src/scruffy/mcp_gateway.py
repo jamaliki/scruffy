@@ -25,7 +25,7 @@ WAIT_TIMEOUT_GRACE_SECONDS = 5.0
 
 
 def _call_timeout(tool: str, params: dict[str, Any]) -> float:
-    """Bound one connector process, including a wedged remote wait."""
+    """Bound one connector process, including SSH startup and a remote wait."""
 
     requested = params.get("timeout_seconds")
     if (
@@ -35,7 +35,10 @@ def _call_timeout(tool: str, params: dict[str, Any]) -> float:
         and math.isfinite(requested)
         and 0 <= requested <= MAX_WAIT_SECONDS
     ):
-        return float(requested) + WAIT_TIMEOUT_GRACE_SECONDS
+        return max(
+            CALL_TIMEOUT_SECONDS,
+            float(requested) + WAIT_TIMEOUT_GRACE_SECONDS,
+        )
     return CALL_TIMEOUT_SECONDS
 
 

@@ -10,6 +10,14 @@ from scruffy import mcp_gateway
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
     def test_wait_deadline_tracks_the_requested_timeout(self) -> None:
         self.assertEqual(
+            mcp_gateway.CALL_TIMEOUT_SECONDS,
+            mcp_gateway._call_timeout("wait_for_updates", {"timeout_seconds": 0}),
+        )
+        self.assertEqual(
+            mcp_gateway.CALL_TIMEOUT_SECONDS,
+            mcp_gateway._call_timeout("wait_for_updates", {"timeout_seconds": 10}),
+        )
+        self.assertEqual(
             305,
             mcp_gateway._call_timeout("wait_for_updates", {"timeout_seconds": 300}),
         )
