@@ -98,7 +98,7 @@ async def call_remote(
     tool: str,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run one read-only tool call in a fresh remote process."""
+    """Run one tool call in a fresh remote process."""
 
     request_id = uuid.uuid4().hex[:12]
     encoded = json.dumps(params, separators=(",", ":"), allow_nan=False)
