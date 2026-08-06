@@ -55,6 +55,8 @@ agents; reading does not consume events for anyone else. Use
 
 ## Rules
 
+- From a source checkout, use `uv run scruffy ...`; no editable install is
+  needed. Use `uv run --extra mcp scruffy-mcp ...` for the optional MCP server.
 - Choose one project for the task and keep `SCRUFFY_PROJECT` fixed. A project
   scopes request and workflow identities plus monitoring; it does not reserve
   resources or provide security. Omit it only for allocation-wide operations.

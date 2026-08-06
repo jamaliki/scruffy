@@ -32,7 +32,13 @@ security boundary.
 
 ## Quick start
 
-Install into the Python environment available throughout the allocation:
+From a checkout, `uv` needs no separate installation step:
+
+```bash
+uv run scruffy --version
+```
+
+For an environment shared throughout an allocation, install the package there:
 
 ```bash
 python -m pip install .
@@ -130,14 +136,14 @@ directories, or environment values.
 For a locally visible queue root:
 
 ```bash
-scruffy --root "$SCRUFFY_ROOT" dashboard
+uv run scruffy --root "$SCRUFFY_ROOT" dashboard
 ```
 
 For a remote queue, run the web server locally and isolate each read through
 the existing SSH gateway:
 
 ```bash
-scruffy --root /shared/runs/scruffy dashboard \
+uv run scruffy --root /shared/runs/scruffy dashboard \
   --connect-command /local/bin/tokyo-ssh \
   --remote-command /shared/env/bin/scruffy-mcp
 ```
@@ -162,6 +168,12 @@ Install the extra in the Python environment visible on the cluster:
 ```bash
 python -m pip install '.[mcp]'
 scruffy-mcp --root "$SCRUFFY_ROOT"
+```
+
+Or run it directly from a checkout:
+
+```bash
+uv run --extra mcp scruffy-mcp --root "$SCRUFFY_ROOT"
 ```
 
 Every server exposes three monitoring tools:
