@@ -228,6 +228,7 @@ def build_srun_argv(
         f"--ntasks={nodes}",
         "--ntasks-per-node=1",
         f"--cpus-per-task={cpus_per_node}",
+        "--cpu-bind=none",
         f"--mem={memory_gb_per_node}G",
         "--kill-on-bad-exit=1",
         f"--wait={wait_seconds}",
@@ -243,10 +244,13 @@ def build_srun_argv(
 
 
 def build_srun_environment() -> dict[str, str]:
-    """Return the controller environment without a stale worker node override."""
+    """Return the controller environment without controller-only placement."""
 
     environment = os.environ.copy()
     environment.pop("SCRUFFY_NODE", None)
+    for name in tuple(environment):
+        if name.startswith("SLURM_CPU_BIND"):
+            environment.pop(name)
     return environment
 
 

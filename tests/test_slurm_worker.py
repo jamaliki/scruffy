@@ -48,6 +48,7 @@ class SlurmArgumentTests(unittest.TestCase):
                 "--ntasks=2",
                 "--ntasks-per-node=1",
                 "--cpus-per-task=28",
+                "--cpu-bind=none",
                 "--mem=256G",
                 "--kill-on-bad-exit=1",
                 "--wait=45",
@@ -91,15 +92,25 @@ class SlurmArgumentTests(unittest.TestCase):
         self.assertIn("--wait=0", argv)
         self.assertIn("--wait-for-children", argv)
 
-    def test_srun_does_not_inherit_a_stale_scruffy_node(self) -> None:
+    def test_srun_does_not_inherit_controller_placement(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {"SCRUFFY_NODE": "stale-node", "KEPT": "yes"},
+            {
+                "SCRUFFY_NODE": "stale-node",
+                "SLURM_CPU_BIND": "verbose,mask_cpu:0x1",
+                "SLURM_CPU_BIND_LIST": "0x1",
+                "SLURM_CPU_BIND_TYPE": "mask_cpu",
+                "SLURM_CPU_BIND_VERBOSE": "verbose",
+                "KEPT": "yes",
+            },
             clear=True,
         ):
             environment = build_srun_environment()
 
         self.assertNotIn("SCRUFFY_NODE", environment)
+        self.assertFalse(
+            any(name.startswith("SLURM_CPU_BIND") for name in environment)
+        )
         self.assertEqual("yes", environment["KEPT"])
 
 
