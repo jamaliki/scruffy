@@ -126,8 +126,10 @@ class DashboardTests(unittest.TestCase):
 
         self.assertIn(b"SCRUFFY", html)
         self.assertIn(b"GPU topology", html)
+        self.assertIn(b">Refresh</button>", html)
         self.assertIn(b"has not refreshed for five minutes", html)
         self.assertNotIn(b"Every GPU has one owner", html)
+        self.assertNotIn(b"Sync now", html)
         self.assertIn(b"--accent:#f97316", css)
         self.assertIn(b".queue-columns .job-list { max-height:460px", css)
         self.assertEqual("DENY", headers["X-Frame-Options"])

@@ -43,7 +43,7 @@ function renderMetrics(snapshot, stale) {
   replace(byId("metrics"), [
     metric("GPU occupancy", `${stale ? "?" : usedGpus} / ${totals.gpus}`, stale ? "availability unknown" : `${totals.freeGpus} available`),
     metric("CPU allocation", `${stale ? "?" : usedCpus} / ${totals.cpus}`, stale ? "availability unknown" : `${totals.freeCpus} cores available`),
-    metric("Memory allocation", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)} GB`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB available`),
+    metric("Memory allocation", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)}`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB available`),
     metric("Waiting", String(Number(counts.submitted || 0) + Number(counts.queued || 0)), `${counts.blocked || 0} dependency-blocked`),
   ]);
 }
@@ -157,7 +157,7 @@ function renderConnection(snapshot) {
   const allocation = snapshot.allocation || {};
   const stale = telemetryIsStale(snapshot);
   byId("allocation-state").textContent = stale ? "Telemetry stale" : String(allocation.state || "No allocation");
-  byId("allocation-id").textContent = allocation.id ? `Allocation ${allocation.id}` : "Waiting for controller";
+  byId("allocation-id").textContent = allocation.id || "Waiting for controller";
   const connectionTone = stale ? "stale" : view.connected ? "live" : "degraded";
   byId("connection-dot").className = `connection-dot ${connectionTone}`;
   byId("stale-banner").hidden = !stale;

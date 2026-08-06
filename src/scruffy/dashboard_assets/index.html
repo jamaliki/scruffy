@@ -23,10 +23,11 @@
     </nav>
     <div class="allocation-identity">
       <span id="connection-dot" class="connection-dot"></span>
-      <div>
-        <strong id="allocation-state">Connecting</strong>
-        <span id="allocation-id">Waiting for queue state</span>
+      <div class="allocation-copy">
+        <span class="allocation-label">Allocation</span>
+        <strong id="allocation-id">Waiting for queue state</strong>
       </div>
+      <span id="allocation-state" class="allocation-state">Connecting</span>
     </div>
   </header>
 
@@ -46,7 +47,7 @@
         <span>Search</span>
         <input id="job-search" type="search" placeholder="Name, job, workflow or task">
       </label>
-      <button id="refresh" class="button" type="button">Sync now</button>
+      <button id="refresh" class="button" type="button">Refresh</button>
       <span id="freshness" class="freshness">No snapshot yet</span>
     </section>
 
