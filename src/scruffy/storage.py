@@ -65,9 +65,22 @@ def utc_now() -> str:
 
 
 def queue_id(root: Path) -> str:
-    """Derive a stable, opaque ID without another mutable metadata file."""
+    """Return the persisted queue identity, deriving it before state exists.
 
-    resolved = str(root.expanduser().resolve()).encode()
+    The state owns the identity once a queue has been created. This keeps
+    observer cursors valid when the complete queue directory is moved.
+    """
+
+    resolved_root = root.expanduser().resolve()
+    state_file = resolved_root / "state.json"
+    if state_file.exists():
+        state = read_json(state_file)
+        identity = state.get("queue_id") if isinstance(state, dict) else None
+        if not isinstance(identity, str) or not identity:
+            raise StorageError(f"invalid queue identity in {state_file}")
+        return identity
+
+    resolved = str(resolved_root).encode()
     return f"queue-{hashlib.sha256(resolved).hexdigest()[:12]}"
 
 

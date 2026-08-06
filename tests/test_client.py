@@ -36,6 +36,34 @@ class ObserveTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name) / "queue"
 
+    def test_queue_identity_and_cursors_survive_a_root_move(self) -> None:
+        original_root = self.root.with_name("original")
+        original_identity = queue_id(original_root)
+        derived_moved_identity = queue_id(self.root)
+        self.assertNotEqual(original_identity, derived_moved_identity)
+
+        state = {
+            "v": 1,
+            "queue_id": original_identity,
+            "last_seq": 0,
+            "journal_generation": 0,
+            "journal_offset": 0,
+            "allocation": None,
+            "nodes": {},
+            "jobs": {},
+            "draining": False,
+        }
+        write_state(self.root, state)
+
+        self.assertEqual(original_identity, queue_id(self.root))
+        response = observe(self.root, after=f"{original_identity}:0:0:0")
+        self.assertFalse(response["reset"])
+        self.assertEqual(
+            f"{original_identity}:0:0:0",
+            response["next_cursor"],
+        )
+        self.assertEqual(original_identity, response["snapshot"]["queue_id"])
+
     def test_readers_have_independent_cursors_and_output_expansion(self) -> None:
         job_id = "job-observe"
         output = b"prefix|expanded output|suffix"
