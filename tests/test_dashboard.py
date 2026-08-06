@@ -109,7 +109,7 @@ class DashboardTests(unittest.TestCase):
     def test_compact_reader_never_exposes_process_details(self) -> None:
         reader = local_reader(self.root)
 
-        overview = reader("overview", {"limit": 20})
+        overview = reader("overview", {"limit": 20, "compact": False})
         explanation = reader("inspect_job", {"job_id": "job-1"})
         encoded = json.dumps({"overview": overview, "explanation": explanation})
 

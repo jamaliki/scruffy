@@ -92,7 +92,7 @@ def _handler(reader: QueueReader) -> type[BaseHTTPRequestHandler]:
             request = urlsplit(self.path)
             try:
                 if request.path == "/api/overview":
-                    self._json(reader("overview", {"limit": 100}))
+                    self._json(reader("overview", {"limit": 100, "compact": False}))
                     return
                 prefix = "/api/jobs/"
                 if request.path.startswith(prefix):

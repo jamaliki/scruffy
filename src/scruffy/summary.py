@@ -32,6 +32,9 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
     """Return the bounded job projection shared by summaries and observers."""
 
     current = now or datetime.now(timezone.utc)
+    started = _parse_time(job.get("started_at"))
+    finished = _parse_time(job.get("finished_at"))
+    elapsed = max(0.0, ((finished or current) - started).total_seconds()) if started else None
     workload = job.get("workload") if isinstance(job.get("workload"), dict) else None
     updated = _parse_time(workload.get("last_update_at")) if workload else None
     progress_age = max(0.0, (current - updated).total_seconds()) if updated else None
@@ -47,6 +50,7 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "submitted_at": job.get("submitted_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
+        "elapsed_seconds": elapsed,
         "request": job.get("request"),
         "workflow_id": job.get("workflow_id"),
         "task_id": job.get("task_id"),

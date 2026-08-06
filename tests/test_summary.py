@@ -96,6 +96,7 @@ class SummaryTests(unittest.TestCase):
             "2026-08-03T11:59:00+00:00",
             result["requires_attention"][0]["started_at"],
         )
+        self.assertEqual(120.0, result["requires_attention"][0]["elapsed_seconds"])
         self.assertEqual({"gpus": 1}, result["requires_attention"][0]["request"])
         self.assertEqual("queue-test:0:9:123", result["as_of_cursor"])
 

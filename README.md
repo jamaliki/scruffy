@@ -178,8 +178,10 @@ uv run --extra mcp scruffy-mcp --root "$SCRUFFY_ROOT"
 
 Every server exposes three monitoring tools:
 
-- `overview(limit=20)` returns the bounded allocation view and
-  `as_of_cursor`.
+- `overview(limit=20, compact=true)` returns an agent-sized allocation view and
+  `as_of_cursor`. Compact jobs contain only identity, state, and elapsed time;
+  nodes contain resource totals and free counts without assignment maps. Use
+  `compact=false` only for a detailed administrative view.
 - `inspect_job(job_id)` returns a compact dependency explanation without argv,
   cwd, or environment values.
 - `wait_for_updates(...)` blocks for up to one hour and returns relevant events
