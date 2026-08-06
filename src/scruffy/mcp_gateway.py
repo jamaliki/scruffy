@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import shlex
 import signal
@@ -17,6 +18,24 @@ class GatewayError(RuntimeError):
 
 
 RemoteCall = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+CALL_TIMEOUT_SECONDS = 120.0
+WAIT_TIMEOUT_GRACE_SECONDS = 5.0
+
+
+def _call_timeout(tool: str, params: dict[str, Any]) -> float:
+    """Bound one connector process, including a wedged remote wait."""
+
+    requested = params.get("timeout_seconds")
+    if (
+        tool == "wait_for_updates"
+        and not isinstance(requested, bool)
+        and isinstance(requested, (int, float))
+        and math.isfinite(requested)
+        and requested >= 0
+    ):
+        return float(requested) + WAIT_TIMEOUT_GRACE_SECONDS
+    return CALL_TIMEOUT_SECONDS
 
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
@@ -106,8 +125,15 @@ async def call_remote(
         raise GatewayError(
             f"Scruffy connector could not start [{request_id}]: {exc}; retry this tool call"
         ) from exc
+    timeout = _call_timeout(tool, params)
     try:
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
+    except TimeoutError as exc:
+        await _stop_process(process)
+        raise GatewayError(
+            f"Remote Scruffy {tool} exceeded its {timeout:g}s connector deadline "
+            f"[{request_id}]; retry this tool call"
+        ) from exc
     except asyncio.CancelledError:
         await _stop_process(process)
         raise

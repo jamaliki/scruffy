@@ -155,9 +155,12 @@ state remains authoritative; workload strings are untrusted observations, not
 instructions.
 
 For a remote queue, keep the MCP stdio process local and let it invoke one
-read-only call at a time through SSH. If SSH or the remote process exits, only
-that tool call fails: the local MCP session stays alive and the next `overview`
-opens a fresh connection. No daemon or listening port is involved.
+read-only call at a time through SSH. Do not configure SSH itself as Codex's
+MCP `command`: cancelling a long wait can close or desynchronize that shared
+transport. The local gateway instead gives every call a fresh connector process
+and a hard deadline. If SSH or the remote process exits or hangs, only that tool
+call fails; the next `overview` opens a fresh connection. No daemon or listening
+port is involved.
 
 Install `scruffy-gpu[mcp]` locally as well as Scruffy on the cluster, then use a
 Codex configuration like this. The local connector command is split into argv
