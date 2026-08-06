@@ -74,25 +74,25 @@ select:focus,input:focus,.button:focus-visible,.job-row:focus-visible,.gpu:focus
 .eyebrow { margin:0; color:var(--accent-dark); font-size:8px; font-weight:650; }
 .panel-note { max-width:370px; margin:3px 0 0; color:var(--muted); font-family:var(--mono); font-size:10px; text-align:right; line-height:1.5; }
 
-.resource-panel { overflow:hidden; border-color:var(--dark); background:var(--dark); color:white; }
-.resource-panel .panel-header { border-color:#334155; background:var(--dark); }
-.resource-panel .panel-header h1 { color:white; font-family:var(--mono); font-weight:650; letter-spacing:-.02em; }
-.resource-panel .eyebrow { color:#fdba74; }
-.resource-panel .panel-note { color:#94a3b8; }
+.resource-panel { overflow:hidden; border-color:var(--rule); border-top:3px solid var(--dark); background:var(--surface); }
+.resource-panel .panel-header { border-color:var(--rule); background:var(--surface); }
+.resource-panel .panel-header h1 { color:var(--dark); font-family:var(--mono); font-weight:650; letter-spacing:-.02em; }
+.resource-panel .eyebrow { color:var(--accent-dark); }
+.resource-panel .panel-note { color:var(--muted); }
 .nodes { display:grid; }
-.node-card { position:relative; padding:21px 24px; border-bottom:1px solid #334155; }
+.node-card { position:relative; padding:21px 24px; border-bottom:1px solid var(--rule); background:#fcfcfb; }
 .node-card:last-child { border-bottom:0; }
-.node-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:#334155; }
+.node-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:#d6d3d1; }
 .node-card:has(.gpu.occupied)::before { background:var(--accent); }
 .node-header { display:flex; justify-content:space-between; align-items:baseline; gap:16px; margin-bottom:12px; }
-.node-name { margin:0; color:white; font-family:var(--mono); font-size:15px; font-style:italic; letter-spacing:.03em; }
+.node-name { margin:0; color:var(--dark); font-family:var(--mono); font-size:15px; font-style:italic; letter-spacing:.03em; }
 .node-name::before { content:"// "; color:var(--accent); }
-.node-free { color:#94a3b8; font-size:8px; }
-.gpu-rack { display:grid; grid-template-columns:repeat(8,minmax(58px,1fr)); border:1px solid #334155; }
-.gpu { min-height:74px; padding:9px; display:grid; align-content:space-between; gap:8px; overflow:hidden; border:0; border-right:1px solid #334155; background:var(--surface); text-align:left; }
+.node-free { color:var(--muted); font-size:8px; }
+.gpu-rack { display:grid; grid-template-columns:repeat(8,minmax(58px,1fr)); border:1px solid #d6d3d1; }
+.gpu { min-height:74px; padding:9px; display:grid; align-content:space-between; gap:8px; overflow:hidden; border:0; border-right:1px solid #d6d3d1; background:var(--surface); text-align:left; }
 .gpu:last-child { border-right:0; }
-.gpu.free { background:#172033; color:#94a3b8; cursor:default; }
-.gpu.unknown { background:#334155; color:#cbd5e1; cursor:default; }
+.gpu.free { background:#f1f0ed; color:#78716c; cursor:default; }
+.gpu.unknown { background:#d6d3d1; color:#44403c; cursor:default; }
 .gpu.occupied { border-top:5px solid var(--project-color); background:white; color:var(--dark); }
 .gpu.occupied:hover { background:var(--accent-light); }
 .gpu.foreign { opacity:.3; filter:grayscale(1); }
@@ -100,10 +100,10 @@ select:focus,input:focus,.button:focus-visible,.job-row:focus-visible,.gpu:focus
 .gpu-owner { font-family:var(--mono); font-size:9px; line-height:1.25; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .node-bars { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:12px; }
 .resource-bar { display:grid; gap:5px; }
-.resource-bar-label { display:flex; justify-content:space-between; color:#94a3b8; font-size:9px; }
+.resource-bar-label { display:flex; justify-content:space-between; color:var(--muted); font-size:9px; }
 .mono { font-family:var(--mono); }
-.bar-track { height:4px; background:#334155; }
-.bar-fill { display:block; height:100%; background:var(--accent); }
+.bar-track { height:4px; background:var(--rule); }
+.bar-fill { display:block; height:100%; background:var(--teal); }
 
 .side-stack { display:grid; gap:14px; }
 .small-header { min-height:77px; padding:17px 18px; }
