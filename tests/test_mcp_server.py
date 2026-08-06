@@ -13,9 +13,9 @@ from unittest import mock
 from scruffy.mcp_server import (
     compact_event,
     compact_explanation,
-    compact_overview,
     dispatch_tool,
     event_matches,
+    minimal_overview,
     wait_for_updates,
 )
 from scruffy.storage import (
@@ -131,7 +131,7 @@ class ProjectionTests(unittest.TestCase):
             )
         )
 
-    def test_compact_overview_omits_heavy_job_and_node_fields(self) -> None:
+    def test_compact_overview_contains_only_health_counts_and_capacity(self) -> None:
         job = {
             **_job("job-1"),
             "elapsed_seconds": 123.0,
@@ -143,6 +143,12 @@ class ProjectionTests(unittest.TestCase):
             "queue_id": "queue-1",
             "project_id": "project-a",
             "as_of_cursor": "queue-1:0:1:10",
+            "allocation": {
+                "id": "allocation-1",
+                "state": "running",
+                "heartbeat_at": "2026-08-06T12:00:00+00:00",
+                "launcher": "slurm",
+            },
             "counts": {"running": 1},
             "nodes": {
                 "gpu-0": {
@@ -158,29 +164,33 @@ class ProjectionTests(unittest.TestCase):
             "active": [job],
         }
 
-        compact = compact_overview(value)
+        compact = minimal_overview(value)
 
         self.assertEqual(
             {
-                "id": "job-1",
-                "name": "training",
-                "state": "running",
-                "elapsed_seconds": 123.0,
+                "nodes": 1,
+                "gpus_total": 8,
+                "gpus_free": 2,
+                "cpus_total": 112,
+                "cpus_free": 28,
+                "memory_gb_total": 1992,
+                "memory_gb_free": 512,
             },
-            compact["active"][0],
+            compact["resources"],
         )
         self.assertEqual(
             {
-                "gpus": 8,
-                "free_gpus": 2,
-                "cpus": 112,
-                "free_cpus": 28,
-                "memory_gb": 1992,
-                "free_memory_gb": 512,
+                "id": "allocation-1",
+                "state": "running",
+                "heartbeat_at": "2026-08-06T12:00:00+00:00",
+                "deadline": None,
             },
-            compact["nodes"]["gpu-0"],
+            compact["allocation"],
         )
         encoded = json.dumps(compact)
+        self.assertLess(len(encoded), 1_000)
+        self.assertNotIn("active", compact)
+        self.assertNotIn("nodes", compact)
         self.assertNotIn("request", encoded)
         self.assertNotIn("assignments", encoded)
         self.assertNotIn("workload", encoded)
@@ -336,14 +346,21 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
         overview = await dispatch_tool(
             self.root, "overview", {"_project_id": "project-a"}
         )
+        listed = await dispatch_tool(
+            self.root,
+            "list_jobs",
+            {"_project_id": "project-a", "state": "running"},
+        )
         detailed = await dispatch_tool(
             self.root,
             "overview",
             {"_project_id": "project-a", "compact": False},
         )
 
-        self.assertEqual(["job-a"], [job["id"] for job in overview["active"]])
-        self.assertNotIn("workload", overview["active"][0])
+        self.assertEqual({"running": 1}, overview["counts"])
+        self.assertEqual(["job-a"], [job["id"] for job in listed["jobs"]])
+        self.assertNotIn("project_id", listed["jobs"][0])
+        self.assertNotIn("workload", listed["jobs"][0])
         self.assertIn("workload", detailed["active"][0])
         with self.assertRaises(KeyError):
             await dispatch_tool(
@@ -351,6 +368,35 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
                 "inspect_job",
                 {"_project_id": "project-a", "job_id": "job-b"},
             )
+
+    async def test_list_jobs_filters_paginates_and_hides_process_details(self) -> None:
+        _commit(
+            self.root,
+            [],
+            jobs={
+                "job-a": _job("job-a", project_id="project-a"),
+                "job-b": _job("job-b", project_id="project-b"),
+                "job-c": _job("job-c", state="queued", project_id="project-a"),
+            },
+        )
+
+        first = await dispatch_tool(
+            self.root, "list_jobs", {"state": "running", "limit": 1}
+        )
+        second = await dispatch_tool(
+            self.root,
+            "list_jobs",
+            {"state": "running", "offset": 1, "limit": 1},
+        )
+
+        self.assertEqual(2, first["total"])
+        self.assertTrue(first["more"])
+        self.assertFalse(second["more"])
+        self.assertNotEqual(first["jobs"][0]["id"], second["jobs"][0]["id"])
+        self.assertNotIn("argv", json.dumps(first))
+        self.assertNotIn("environment", json.dumps(first))
+        with self.assertRaisesRegex(ValueError, "state must be one of"):
+            await dispatch_tool(self.root, "list_jobs", {"state": "active"})
 
     async def test_submission_requires_project_and_deduplicates_retries(self) -> None:
         params = {
@@ -397,7 +443,7 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["reset"])
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["next_cursor"], result["overview"]["as_of_cursor"])
-        self.assertEqual("running", result["overview"]["active"][0]["state"])
+        self.assertEqual(1, result["overview"]["counts"]["running"])
 
     async def test_wait_is_cancellable_without_a_polling_thread(self) -> None:
         entered = asyncio.Event()
@@ -479,21 +525,21 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual(
-                {"overview", "inspect_job", "wait_for_updates"},
+                {"overview", "list_jobs", "inspect_job", "wait_for_updates"},
                 {tool.name for tool in tools.tools},
             )
             overview = self.structured(await session.call_tool("overview", {}))
-            detailed = self.structured(
-                await session.call_tool("overview", {"compact": False})
+            listed = self.structured(
+                await session.call_tool("list_jobs", {"state": "running"})
             )
             inspected = self.structured(
                 await session.call_tool("inspect_job", {"job_id": self.job_id})
             )
             self.assertEqual(
                 {"id", "project_id", "name", "state", "elapsed_seconds"},
-                overview["active"][0].keys(),
+                listed["jobs"][0].keys(),
             )
-            self.assertEqual({"phase": "training"}, detailed["active"][0]["workload"])
+            self.assertNotIn("jobs", overview)
             self.assertNotIn("environment", inspected["job"])
             invalid = await session.call_tool("wait_for_updates", {"timeout_seconds": 3601})
             self.assertTrue(invalid.isError)
@@ -563,7 +609,13 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual(
-                {"overview", "inspect_job", "wait_for_updates", "submit_job"},
+                {
+                    "overview",
+                    "list_jobs",
+                    "inspect_job",
+                    "wait_for_updates",
+                    "submit_job",
+                },
                 {tool.name for tool in tools.tools},
             )
             first = self.structured(await session.call_tool("submit_job", submission))

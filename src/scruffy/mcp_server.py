@@ -13,10 +13,17 @@ from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 from typing import Any
 
-from .client import explain, observe, summary
+from .client import explain, observe, status, summary
 from .client import submit_job as enqueue_job
 from .mcp_gateway import RemoteCall, remote_caller
-from .models import DEFAULT_PROJECT, ResourceRequest, job_project, normalize_project_id
+from .models import (
+    ACTIVE_JOB_STATES,
+    DEFAULT_PROJECT,
+    TERMINAL_JOB_STATES,
+    ResourceRequest,
+    job_project,
+    normalize_project_id,
+)
 from .summary import build_summary, job_view
 
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
@@ -26,8 +33,9 @@ POLL_SECONDS = 1.0
 QUIET_EVENT_KINDS = frozenset({"job.output", "workload.progress"})
 
 SERVER_INSTRUCTIONS = """\
-Scruffy monitors a shared GPU queue. Call the compact overview first and keep
-its as_of_cursor private to this agent. When waiting, call wait_for_updates
+Scruffy monitors a shared GPU queue. Call overview first and keep its
+as_of_cursor private to this agent. Use list_jobs only when job IDs are needed,
+then inspect_job for one selected ID. When waiting, call wait_for_updates
 instead of shell sleep or repeated polling, and replace the cursor with every
 returned next_cursor. If more is true, call again immediately. If reset is true,
 rebuild from the returned overview. Queue lifecycle state is authoritative.
@@ -52,26 +60,10 @@ COMPACT_EVENT_FIELDS = (
     "source",
     "data",
 )
-OVERVIEW_LANES = (
-    "submitted",
-    "active",
-    "queued",
-    "blocked",
-    "requires_attention",
-    "recent_terminal",
-)
-OVERVIEW_FIELDS = (
-    "v",
-    "queue_id",
-    "project_id",
-    "as_of_cursor",
-    "allocation",
-    "updated_at",
-    "draining",
-    "launches_paused",
-    "counts",
-    "archived_jobs",
-    "truncated",
+JOB_STATES = (
+    frozenset({"submitted", "blocked", "queued"})
+    | ACTIVE_JOB_STATES
+    | TERMINAL_JOB_STATES
 )
 
 
@@ -109,36 +101,114 @@ def compact_event(event: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, 
     return result
 
 
-def compact_overview(value: dict[str, Any]) -> dict[str, Any]:
-    """Return the small orientation view used by agents by default."""
+def _resource_totals(nodes: object) -> dict[str, int]:
+    """Sum the scheduler's node capacities without exposing assignments."""
 
-    result = {
-        field: copy.deepcopy(value[field]) for field in OVERVIEW_FIELDS if field in value
+    resources = {
+        "nodes": 0,
+        "gpus_total": 0,
+        "gpus_free": 0,
+        "cpus_total": 0,
+        "cpus_free": 0,
+        "memory_gb_total": 0,
+        "memory_gb_free": 0,
     }
-    include_project = value.get("project_id") is None
-    job_fields = ("id", "name", "state", "elapsed_seconds")
+    if not isinstance(nodes, dict):
+        return resources
+    for node in nodes.values():
+        if not isinstance(node, dict):
+            continue
+        capacity = node.get("capacity", {})
+        free = node.get("free", {})
+        resources["nodes"] += 1
+        resources["gpus_total"] += len(capacity.get("gpu_ids", []))
+        resources["gpus_free"] += len(free.get("gpu_ids", []))
+        for key in ("cpus", "memory_gb"):
+            resources[f"{key}_total"] += int(capacity.get(key, 0) or 0)
+            resources[f"{key}_free"] += int(free.get(key, 0) or 0)
+    return resources
+
+
+def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
+    """Return allocation health and aggregate capacity, without any job rows."""
+
+    allocation = value.get("allocation")
+    allocation = allocation if isinstance(allocation, dict) else {}
+
+    return {
+        "v": value.get("v", 1),
+        "queue_id": value.get("queue_id"),
+        "project_id": value.get("project_id"),
+        "as_of_cursor": value.get("as_of_cursor"),
+        "allocation": {
+            field: copy.deepcopy(allocation.get(field))
+            for field in ("id", "state", "heartbeat_at", "deadline")
+        },
+        "updated_at": value.get("updated_at"),
+        "draining": bool(value.get("draining", False)),
+        "launches_paused": bool(value.get("launches_paused", False)),
+        "counts": copy.deepcopy(value.get("counts", {})),
+        "resources": _resource_totals(value.get("nodes")),
+    }
+
+
+def _compact_job_identity(job: dict[str, Any], include_project: bool) -> dict[str, Any]:
+    """Project one job to the fields needed before an explicit inspection."""
+
+    view = job_view(job)
+    fields = ["id", "name", "state", "elapsed_seconds"]
     if include_project:
-        job_fields = ("id", "project_id", "name", "state", "elapsed_seconds")
-    for lane in OVERVIEW_LANES:
-        jobs = value.get(lane, [])
-        result[lane] = [
-            {field: copy.deepcopy(job.get(field)) for field in job_fields}
-            for job in jobs
-            if isinstance(job, dict)
-        ]
-    result["nodes"] = {
-        name: {
-            "gpus": len(node.get("capacity", {}).get("gpu_ids", [])),
-            "free_gpus": len(node.get("free", {}).get("gpu_ids", [])),
-            "cpus": node.get("capacity", {}).get("cpus"),
-            "free_cpus": node.get("free", {}).get("cpus"),
-            "memory_gb": node.get("capacity", {}).get("memory_gb"),
-            "free_memory_gb": node.get("free", {}).get("memory_gb"),
-        }
-        for name, node in value.get("nodes", {}).items()
-        if isinstance(node, dict)
+        fields.insert(1, "project_id")
+    elapsed = view.get("elapsed_seconds")
+    if elapsed is not None:
+        view["elapsed_seconds"] = int(elapsed)
+    return {field: copy.deepcopy(view.get(field)) for field in fields}
+
+
+def compact_job_list(
+    snapshot: dict[str, Any],
+    *,
+    state: str | None,
+    offset: int,
+    limit: int,
+    project_id: str | None,
+) -> dict[str, Any]:
+    """Return one stable page of job identities from the hot queue state."""
+
+    jobs = [
+        job
+        for job in snapshot.get("jobs", {}).values()
+        if isinstance(job, dict) and (state is None or job.get("state") == state)
+    ]
+    jobs.sort(
+        key=lambda job: (
+            str(job.get("state") or ""),
+            int(job.get("queue_order", 0) or 0),
+            str(job.get("submitted_at") or ""),
+            str(job.get("id") or ""),
+        )
+    )
+    page = jobs[offset : offset + limit]
+    identity = snapshot.get("queue_id")
+    cursor = (
+        f"{identity}:{snapshot.get('journal_generation', 0)}:"
+        f"{snapshot.get('last_seq', 0)}:{snapshot.get('journal_offset', 0)}"
+    )
+
+    return {
+        "v": 1,
+        "queue_id": identity,
+        "project_id": project_id,
+        "as_of_cursor": cursor,
+        "state": state,
+        "total": len(jobs),
+        "offset": offset,
+        "more": offset + len(page) < len(jobs),
+        "jobs": [
+            _compact_job_identity(job, include_project=project_id is None)
+            for job in page
+        ],
     }
-    return result
 
 
 def event_matches(
@@ -269,7 +339,7 @@ async def wait_for_updates(
                 "more": False,
                 "reset": True,
                 "timed_out": False,
-                "overview": compact_overview(
+                "overview": minimal_overview(
                     build_summary(
                         response["snapshot"], limit=20, project_id=selected_project
                     )
@@ -427,13 +497,36 @@ async def dispatch_tool(
     if tool == "overview":
         _only(params, {"limit", "compact"})
         limit = params.get("limit", 20)
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
             raise ValueError("limit must be between 1 and 100")
         compact = params.get("compact", True)
         if not isinstance(compact, bool):
             raise TypeError("compact must be a boolean")
         overview = summary(root, limit=limit, project_id=project_id)
-        return compact_overview(overview) if compact else overview
+        return minimal_overview(overview) if compact else overview
+    if tool == "list_jobs":
+        _only(params, {"state", "offset", "limit"})
+        selected_state = params.get("state")
+        if selected_state is not None and selected_state not in JOB_STATES:
+            raise ValueError(f"state must be one of {', '.join(sorted(JOB_STATES))}")
+        offset = params.get("offset", 0)
+        limit = params.get("limit", 50)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        snapshot = status(root, project_id=project_id)
+        return compact_job_list(
+            snapshot,
+            state=selected_state,
+            offset=offset,
+            limit=limit,
+            project_id=project_id,
+        )
     if tool == "inspect_job":
         _only(params, {"job_id"})
         job_id = params.get("job_id")
@@ -494,10 +587,24 @@ def create_server(
         return await dispatch_tool(root, tool, params, project_id=project_id)
 
     @server.tool()
-    async def overview(limit: int = 20, compact: bool = True) -> dict[str, Any]:
-        """Return an allocation overview and cursor; compact is agent-oriented."""
+    async def overview() -> dict[str, Any]:
+        """Return minimal allocation health, job counts, capacity, and cursor."""
 
-        return await call("overview", {"limit": limit, "compact": compact})
+        return await call("overview", {})
+
+    @server.tool()
+    async def list_jobs(
+        state: str | None = None, offset: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
+        """List lightweight job identities, optionally in one exact state.
+
+        Use state='queued' for the queue or state='running' for running jobs,
+        then call inspect_job only for an ID that needs detail.
+        """
+
+        return await call(
+            "list_jobs", {"state": state, "offset": offset, "limit": limit}
+        )
 
     @server.tool()
     async def inspect_job(job_id: str) -> dict[str, Any]:

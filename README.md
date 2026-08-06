@@ -184,12 +184,13 @@ Or run it directly from a checkout:
 uv run --extra mcp scruffy-mcp --root "$SCRUFFY_ROOT"
 ```
 
-Every server exposes three monitoring tools:
+Every server exposes four monitoring tools:
 
-- `overview(limit=20, compact=true)` returns an agent-sized allocation view and
-  `as_of_cursor`. Compact jobs contain only identity, state, and elapsed time;
-  nodes contain resource totals and free counts without assignment maps. Use
-  `compact=false` only for a detailed administrative view.
+- `overview()` returns only allocation health, lifecycle counts, aggregate free
+  and total resources, and `as_of_cursor`. It never includes job rows.
+- `list_jobs(state=None, offset=0, limit=50)` returns lightweight job identity,
+  name, state, and elapsed time. Use `state="queued"` for the queue or
+  `state="running"` for running jobs, then page while `more` is true.
 - `inspect_job(job_id)` returns a compact dependency explanation without argv,
   cwd, or environment values.
 - `wait_for_updates(...)` blocks for up to one hour and returns relevant events
@@ -216,7 +217,8 @@ waiting for GPUs. Retry an uncertain call with identical arguments and the same
 }
 ```
 
-The agent loop is: call `overview`, save `as_of_cursor`, then call
+The agent loop is: call `overview`, save `as_of_cursor`, and call `list_jobs`
+only when job IDs are needed. Use `inspect_job` for a selected job, then call
 `wait_for_updates` instead of sleeping. Always replace the private cursor with
 `next_cursor`, even after a timeout. Call again immediately when `more` is true.
 When `reset` is true, rebuild from the returned `overview`. Queue lifecycle

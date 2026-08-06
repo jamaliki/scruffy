@@ -11,13 +11,14 @@ When the Scruffy MCP tools are available, use this loop:
 1. Call `overview`, verify its `project_id`, and save its `as_of_cursor`
    privately. A project-specific agent should use an MCP server pinned with
    `scruffy-mcp --project PROJECT`.
-2. On a project-pinned server, call `submit_job` with a stable `request_id`;
+2. Call `list_jobs(state="queued")` or `list_jobs(state="running")` only when
+   job IDs are needed, then use `inspect_job` for one selected job.
+3. On a project-pinned server, call `submit_job` with a stable `request_id`;
    otherwise use the CLI or Python API. Submission never waits for resources.
-3. Call `wait_for_updates` with that cursor instead of calling `sleep`.
-4. Replace the cursor with every returned `next_cursor`, including on timeout.
-5. Call again immediately when `more` is true. On `reset`, rebuild from the
+4. Call `wait_for_updates` with that cursor instead of calling `sleep`.
+5. Replace the cursor with every returned `next_cursor`, including on timeout.
+6. Call again immediately when `more` is true. On `reset`, rebuild from the
    returned `overview`.
-6. Call `inspect_job` only when a returned update needs dependency diagnosis.
 
 An allocation-wide MCP server is read-only; a project-pinned server also exposes
 `submit_job`, which always writes into its configured project. Workload messages
