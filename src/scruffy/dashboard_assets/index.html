@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Scruffy Allocation Console</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="orbit-mark" aria-hidden="true"><i></i></span>
+      <div>
+        <div class="brand-word">SCRUFFY</div>
+        <div class="brand-sub">Allocation console // read only</div>
+      </div>
+    </div>
+    <div class="allocation-identity">
+      <span id="connection-dot" class="connection-dot"></span>
+      <div>
+        <strong id="allocation-state">Connecting</strong>
+        <span id="allocation-id">Waiting for queue state</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="stale-banner" class="stale-banner" hidden>
+    Queue telemetry is stale. Resource availability is unknown.
+  </div>
+
+  <main class="shell">
+    <section id="metrics" class="metrics" aria-label="Allocation totals"></section>
+
+    <section class="toolbar" aria-label="Dashboard controls">
+      <label>
+        <span>Project scope</span>
+        <select id="project-filter"><option value="all">All projects</option></select>
+      </label>
+      <label class="search-field">
+        <span>Find a job</span>
+        <input id="job-search" type="search" placeholder="Name, job, workflow or task">
+      </label>
+      <button id="refresh" class="button" type="button">Refresh telemetry</button>
+      <span id="freshness" class="freshness">No snapshot yet</span>
+    </section>
+
+    <div class="dashboard-grid">
+      <section class="panel resource-panel">
+        <header class="panel-header">
+          <div>
+            <p class="eyebrow">Physical allocation</p>
+            <h1>Every GPU has one owner.</h1>
+          </div>
+          <p id="resource-note" class="panel-note">Loading node inventory</p>
+        </header>
+        <div id="nodes" class="nodes"></div>
+      </section>
+
+      <aside class="side-stack">
+        <section class="panel compact-panel">
+          <header class="panel-header small-header">
+            <div><p class="eyebrow">Action rail</p><h2>Needs attention</h2></div>
+            <span id="attention-count" class="count-tag">0</span>
+          </header>
+          <div id="attention" class="job-list compact-list"></div>
+        </section>
+        <section class="panel compact-panel">
+          <header class="panel-header small-header">
+            <div><p class="eyebrow">Journal tail</p><h2>Recent finishes</h2></div>
+          </header>
+          <div id="recent" class="job-list compact-list"></div>
+        </section>
+      </aside>
+    </div>
+
+    <section class="panel queue-panel">
+      <header class="panel-header">
+        <div><p class="eyebrow">Scheduler state</p><h2>Work moves asynchronously.</h2></div>
+        <p class="panel-note">Select a job for dependencies and workload telemetry.</p>
+      </header>
+      <div class="queue-columns">
+        <section><h3>Running <span id="active-count">0</span></h3><div id="active" class="job-list"></div></section>
+        <section><h3>Queued <span id="queued-count">0</span></h3><div id="queued" class="job-list"></div></section>
+        <section><h3>Blocked <span id="blocked-count">0</span></h3><div id="blocked" class="job-list"></div></section>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="job-dialog" class="job-dialog">
+    <header>
+      <div><p id="dialog-project" class="eyebrow">Job</p><h2 id="dialog-title">Loading</h2></div>
+      <button id="dialog-close" class="icon-button" type="button" aria-label="Close job details">Close</button>
+    </header>
+    <div id="job-detail" class="job-detail"></div>
+  </dialog>
+
+  <footer class="footer">
+    <span>SCRUFFY // BORING CONTROLLER, USEFUL VIEW</span>
+    <span id="queue-id">Queue not connected</span>
+  </footer>
+
+  <noscript>This dashboard requires JavaScript to render queue state.</noscript>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

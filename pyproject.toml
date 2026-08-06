@@ -36,6 +36,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+scruffy = ["dashboard_assets/*.html", "dashboard_assets/*.css", "dashboard_assets/*.js"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

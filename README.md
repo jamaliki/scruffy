@@ -119,6 +119,36 @@ still appear because they can affect every project. Omit the project selector
 for an allocation-wide administrative view. Existing jobs without a project
 belong to `default`.
 
+## Web dashboard
+
+`scruffy dashboard` opens a read-only allocation console on loopback. It shows
+physical GPU ownership, CPU and memory reservations, project scopes, queue
+lanes, failures, recent finishes, and compact job/dependency details. The UI
+uses the same bounded projections as MCP and never returns argv, working
+directories, or environment values.
+
+For a locally visible queue root:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" dashboard
+```
+
+For a remote queue, run the web server locally and isolate each read through
+the existing SSH gateway:
+
+```bash
+scruffy --root /shared/runs/scruffy dashboard \
+  --connect-command /local/bin/tokyo-ssh \
+  --remote-command /shared/env/bin/scruffy-mcp
+```
+
+The default address is `http://127.0.0.1:8765/`; use `--port PORT` to change it
+or `--no-open` when a browser tab already exists. The server accepts only
+loopback host headers, exposes no mutation endpoint, and refreshes the compact
+allocation view every five seconds. If the controller heartbeat is older than
+15 seconds, the UI marks resource availability unknown rather than presenting
+stale GPUs as free.
+
 ## MCP monitoring for agents
 
 The optional read-only MCP server replaces repeated `sleep` calls with one

@@ -25,6 +25,7 @@ from .client import (
     wait_for_job,
 )
 from .controller import run_controller
+from .dashboard import run_dashboard
 from .models import (
     DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
@@ -326,6 +327,17 @@ def _drain(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _dashboard(arguments: argparse.Namespace) -> int:
+    run_dashboard(
+        str(_root(arguments)),
+        port=arguments.port,
+        connect_command=arguments.connect_command,
+        remote_command=arguments.remote_command,
+        open_browser=not arguments.no_open,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the public CLI and its concise operational help."""
 
@@ -536,6 +548,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     drain.set_defaults(handler=_drain)
+
+    dashboard = commands.add_parser(
+        "dashboard",
+        help="open the read-only allocation dashboard",
+        description="Serve a read-only Scruffy dashboard on 127.0.0.1.",
+    )
+    dashboard.add_argument(
+        "--port", type=int, default=8765, help="local port (default: 8765)"
+    )
+    dashboard.add_argument(
+        "--connect-command",
+        help="invoke each read through this connector, such as tokyo-ssh",
+    )
+    dashboard.add_argument(
+        "--remote-command",
+        help="remote scruffy-mcp command used with --connect-command",
+    )
+    dashboard.add_argument(
+        "--no-open", action="store_true", help="do not open a browser"
+    )
+    dashboard.set_defaults(handler=_dashboard)
     return parser
 
 

@@ -1,0 +1,242 @@
+import {
+  allocationIsStale, formatAge, formatDuration, formatNumber, gpuOwners,
+  progressLabel, projectColor, projects, resourceLabel, resourceTotals,
+  scalarTelemetry, stateTone, uniqueJobs, visibleJobs,
+} from "/assets/model.js";
+
+const byId = (id) => document.getElementById(id);
+const view = {
+  snapshot: null, project: "all", search: "", connected: false, loading: false,
+};
+
+function element(tag, className = "", text = null) {
+  const item = document.createElement(tag);
+  if (className) item.className = className;
+  if (text != null) item.textContent = text;
+  return item;
+}
+
+function replace(target, children) {
+  target.replaceChildren(...children);
+}
+
+function metric(label, value, detail) {
+  const card = element("article", "metric");
+  card.append(element("span", "metric-label", label), element("strong", "metric-value", value));
+  card.append(element("span", "metric-detail", detail));
+  return card;
+}
+
+function renderMetrics(snapshot, stale) {
+  const totals = resourceTotals(snapshot.nodes);
+  const counts = snapshot.counts || {};
+  const usedGpus = totals.gpus - totals.freeGpus;
+  const usedCpus = totals.cpus - totals.freeCpus;
+  const usedMemory = totals.memory - totals.freeMemory;
+  replace(byId("metrics"), [
+    metric("GPU fabric", `${stale ? "?" : usedGpus} / ${totals.gpus}`, stale ? "availability unknown" : `${totals.freeGpus} free now`),
+    metric("CPU budget", `${stale ? "?" : usedCpus} / ${totals.cpus}`, stale ? "availability unknown" : `${totals.freeCpus} cores free`),
+    metric("Memory", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)} GB`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB free`),
+    metric("Queue depth", String(Number(counts.submitted || 0) + Number(counts.queued || 0)), `${counts.blocked || 0} dependency-blocked`),
+  ]);
+}
+
+function progressBar(label, used, total) {
+  const wrapper = element("div", "resource-bar");
+  const header = element("div", "resource-bar-label");
+  header.append(element("span", "", label), element("span", "mono", `${formatNumber(used)} / ${formatNumber(total)}`));
+  const track = element("div", "bar-track");
+  const fill = element("i", "bar-fill");
+  fill.style.width = total ? `${Math.min(100, used / total * 100)}%` : "0%";
+  track.append(fill); wrapper.append(header, track);
+  return wrapper;
+}
+
+function renderNode(name, nodeState, jobs, stale) {
+  const card = element("article", "node-card");
+  const header = element("header", "node-header");
+  header.append(element("h3", "node-name", name));
+  const gpuIds = nodeState.capacity?.gpu_ids || [];
+  const free = new Set(nodeState.free?.gpu_ids || []);
+  header.append(element("span", "node-free", stale ? "GPU availability unknown" : `${free.size} / ${gpuIds.length} GPUs free`));
+  const rack = element("div", "gpu-rack");
+  const owners = gpuOwners(nodeState);
+  for (const gpuId of gpuIds) {
+    const jobId = owners.get(gpuId);
+    const job = jobs.get(jobId);
+    const project = job?.project_id || "default";
+    const available = free.has(gpuId);
+    const tile = element("button", available ? `gpu ${stale ? "unknown" : "free"}` : "gpu occupied");
+    tile.type = "button";
+    tile.append(element("span", "gpu-id", `GPU ${gpuId}`));
+    tile.append(element("strong", "gpu-owner", available ? (stale ? "UNKNOWN" : "FREE") : (job?.name || jobId || "ASSIGNED")));
+    if (!available) {
+      tile.style.setProperty("--project-color", projectColor(project));
+      tile.dataset.jobId = jobId || "";
+      tile.classList.toggle("foreign", view.project !== "all" && project !== view.project);
+      tile.title = `${job?.name || jobId} · ${project}`;
+    } else {
+      tile.disabled = true;
+    }
+    rack.append(tile);
+  }
+  const capacity = nodeState.capacity || {};
+  const available = nodeState.free || {};
+  const bars = element("div", "node-bars");
+  bars.append(
+    progressBar("CPU", Number(capacity.cpus || 0) - Number(available.cpus || 0), Number(capacity.cpus || 0)),
+    progressBar("Memory GB", Number(capacity.memory_gb || 0) - Number(available.memory_gb || 0), Number(capacity.memory_gb || 0)),
+  );
+  card.append(header, rack, bars);
+  return card;
+}
+
+function renderNodes(snapshot) {
+  const jobs = uniqueJobs(snapshot);
+  const entries = Object.entries(snapshot.nodes || {}).sort(([left], [right]) => left.localeCompare(right, undefined, {numeric: true}));
+  const stale = !view.connected || allocationIsStale(snapshot);
+  replace(byId("nodes"), entries.length ? entries.map(([name, state]) => renderNode(name, state, jobs, stale)) : [empty("No managed nodes are visible.")]);
+  const totals = resourceTotals(snapshot.nodes);
+  byId("resource-note").textContent = stale ? `${entries.length} nodes · ${totals.gpus} physical GPUs · availability unknown` : `${entries.length} nodes · ${totals.gpus} physical GPUs · ${totals.freeGpus} currently free`;
+}
+
+function projectTag(project) {
+  const tag = element("span", "project-tag", project || "default");
+  tag.style.setProperty("--project-color", projectColor(project));
+  return tag;
+}
+
+function jobRow(job, compact = false) {
+  const row = element("button", `job-row ${compact ? "compact" : ""}`);
+  row.type = "button"; row.dataset.jobId = job.id;
+  const marker = element("i", `state-marker ${stateTone(job.state)}`);
+  const main = element("span", "job-main");
+  const top = element("span", "job-top");
+  top.append(element("strong", "job-name", job.name || job.id), projectTag(job.project_id));
+  const secondary = compact ? `${job.state} · ${formatAge(job.finished_at || job.submitted_at)}` : `${resourceLabel(job)} · ${progressLabel(job)}`;
+  main.append(top, element("span", "job-secondary", secondary));
+  const tail = element("span", "job-tail");
+  tail.append(element("span", `state-text ${stateTone(job.state)}`, String(job.state || "unknown")));
+  if (!compact) tail.append(element("span", "mono", formatDuration(job.started_at, job.finished_at)));
+  row.append(marker, main, tail);
+  return row;
+}
+
+function empty(message) {
+  return element("p", "empty", message);
+}
+
+function renderList(targetId, jobs, emptyMessage, compact = false) {
+  const selected = visibleJobs(jobs, view.project, view.search);
+  replace(byId(targetId), selected.length ? selected.map((job) => jobRow(job, compact)) : [empty(emptyMessage)]);
+  const counter = byId(`${targetId}-count`);
+  if (counter) counter.textContent = String(selected.length);
+  return selected.length;
+}
+
+function renderProjects(snapshot) {
+  const select = byId("project-filter");
+  const choices = [element("option", "", "All projects")];
+  choices[0].value = "all";
+  for (const project of projects(snapshot)) {
+    const option = element("option", "", project); option.value = project; choices.push(option);
+  }
+  replace(select, choices);
+  if (![...select.options].some((option) => option.value === view.project)) view.project = "all";
+  select.value = view.project;
+}
+
+function renderConnection(snapshot) {
+  const allocation = snapshot.allocation || {};
+  const stale = !view.connected || allocationIsStale(snapshot);
+  byId("allocation-state").textContent = stale ? "Telemetry stale" : String(allocation.state || "No allocation");
+  byId("allocation-id").textContent = allocation.id ? `Allocation ${allocation.id}` : "Waiting for controller";
+  byId("connection-dot").className = `connection-dot ${view.connected && !stale ? "live" : "stale"}`;
+  byId("stale-banner").hidden = !stale;
+  byId("freshness").textContent = `Heartbeat ${formatAge(allocation.heartbeat_at)}`;
+  byId("queue-id").textContent = snapshot.queue_id || "Queue not identified";
+  document.body.classList.toggle("data-stale", stale);
+}
+
+function render() {
+  const snapshot = view.snapshot;
+  if (!snapshot) return;
+  const stale = !view.connected || allocationIsStale(snapshot);
+  renderConnection(snapshot); renderMetrics(snapshot, stale); renderProjects(snapshot); renderNodes(snapshot);
+  renderList("active", snapshot.active, "No jobs are using resources.");
+  renderList("queued", [...(snapshot.submitted || []), ...(snapshot.queued || [])], "No jobs are waiting for placement.");
+  renderList("blocked", snapshot.blocked, "No workflows are dependency-blocked.");
+  const attention = renderList("attention", snapshot.requires_attention, "Nothing requires attention.", true);
+  byId("attention-count").textContent = String(attention);
+  renderList("recent", snapshot.recent_terminal, "No recent terminal jobs.", true);
+}
+
+function detailSection(title, rows) {
+  const section = element("section", "detail-section");
+  section.append(element("h3", "", title));
+  const list = element("dl", "detail-grid");
+  for (const [label, value] of rows) {
+    list.append(element("dt", "", label), element("dd", "", value == null || value === "" ? "—" : String(value)));
+  }
+  section.append(list); return section;
+}
+
+async function openJob(jobId) {
+  if (!jobId) return;
+  const dialog = byId("job-dialog");
+  byId("dialog-title").textContent = jobId;
+  byId("dialog-project").textContent = "Reading job state";
+  replace(byId("job-detail"), [empty("Loading compact dependency view…")]);
+  if (!dialog.open) dialog.showModal();
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    const explanation = await response.json();
+    if (!response.ok) throw new Error(explanation.error || "Job lookup failed");
+    const job = explanation.job;
+    byId("dialog-title").textContent = job.name || job.id;
+    byId("dialog-project").textContent = `${job.project_id || "default"} // ${job.state}`;
+    const sections = [
+      detailSection("Lifecycle", [["Job", job.id], ["State", job.state], ["Reason", job.reason], ["Runtime", formatDuration(job.started_at, job.finished_at)], ["Exit code", job.exit_code]]),
+      detailSection("Placement", [["Request", resourceLabel(job)], ["Assignment", JSON.stringify(job.assignment || "Not assigned")], ["Stdout", job.stdout], ["Stderr", job.stderr]]),
+      detailSection("Workflow", [["Workflow", job.workflow_id], ["Task", job.task_id], ["Explanation", explanation.explanation], ["Blockers", JSON.stringify(explanation.blockers || job.blockers || [])]]),
+      detailSection("Workload telemetry", scalarTelemetry(job.workload || {})),
+    ];
+    replace(byId("job-detail"), sections);
+  } catch (error) {
+    replace(byId("job-detail"), [empty(error.message)]);
+  }
+}
+
+async function loadOverview() {
+  if (view.loading) return;
+  view.loading = true; byId("refresh").disabled = true;
+  try {
+    const response = await fetch("/api/overview", {cache: "no-store"});
+    const snapshot = await response.json();
+    if (!response.ok) throw new Error(snapshot.error || "Queue read failed");
+    view.snapshot = snapshot; view.connected = true; render();
+  } catch (error) {
+    view.connected = false;
+    if (view.snapshot) render();
+    byId("stale-banner").hidden = false;
+    byId("stale-banner").textContent = `Dashboard disconnected: ${error.message}`;
+    byId("connection-dot").className = "connection-dot stale";
+    document.body.classList.add("data-stale");
+  } finally {
+    view.loading = false; byId("refresh").disabled = false;
+  }
+}
+
+document.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-job-id]");
+  if (target) openJob(target.dataset.jobId);
+});
+byId("project-filter").addEventListener("change", (event) => { view.project = event.target.value; render(); });
+byId("job-search").addEventListener("input", (event) => { view.search = event.target.value; render(); });
+byId("refresh").addEventListener("click", loadOverview);
+byId("dialog-close").addEventListener("click", () => byId("job-dialog").close());
+byId("job-dialog").addEventListener("click", (event) => { if (event.target === byId("job-dialog")) byId("job-dialog").close(); });
+
+loadOverview();
+setInterval(loadOverview, 5_000);
+setInterval(() => { if (view.snapshot) renderConnection(view.snapshot); }, 1_000);

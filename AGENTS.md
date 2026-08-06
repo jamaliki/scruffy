@@ -74,6 +74,9 @@ agents; reading does not consume events for anyone else. Use
   the same workflow.
 - Prefer `summary` for bounded orientation, `explain` for one dependency chain,
   and `observe` for incremental monitoring.
+- Use `scruffy dashboard` for human allocation orientation. It is read-only,
+  loopback-only, and uses the same compact views; do not infer queue state by
+  scraping its HTML.
 - Prefer MCP `wait_for_updates` whenever it is available. Do not spend agent
   turns repeatedly invoking shell `sleep` while waiting for queue activity.
 - For a remote queue, run the MCP server locally with `--connect-command`.

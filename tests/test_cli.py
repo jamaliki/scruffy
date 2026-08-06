@@ -464,5 +464,33 @@ class ObserveFollowCliTests(unittest.TestCase):
         )
 
 
+class DashboardCliTests(unittest.TestCase):
+    def test_dashboard_forwards_remote_mode(self) -> None:
+        with mock.patch("scruffy.cli.run_dashboard") as run:
+            result = main(
+                [
+                    "--root",
+                    "/shared/queue",
+                    "dashboard",
+                    "--port",
+                    "9000",
+                    "--connect-command",
+                    "tokyo-ssh",
+                    "--remote-command",
+                    "/shared/env/bin/scruffy-mcp",
+                    "--no-open",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        run.assert_called_once_with(
+            "/shared/queue",
+            port=9000,
+            connect_command="tokyo-ssh",
+            remote_command="/shared/env/bin/scruffy-mcp",
+            open_browser=False,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
