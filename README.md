@@ -145,9 +145,9 @@ scruffy --root /shared/runs/scruffy dashboard \
 The default address is `http://127.0.0.1:8765/`; use `--port PORT` to change it
 or `--no-open` when a browser tab already exists. The server accepts only
 loopback host headers, exposes no mutation endpoint, and refreshes the compact
-allocation view every five seconds. If the controller heartbeat is older than
-15 seconds, the UI marks resource availability unknown rather than presenting
-stale GPUs as free.
+allocation view every five seconds. Brief read failures retain the last good
+view; after five minutes without fresh telemetry, resource availability becomes
+unknown rather than presenting stale GPUs as free.
 
 ## MCP monitoring for agents
 

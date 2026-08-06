@@ -1,5 +1,6 @@
 const PROJECT_COLORS = ["#f97316", "#0E6E66", "#3F4FA8", "#7E3F70", "#5A7A3C", "#B7472A"];
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "lost", "rejected", "skipped"]);
+export const TELEMETRY_STALE_AFTER_MS = 5 * 60 * 1000;
 
 export function projectColor(project) {
   if (!project || project === "default") return "#64748b";
@@ -102,10 +103,10 @@ export function stateTone(state) {
   return "neutral";
 }
 
-export function allocationIsStale(snapshot) {
+export function allocationIsStale(snapshot, now = Date.now()) {
   const heartbeat = snapshot?.allocation?.heartbeat_at;
   const recorded = heartbeat ? new Date(heartbeat).getTime() : Number.NaN;
-  return !Number.isFinite(recorded) || Date.now() - recorded > 15_000;
+  return !Number.isFinite(recorded) || now - recorded > TELEMETRY_STALE_AFTER_MS;
 }
 
 export function scalarTelemetry(workload = {}) {

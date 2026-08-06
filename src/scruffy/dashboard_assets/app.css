@@ -44,6 +44,7 @@ button { cursor:pointer; }
 .allocation-identity span { color:#cbd5e1; font-family:var(--mono); font-size:10px; }
 .connection-dot { width:9px; height:9px; flex:0 0 auto; background:var(--slate); border:2px solid white; }
 .connection-dot.live { background:var(--success); animation:pulse 2s steps(2,end) infinite; }
+.connection-dot.degraded { background:var(--warning); }
 .connection-dot.stale { background:var(--danger); }
 .stale-banner { padding:11px 5vw; color:white; background:var(--danger); font-family:var(--mono); font-size:11px; text-align:center; }
 

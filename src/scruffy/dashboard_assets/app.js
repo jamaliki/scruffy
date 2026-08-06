@@ -1,13 +1,20 @@
 import {
   allocationIsStale, formatAge, formatDuration, formatNumber, gpuOwners,
   progressLabel, projectColor, projects, resourceLabel, resourceTotals,
-  scalarTelemetry, stateTone, uniqueJobs, visibleJobs,
+  scalarTelemetry, stateTone, TELEMETRY_STALE_AFTER_MS, uniqueJobs, visibleJobs,
 } from "/assets/model.js";
 
 const byId = (id) => document.getElementById(id);
 const view = {
   snapshot: null, project: "all", search: "", connected: false, loading: false,
+  lastSuccessAt: null,
 };
+
+function telemetryIsStale(snapshot) {
+  const refreshExpired = view.lastSuccessAt != null
+    && Date.now() - view.lastSuccessAt > TELEMETRY_STALE_AFTER_MS;
+  return refreshExpired || allocationIsStale(snapshot);
+}
 
 function element(tag, className = "", text = null) {
   const item = document.createElement(tag);
@@ -94,7 +101,7 @@ function renderNode(name, nodeState, jobs, stale) {
 function renderNodes(snapshot) {
   const jobs = uniqueJobs(snapshot);
   const entries = Object.entries(snapshot.nodes || {}).sort(([left], [right]) => left.localeCompare(right, undefined, {numeric: true}));
-  const stale = !view.connected || allocationIsStale(snapshot);
+  const stale = telemetryIsStale(snapshot);
   replace(byId("nodes"), entries.length ? entries.map(([name, state]) => renderNode(name, state, jobs, stale)) : [empty("No managed nodes are visible.")]);
   const totals = resourceTotals(snapshot.nodes);
   byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available`;
@@ -148,11 +155,13 @@ function renderProjects(snapshot) {
 
 function renderConnection(snapshot) {
   const allocation = snapshot.allocation || {};
-  const stale = !view.connected || allocationIsStale(snapshot);
+  const stale = telemetryIsStale(snapshot);
   byId("allocation-state").textContent = stale ? "Telemetry stale" : String(allocation.state || "No allocation");
   byId("allocation-id").textContent = allocation.id ? `Allocation ${allocation.id}` : "Waiting for controller";
-  byId("connection-dot").className = `connection-dot ${view.connected && !stale ? "live" : "stale"}`;
+  const connectionTone = stale ? "stale" : view.connected ? "live" : "degraded";
+  byId("connection-dot").className = `connection-dot ${connectionTone}`;
   byId("stale-banner").hidden = !stale;
+  byId("stale-banner").textContent = "Queue telemetry has not refreshed for five minutes. Resource availability is unknown.";
   byId("freshness").textContent = `Heartbeat ${formatAge(allocation.heartbeat_at)}`;
   byId("queue-id").textContent = snapshot.queue_id || "Queue not identified";
   document.body.classList.toggle("data-stale", stale);
@@ -161,7 +170,7 @@ function renderConnection(snapshot) {
 function render() {
   const snapshot = view.snapshot;
   if (!snapshot) return;
-  const stale = !view.connected || allocationIsStale(snapshot);
+  const stale = telemetryIsStale(snapshot);
   renderConnection(snapshot); renderMetrics(snapshot, stale); renderProjects(snapshot); renderNodes(snapshot);
   renderList("active", snapshot.active, "No jobs are using resources.");
   renderList("queued", [...(snapshot.submitted || []), ...(snapshot.queued || [])], "No jobs are waiting for placement.");
@@ -214,14 +223,16 @@ async function loadOverview() {
     const response = await fetch("/api/overview", {cache: "no-store"});
     const snapshot = await response.json();
     if (!response.ok) throw new Error(snapshot.error || "Queue read failed");
-    view.snapshot = snapshot; view.connected = true; render();
+    view.snapshot = snapshot; view.connected = true; view.lastSuccessAt = Date.now(); render();
   } catch (error) {
     view.connected = false;
-    if (view.snapshot) render();
-    byId("stale-banner").hidden = false;
-    byId("stale-banner").textContent = `Dashboard disconnected: ${error.message}`;
-    byId("connection-dot").className = "connection-dot stale";
-    document.body.classList.add("data-stale");
+    if (view.snapshot) {
+      render();
+    } else {
+      byId("stale-banner").hidden = false;
+      byId("stale-banner").textContent = `Dashboard unavailable: ${error.message}`;
+      byId("connection-dot").className = "connection-dot stale";
+    }
   } finally {
     view.loading = false; byId("refresh").disabled = false;
   }
