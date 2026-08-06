@@ -9,7 +9,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .models import ResourceRequest, TERMINAL_JOB_STATES
+from .models import (
+    DEFAULT_PROJECT,
+    TERMINAL_JOB_STATES,
+    ResourceRequest,
+    job_project,
+    normalize_project_id,
+)
 from .protocol import validate_event
 from .storage import (
     create_job_id,
@@ -61,6 +67,7 @@ def submit_job(
     environment: dict[str, str],
     request: ResourceRequest,
     request_id: str | None,
+    project_id: str = DEFAULT_PROJECT,
     workflow_id: str | None = None,
     task_id: str | None = None,
     needs: Sequence[Mapping[str, str]] | None = None,
@@ -71,7 +78,8 @@ def submit_job(
         raise ValueError("command must contain at least one non-empty argument")
     if not name.strip():
         raise ValueError("name must not be empty")
-    job_id = create_job_id(request_id)
+    project_id = normalize_project_id(project_id)
+    job_id = create_job_id(request_id, project_id=project_id)
     spec = {
         "v": 1,
         "job_id": job_id,
@@ -82,10 +90,16 @@ def submit_job(
         "cwd": str(cwd.expanduser().resolve()),
         "env": dict(sorted(environment.items())),
         "resources": request.to_dict(),
+        **({"project_id": project_id} if project_id != DEFAULT_PROJECT else {}),
         **_workflow_fields(workflow_id, task_id, needs),
     }
     job_id, deduplicated = submit_request(root, spec)
-    return {"job_id": job_id, "state": "submitted", "deduplicated": deduplicated}
+    return {
+        "job_id": job_id,
+        "project_id": project_id,
+        "state": "submitted",
+        "deduplicated": deduplicated,
+    }
 
 
 def publish_event(
@@ -149,6 +163,11 @@ def _submitted_from_spec(
     valid = valid and all(
         key in document for key in ("name", "submitted_at", "resources")
     )
+    try:
+        project_id = normalize_project_id(document.get("project_id"))
+    except ValueError:
+        project_id = DEFAULT_PROJECT
+        valid = False
     workflow: dict[str, Any] = {}
     workflow_id, task_id = document.get("workflow_id"), document.get("task_id")
     needs = document.get("needs", [])
@@ -168,6 +187,7 @@ def _submitted_from_spec(
             valid = False
     submitted = {
         "id": job_id,
+        "project_id": project_id,
         "name": str(document.get("name", "invalid")),
         "state": "submitted",
         "submitted_at": document.get("submitted_at"),
@@ -180,9 +200,34 @@ def _submitted_from_spec(
     return submitted
 
 
-def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
+def _scope_state(state: dict[str, Any], project_id: str) -> dict[str, Any]:
+    """Filter job-specific state while retaining global allocation capacity."""
+
+    jobs = state.get("jobs", {})
+    state["jobs"] = {
+        key: job for key, job in jobs.items() if job_project(job) == project_id
+    }
+    by_project = state.get("archived_project_counts")
+    if isinstance(by_project, dict):
+        archived_counts = by_project.get(project_id, {})
+    elif project_id == DEFAULT_PROJECT:
+        archived_counts = state.get("archived_counts", {})
+    else:
+        archived_counts = {}
+    state["archived_counts"] = copy.deepcopy(archived_counts)
+    state["archived_jobs"] = sum(int(count) for count in archived_counts.values())
+    state["project_id"] = project_id
+    return state
+
+
+def status(
+    root: Path, job_id: str | None = None, *, project_id: str | None = None
+) -> dict[str, Any]:
     """Return one job or hot queue state, including unadmitted submissions."""
 
+    selected_project = (
+        normalize_project_id(project_id) if project_id is not None else None
+    )
     state = load_state(root)
     if state is None:
         state = {
@@ -199,6 +244,7 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
             "next_queue_order": 0,
             "archived_jobs": 0,
             "archived_counts": {},
+            "archived_project_counts": {},
             "draining": False,
             "drain_requested": False,
         }
@@ -209,15 +255,24 @@ def status(root: Path, job_id: str | None = None) -> dict[str, Any]:
         jobs = state["jobs"]
         for request_id, spec in list_requests(root, exclude=set(jobs)):
             jobs[request_id] = _submitted_from_spec(request_id, spec)
+        if selected_project is not None:
+            _scope_state(state, selected_project)
         return state
     job = state.get("jobs", {}).get(job_id)
     if job is not None:
+        if selected_project is not None and job_project(job) != selected_project:
+            raise KeyError(f"unknown job {job_id}")
         return job
     pending = dict(list_requests(root))
     if job_id in pending:
-        return _submitted_from_spec(job_id, pending[job_id])
+        job = _submitted_from_spec(job_id, pending[job_id])
+        if selected_project is not None and job_project(job) != selected_project:
+            raise KeyError(f"unknown job {job_id}")
+        return job
     archived = find_archived_job(root, job_id)
     if archived is not None:
+        if selected_project is not None and job_project(archived) != selected_project:
+            raise KeyError(f"unknown job {job_id}")
         return archived
     raise KeyError(f"unknown job {job_id}")
 
@@ -231,6 +286,22 @@ def _snapshot_cursor(root: Path) -> tuple[int, int, int]:
         int(snapshot.get("last_seq", 0)),
         int(snapshot.get("journal_offset", 0)),
     )
+
+
+def _event_project(event: dict[str, Any], snapshot: dict[str, Any]) -> str | None:
+    """Return one job event's authoritative project; global events have none."""
+
+    job_id = event.get("job_id")
+    if not isinstance(job_id, str):
+        return None
+    event_project = event.get("project_id")
+    if isinstance(event_project, str):
+        return event_project
+    embedded = event.get("job")
+    if isinstance(embedded, dict):
+        return job_project(embedded)
+    candidate = snapshot.get("jobs", {}).get(job_id)
+    return job_project(candidate) if isinstance(candidate, dict) else DEFAULT_PROJECT
 
 
 def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, bool]:
@@ -285,6 +356,7 @@ def observe(
     wait_seconds: float = 0,
     include_output: bool = False,
     limit: int = 1000,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Return a queue snapshot and one non-consuming page after ``after``."""
 
@@ -327,8 +399,19 @@ def observe(
         )
 
     next_sequence = max((int(item["seq"]) for item in page), default=sequence)
+    selected_project = (
+        normalize_project_id(project_id) if project_id is not None else None
+    )
+    snapshot = status(root)
     visible: list[dict[str, Any]] = []
     for original in page:
+        event_project = _event_project(original, snapshot)
+        if (
+            selected_project is not None
+            and event_project is not None
+            and event_project != selected_project
+        ):
+            continue
         event = copy.deepcopy(original)
         if event.get("kind") == "job.output" and include_output:
             data = event.get("data", {})
@@ -339,7 +422,8 @@ def observe(
                 int(data["length"]),
             )
         visible.append(event)
-    snapshot = status(root)
+    if selected_project is not None:
+        _scope_state(snapshot, selected_project)
     identity = queue_id(root)
     snapshot_generation = int(snapshot.get("journal_generation", 0))
     latest_sequence = int(snapshot.get("last_seq", 0))
@@ -390,22 +474,30 @@ def wait_for_job(
         time.sleep(0.2)
 
 
-def summary(root: Path, *, limit: int = 20) -> dict[str, Any]:
-    """Return a bounded, action-oriented view of the whole allocation."""
+def summary(
+    root: Path, *, limit: int = 20, project_id: str | None = None
+) -> dict[str, Any]:
+    """Return a bounded allocation view, optionally for one project."""
 
-    return build_summary(status(root), limit=limit)
+    return build_summary(status(root), limit=limit, project_id=project_id)
 
 
-def explain(root: Path, job_id: str) -> dict[str, Any]:
+def explain(
+    root: Path, job_id: str, *, project_id: str | None = None
+) -> dict[str, Any]:
     """Explain one job's state and dependency chain."""
 
     state = status(root)
     job = state["jobs"].get(job_id)
     if job is None:
-        job = status(root, job_id)
+        job = status(root, job_id, project_id=project_id)
         state["jobs"][job_id] = job
+    elif project_id is not None and job_project(job) != normalize_project_id(project_id):
+        raise KeyError(f"unknown job {job_id}")
     workflow_id = job.get("workflow_id")
     if isinstance(workflow_id, str):
-        for archived in list_archived_workflow(root, workflow_id):
+        for archived in list_archived_workflow(
+            root, workflow_id, project_id=job_project(job)
+        ):
             state["jobs"].setdefault(archived["id"], archived)
     return explain_job(state, job_id)

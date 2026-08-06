@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scruffy import ConflictError, publish_event as public_publish_event
+from scruffy import ConflictError
+from scruffy import publish_event as public_publish_event
 from scruffy.client import (
     explain,
     observe,
@@ -129,6 +130,29 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(
             "submitted",
             observe(self.root)["snapshot"]["jobs"][response["job_id"]]["state"],
+        )
+
+    def test_projects_scope_idempotency_and_queue_views(self) -> None:
+        submitted = [
+            submit_job(
+                self.root,
+                argv=["true"],
+                name=project_id,
+                cwd=Path.cwd(),
+                environment={},
+                request=ResourceRequest(1, 1, 1, 1),
+                request_id="shared-request",
+                project_id=project_id,
+            )
+            for project_id in ("project-a", "project-b")
+        ]
+
+        self.assertNotEqual(submitted[0]["job_id"], submitted[1]["job_id"])
+        scoped = status(self.root, project_id="project-a")
+        self.assertEqual([submitted[0]["job_id"]], list(scoped["jobs"]))
+        self.assertEqual(
+            "project-a",
+            summary(self.root, project_id="project-a")["project_id"],
         )
 
     def test_wait_tolerates_a_transient_unknown_job_view(self) -> None:

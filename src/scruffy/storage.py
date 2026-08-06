@@ -19,8 +19,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import AbstractSet, Any, BinaryIO, Callable, Iterator, Sequence, TextIO
 
+from .models import DEFAULT_PROJECT, job_project, normalize_project_id
 from .protocol import MAX_EVENT_BYTES, validate_event
-
 
 LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports")
 LOCK_SHARDS = 64
@@ -132,6 +132,10 @@ def canonical_job_identity(spec: dict[str, Any]) -> bytes:
         for key, value in spec.items()
         if key not in {"job_id", "submitted_at"}
     }
+    # Adding projects must not invalidate receipts created before the field
+    # existed. The explicit default and a missing legacy field are identical.
+    if identity.get("project_id") == DEFAULT_PROJECT:
+        identity.pop("project_id")
     return json.dumps(
         identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode()
@@ -143,9 +147,15 @@ def job_identity_digest(spec: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_job_identity(spec)).hexdigest()
 
 
-def create_job_id(request_id: str | None = None) -> str:
+def create_job_id(
+    request_id: str | None = None, *, project_id: str = DEFAULT_PROJECT
+) -> str:
+    """Create a stable ID, with idempotency keys scoped to one project."""
+
+    project_id = normalize_project_id(project_id)
     if request_id:
-        digest = hashlib.sha256(request_id.encode()).hexdigest()[:20]
+        identity = request_id if project_id == DEFAULT_PROJECT else f"{project_id}\0{request_id}"
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
         return f"job-{digest}"
     timestamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     return f"job-{timestamp}-{uuid.uuid4().hex[:10]}"
@@ -355,6 +365,7 @@ _ARCHIVED_JOB_FIELDS = (
     "task_id",
     "needs",
     "workflow_invalid",
+    "project_id",
 )
 
 
@@ -367,8 +378,12 @@ def _archived_job(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _workflow_archive(root: Path, workflow_id: str) -> Path:
-    digest = hashlib.sha256(workflow_id.encode()).hexdigest()
+def _workflow_archive(root: Path, workflow_id: str, project_id: str) -> Path:
+    project_id = normalize_project_id(project_id)
+    # Preserve the legacy path for the default project. Other projects use the
+    # same compact index shape with a project-qualified identity.
+    identity = workflow_id if project_id == DEFAULT_PROJECT else f"{project_id}\0{workflow_id}"
+    digest = hashlib.sha256(identity.encode()).hexdigest()
     return ensure_layout(root) / "requests" / ".workflows" / digest[:2] / digest
 
 
@@ -398,14 +413,20 @@ def archive_terminal_job(root: Path, job: dict[str, Any]) -> None:
         workflow_id = archived.get("workflow_id")
         task_id = archived.get("task_id")
         if isinstance(workflow_id, str) and isinstance(task_id, str):
-            workflow_directory = _workflow_archive(root, workflow_id)
+            project_id = job_project(archived)
+            workflow_directory = _workflow_archive(root, workflow_id, project_id)
             _mkdir(workflow_directory.parent.parent)
             _mkdir(workflow_directory.parent)
             _mkdir(workflow_directory)
             job_digest = hashlib.sha256(job_id.encode()).hexdigest()
             atomic_write_json(
                 workflow_directory / f"{job_digest}.json",
-                {"v": 1, "workflow_id": workflow_id, "job": archived},
+                {
+                    "v": 1,
+                    "project_id": project_id,
+                    "workflow_id": workflow_id,
+                    "job": archived,
+                },
             )
 
 
@@ -421,25 +442,38 @@ def list_archived_workflow(
     root: Path,
     workflow_id: str,
     *,
+    project_id: str = DEFAULT_PROJECT,
     on_error: Callable[[Path, StorageError], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Load one workflow, skipping corrupt entries and optionally reporting them."""
 
-    directory = _workflow_archive(root, workflow_id)
+    project_id = normalize_project_id(project_id)
+    directory = _workflow_archive(root, workflow_id, project_id)
     if not directory.exists():
         return []
     jobs: list[dict[str, Any]] = []
     for source in directory.glob("*.json"):
         try:
             document = read_json(source)
+            try:
+                document_project = normalize_project_id(
+                    document.get("project_id") if isinstance(document, dict) else None
+                )
+            except ValueError as exc:
+                raise StorageError(
+                    f"invalid workflow archive entry {source}: {exc}"
+                ) from exc
             if (
                 not isinstance(document, dict)
                 or document.get("workflow_id") != workflow_id
+                or document_project != project_id
             ):
                 raise StorageError(f"invalid workflow archive entry {source}")
             job = document.get("job")
             if not isinstance(job, dict):
                 raise StorageError(f"workflow archive entry {source} has no job")
+            if job_project(job) != project_id:
+                raise StorageError(f"workflow archive entry {source} has wrong project")
         except TransientStorageError:
             raise
         except StorageError as exc:

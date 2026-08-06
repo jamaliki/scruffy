@@ -15,10 +15,12 @@ def task(
     task_id: str,
     *,
     workflow_id: str = "pipeline",
+    project_id: str = "default",
     state: str = "queued",
     needs: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     return {
+        "project_id": project_id,
         "workflow_id": workflow_id,
         "task_id": task_id,
         "state": state,
@@ -82,6 +84,9 @@ class WorkflowValidationTests(unittest.TestCase):
 
     def test_task_ids_are_unique_within_but_not_across_workflows(self) -> None:
         validate_workflows([task("train", workflow_id="a"), task("train", workflow_id="b")])
+        validate_workflows(
+            [task("train", project_id="a"), task("train", project_id="b")]
+        )
 
         with self.assertRaisesRegex(WorkflowError, "duplicate task_id"):
             validate_workflows([task("train"), task("train")])
@@ -163,7 +168,7 @@ class WorkflowResolutionTests(unittest.TestCase):
 
         selected = select_task_attempts(attempts)
 
-        self.assertIs(attempts[2], selected[("pipeline", "train")])
+        self.assertIs(attempts[2], selected[("default", "pipeline", "train")])
 
     def test_batch_resolver_reaches_a_fixed_point_in_topological_order(self) -> None:
         jobs = [
@@ -181,15 +186,32 @@ class WorkflowResolutionTests(unittest.TestCase):
 
         self.assertEqual(
             ["child", "cleanup", "consumer"],
-            [task_id for _, task_id in resolutions],
+            [task_id for _, _, task_id in resolutions],
         )
-        self.assertEqual("skipped", resolutions[("pipeline", "child")]["decision"])
-        self.assertEqual("ready", resolutions[("pipeline", "cleanup")]["decision"])
-        self.assertEqual("blocked", resolutions[("pipeline", "consumer")]["decision"])
+        self.assertEqual(
+            "skipped", resolutions[("default", "pipeline", "child")]["decision"]
+        )
+        self.assertEqual(
+            "ready", resolutions[("default", "pipeline", "cleanup")]["decision"]
+        )
+        self.assertEqual(
+            "blocked", resolutions[("default", "pipeline", "consumer")]["decision"]
+        )
         self.assertEqual(
             "queued",
-            resolutions[("pipeline", "consumer")]["blockers"][0]["state"],
+            resolutions[("default", "pipeline", "consumer")]["blockers"][0][
+                "state"
+            ],
         )
+
+    def test_dependencies_never_cross_project_boundaries(self) -> None:
+        child = task("infer", project_id="project-a", needs=[need("train")])
+        other = task("train", project_id="project-b", state="succeeded")
+
+        resolution = resolve_dependencies(child, [child, other])
+
+        self.assertEqual("blocked", resolution["decision"])
+        self.assertEqual("dependency_missing", resolution["blockers"][0]["reason"])
 
     def test_open_workflow_treats_not_yet_submitted_task_as_pending(self) -> None:
         child = task(

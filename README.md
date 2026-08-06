@@ -93,6 +93,32 @@ JSON Lines view. Cursors include a journal generation; compaction makes an older
 generation return `reset: true`, at which point the reader rebuilds from the
 returned snapshot. See [the client contract](docs/client-v1.md).
 
+## Projects
+
+Projects isolate names and monitoring without dividing the allocation. There is
+still one controller, one global resource ledger, and one scheduling queue, so
+GPU exclusivity holds across every project. A project is not an access-control,
+quota, or fairness boundary.
+
+Set `--project` on submission and observation, or export `SCRUFFY_PROJECT` for
+an agent session:
+
+```bash
+export SCRUFFY_PROJECT=koochak
+scruffy --root "$SCRUFFY_ROOT" submit \
+  --request-id experiment-7/train -- python train.py
+scruffy --root "$SCRUFFY_ROOT" summary
+scruffy --root "$SCRUFFY_ROOT" observe --after "$CURSOR" --wait 30
+```
+
+`request_id` and `(workflow_id, task_id)` identities are local to a project.
+Dependencies can only resolve inside that same project. Project-filtered
+readers advance their global cursor across other projects' events, so unrelated
+traffic is neither returned nor repeatedly scanned. Allocation-wide events
+still appear because they can affect every project. Omit the project selector
+for an allocation-wide administrative view. Existing jobs without a project
+belong to `default`.
+
 ## MCP monitoring for agents
 
 The optional read-only MCP server replaces repeated `sleep` calls with one
@@ -117,6 +143,10 @@ The server exposes only three tools:
   it by default; `job.output` and `workload.progress` are opt-in through
   `event_kinds`.
 
+Start it with `--project PROJECT` (or `SCRUFFY_PROJECT`) to pin all three tools
+to one project. The project is fixed by the server command, so agents cannot
+accidentally mix project views or need to repeat a selector on every call.
+
 The agent loop is: call `overview`, save `as_of_cursor`, then call
 `wait_for_updates` instead of sleeping. Always replace the private cursor with
 `next_cursor`, even after a timeout. Call again immediately when `more` is true.
@@ -139,6 +169,7 @@ remote shell.
 command = "/local/env/bin/scruffy-mcp"
 args = [
   "--root", "/shared/runs/scruffy",
+  "--project", "koochak",
   "--connect-command", "/local/bin/tokyo-ssh",
   "--remote-command", "/shared/env/bin/scruffy-mcp",
 ]
@@ -158,7 +189,7 @@ options and run `scruffy-mcp --root ROOT` as before.
 ## Submission and resources
 
 `submit` returns after its immutable request is durable. A stable `request_id`
-is an idempotency key scoped to the queue: retrying the same specification
+is an idempotency key scoped to the project: retrying the same specification
 returns the original job ID, while changing it raises a conflict. Without a
 request ID, every call creates a new job. Exact request idempotency survives hot
 job eviction through a compact receipt in the archive.
@@ -198,6 +229,7 @@ result = submit_job(
         memory_gb_per_node=128,
     ),
     request_id="agent-a/experiment-7/train",
+    project_id="koochak",
     workflow_id="experiment-7",
     task_id="train",
 )
@@ -206,7 +238,8 @@ result = submit_job(
 ## Workflows
 
 A task may depend on tasks that have not been submitted yet. All submissions
-still return immediately.
+still return immediately. Workflow and task identities are scoped to the job's
+project, and a dependency never binds across projects.
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" submit \
@@ -228,9 +261,9 @@ Active duplicate task IDs, self-dependencies, and cycles are rejected. Use
 
 ## Workload progress and output
 
-Workers receive controller-owned `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`,
-`SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE`. A workload can publish a bounded semantic
-annotation without contacting the controller process:
+Workers receive controller-owned `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`,
+`SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE`. A workload can publish
+a bounded semantic annotation without contacting the controller process:
 
 ```bash
 scruffy report workload.progress \

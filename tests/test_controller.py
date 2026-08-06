@@ -24,7 +24,6 @@ from scruffy.controller import run_controller
 from scruffy.models import NodeInventory, ResourceRequest
 from scruffy.storage import read_events, submit_request, utc_now
 
-
 TIMEOUT = 12.0
 REQUEST = ResourceRequest(
     nodes=1,
@@ -135,6 +134,7 @@ class ControllerIntegrationTests(unittest.TestCase):
         code: str,
         *,
         environment: dict[str, str] | None = None,
+        project_id: str = "default",
         workflow_id: str | None = None,
         task_id: str | None = None,
         needs: tuple[dict[str, str], ...] = (),
@@ -147,6 +147,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             environment=environment or {},
             request=REQUEST,
             request_id=f"test/{name}",
+            project_id=project_id,
             workflow_id=workflow_id,
             task_id=task_id,
             needs=needs,
@@ -154,6 +155,26 @@ class ControllerIntegrationTests(unittest.TestCase):
         self.assertEqual("submitted", response["state"])
         self.assertFalse(response["deduplicated"])
         return str(response["job_id"])
+
+    def test_projects_isolate_workflow_identity_and_reach_workers(self) -> None:
+        self._start_controller((0,))
+        first = self._submit(
+            "project-a-train",
+            "import os; assert os.environ['SCRUFFY_PROJECT'] == 'project-a'",
+            project_id="project-a",
+            workflow_id="shared-flow",
+            task_id="train",
+        )
+        second = self._submit(
+            "project-b-train",
+            "import os; assert os.environ['SCRUFFY_PROJECT'] == 'project-b'",
+            project_id="project-b",
+            workflow_id="shared-flow",
+            task_id="train",
+        )
+
+        self.assertEqual("succeeded", wait_for_job(self.root, first, timeout=TIMEOUT)["state"])
+        self.assertEqual("succeeded", wait_for_job(self.root, second, timeout=TIMEOUT)["state"])
 
     def test_dependencies_block_release_and_skip_without_waiting_to_submit(self) -> None:
         self._start_controller((0,))

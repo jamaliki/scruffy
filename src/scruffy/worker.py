@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .models import job_project
+
 
 def current_node() -> str:
     return (
@@ -55,6 +57,7 @@ def execute_assignment(source: Path) -> None:
     # a workload cannot redirect reports or impersonate another job.
     environment["SCRUFFY_ROOT"] = root
     environment["SCRUFFY_JOB_ID"] = job_id
+    environment["SCRUFFY_PROJECT"] = job_project(document)
     environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
     # Apply this last: jobs submitted through the API cannot choose another slot.

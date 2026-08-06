@@ -9,15 +9,19 @@ from typing import Any
 
 from .models import (
     ACTIVE_JOB_STATES,
+    DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
     Assignment,
     NodeInventory,
     ResourceRequest,
+    job_project,
+    normalize_project_id,
 )
 from .protocol import EVENT_KINDS
 from .runtime import Controller
 from .scheduler import available_resources
 from .storage import (
+    StorageError,
     activate_journal_generation,
     append_event,
     archive_terminal_job,
@@ -32,13 +36,11 @@ from .storage import (
     queue_id,
     read_event_page,
     remove_cold_job_directories,
-    StorageError,
     sync_file,
     sync_report_inboxes,
     utc_now,
     write_state,
 )
-
 
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
 MAX_TERMINAL_JOBS = 1000
@@ -168,8 +170,10 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
     cwd = Path(str(spec["cwd"]))
     if not cwd.is_absolute():
         raise ValueError("cwd must be absolute")
+    project_id = normalize_project_id(spec.get("project_id"))
     job = {
         "id": str(spec["job_id"]),
+        "project_id": project_id,
         "name": str(spec["name"]),
         "state": "queued",
         "submitted_at": str(spec["submitted_at"]),
@@ -294,6 +298,9 @@ def emit(
         job_id = str(job["id"])
     if job_id is not None:
         event["job_id"] = job_id
+        authoritative = job or state.get("jobs", {}).get(job_id)
+        if isinstance(authoritative, dict):
+            event["project_id"] = job_project(authoritative)
     if job is not None:
         # Complete images let a missing or stale snapshot be rebuilt.
         event["job"] = copy.deepcopy(job)
@@ -347,6 +354,9 @@ def compact_journal(
         reverse=True,
     )
     archived_counts = controller.state.setdefault("archived_counts", {})
+    archived_project_counts = controller.state.setdefault(
+        "archived_project_counts", {}
+    )
     retain_count = len(terminal) if max_terminal_jobs < 0 else max_terminal_jobs
     remaining = len(terminal)
     for job in reversed(terminal):
@@ -369,6 +379,8 @@ def compact_journal(
             continue
         state_name = str(job.get("state", "unknown"))
         archived_counts[state_name] = int(archived_counts.get(state_name, 0)) + 1
+        project_counts = archived_project_counts.setdefault(job_project(job), {})
+        project_counts[state_name] = int(project_counts.get(state_name, 0)) + 1
         del controller.state["jobs"][job["id"]]
         remaining -= 1
     controller.state["archived_jobs"] = sum(
@@ -423,6 +435,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "next_queue_order": 0,
                 "archived_jobs": 0,
                 "archived_counts": {},
+                "archived_project_counts": {},
                 "draining": False,
                 "drain_requested": False,
                 "updated_at": utc_now(),
@@ -487,5 +500,10 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     )
     state.setdefault("archived_jobs", 0)
     state.setdefault("archived_counts", {})
+    if "archived_project_counts" not in state:
+        # Every archive created before projects existed belongs to default.
+        state["archived_project_counts"] = {
+            DEFAULT_PROJECT: copy.deepcopy(state["archived_counts"])
+        }
     state.setdefault("drain_requested", False)
     return state

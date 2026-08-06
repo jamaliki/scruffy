@@ -13,6 +13,7 @@ from unittest import mock
 from scruffy.mcp_server import (
     compact_event,
     compact_explanation,
+    dispatch_tool,
     event_matches,
     wait_for_updates,
 )
@@ -66,9 +67,12 @@ def _commit(
     return state
 
 
-def _job(job_id: str, state: str = "running") -> dict:
+def _job(
+    job_id: str, state: str = "running", project_id: str = "default"
+) -> dict:
     return {
         "id": job_id,
+        "project_id": project_id,
         "name": "training",
         "state": state,
         "workflow_id": "workflow-1",
@@ -138,7 +142,9 @@ class ProjectionTests(unittest.TestCase):
                 job_ids={"job-1"},
             )
         )
-        self.assertFalse(event_matches(event, snapshot, workflow_id="other", job_ids={"job-1"}))
+        self.assertFalse(
+            event_matches(event, snapshot, workflow_id="other", job_ids={"job-1"})
+        )
         self.assertFalse(event_matches(event, snapshot, job_ids={"job-2"}))
         self.assertTrue(
             event_matches(
@@ -146,6 +152,25 @@ class ProjectionTests(unittest.TestCase):
                 snapshot,
                 workflow_id="other",
                 job_ids={"job-2"},
+            )
+        )
+
+    def test_project_scope_rejects_other_jobs_but_keeps_global_events(self) -> None:
+        job = _job("job-1", project_id="project-b")
+        snapshot = {"jobs": {"job-1": job}}
+
+        self.assertFalse(
+            event_matches(
+                {"kind": "job.running", "job_id": "job-1", "job": job},
+                snapshot,
+                project_id="project-a",
+            )
+        )
+        self.assertTrue(
+            event_matches(
+                {"kind": "allocation.draining"},
+                snapshot,
+                project_id="project-a",
             )
         )
 
@@ -215,6 +240,51 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([1], [event["seq"] for event in first["events"]])
         self.assertEqual(first["events"], second["events"])
         self.assertEqual(first["next_cursor"], second["next_cursor"])
+
+    async def test_project_wait_only_returns_its_own_jobs(self) -> None:
+        other = self.event(1, "job.running", "job-other")
+        other["project_id"] = "project-b"
+        selected = self.event(2, "job.running", "job-selected")
+        selected["project_id"] = "project-a"
+        _commit(
+            self.root,
+            [other, selected],
+            jobs={
+                "job-other": _job("job-other", project_id="project-b"),
+                "job-selected": _job("job-selected", project_id="project-a"),
+            },
+        )
+
+        result = await wait_for_updates(
+            self.root,
+            after="0",
+            timeout_seconds=0,
+            project_id="project-a",
+        )
+
+        self.assertEqual(["job-selected"], [event["job_id"] for event in result["events"]])
+
+    async def test_forwarded_project_pins_overview_and_inspection(self) -> None:
+        _commit(
+            self.root,
+            [],
+            jobs={
+                "job-a": _job("job-a", project_id="project-a"),
+                "job-b": _job("job-b", project_id="project-b"),
+            },
+        )
+
+        overview = await dispatch_tool(
+            self.root, "overview", {"_project_id": "project-a"}
+        )
+
+        self.assertEqual(["job-a"], [job["id"] for job in overview["active"]])
+        with self.assertRaises(KeyError):
+            await dispatch_tool(
+                self.root,
+                "inspect_job",
+                {"_project_id": "project-a", "job_id": "job-b"},
+            )
 
     async def test_stale_cursor_returns_authoritative_overview(self) -> None:
         _commit(self.root, [], jobs={"job-1": _job("job-1")})

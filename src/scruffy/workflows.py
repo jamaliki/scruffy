@@ -11,11 +11,10 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 
-from .models import TERMINAL_JOB_STATES
-
+from .models import TERMINAL_JOB_STATES, job_project
 
 Job = Mapping[str, object]
-TaskKey = tuple[str, str]
+TaskKey = tuple[str, str, str]
 Need = tuple[str, str]
 
 DEPENDENCY_CONDITIONS = frozenset({"succeeded", "terminal"})
@@ -50,6 +49,7 @@ def _identity(job: Job, label: str) -> TaskKey | None:
     if not has_workflow:
         return None
     return (
+        job_project(job),
         _identifier(job["workflow_id"], f"{label}.workflow_id"),
         _task_id(job["task_id"], f"{label}.task_id"),
     )
@@ -100,14 +100,14 @@ def _validate_cycles(needs: Mapping[TaskKey, tuple[Need, ...]]) -> tuple[TaskKey
     # Missing tasks are allowed while a workflow is being submitted piecemeal.
     # They cannot participate in a cycle until their task request exists.
     indegree = {
-        key: sum((key[0], task_id) in needs for task_id, _ in dependencies)
+        key: sum((key[0], key[1], task_id) in needs for task_id, _ in dependencies)
         for key, dependencies in needs.items()
     }
     dependents: dict[TaskKey, list[TaskKey]] = {key: [] for key in needs}
     for key, dependencies in needs.items():
-        workflow_id, _ = key
+        project_id, workflow_id, _ = key
         for dependency_id, _ in dependencies:
-            dependency_key = (workflow_id, dependency_id)
+            dependency_key = (project_id, workflow_id, dependency_id)
             if dependency_key in dependents:
                 dependents[dependency_key].append(key)
 
@@ -123,7 +123,10 @@ def _validate_cycles(needs: Mapping[TaskKey, tuple[Need, ...]]) -> tuple[TaskKey
 
     if len(ordered) != len(needs):
         cyclic = sorted(key for key, count in indegree.items() if count > 0)
-        details = ", ".join(f"{workflow_id}/{task_id}" for workflow_id, task_id in cyclic)
+        details = ", ".join(
+            f"{project_id}/{workflow_id}/{task_id}"
+            for project_id, workflow_id, task_id in cyclic
+        )
         raise WorkflowError(f"dependency cycle involving: {details}")
     return tuple(ordered)
 
@@ -132,11 +135,12 @@ def _validate_self_dependencies(
     needs: Mapping[TaskKey, tuple[Need, ...]],
 ) -> None:
     for key, dependencies in needs.items():
-        workflow_id, task_id = key
+        project_id, workflow_id, task_id = key
         for dependency_id, _ in dependencies:
             if dependency_id == task_id:
                 raise WorkflowError(
-                    f"task {workflow_id!r}/{task_id!r} cannot depend on itself"
+                    f"task {project_id!r}/{workflow_id!r}/{task_id!r} "
+                    "cannot depend on itself"
                 )
 
 
@@ -162,9 +166,10 @@ def _validated_graph(
                 )
             continue
         if key in by_key:
-            workflow_id, task_id = key
+            project_id, workflow_id, task_id = key
             raise WorkflowError(
-                f"duplicate task_id {task_id!r} in workflow {workflow_id!r}"
+                f"duplicate task_id {task_id!r} in workflow {workflow_id!r} "
+                f"for project {project_id!r}"
             )
         by_key[key] = job
         # Once an admitted task has crossed its dependency gate, historical
@@ -224,7 +229,7 @@ def select_task_attempts(jobs: Iterable[Job]) -> dict[TaskKey, Job]:
             or ":" in task_id
         ):
             continue
-        key = (workflow_id, task_id)
+        key = (job_project(job), workflow_id, task_id)
         if job.get("workflow_invalid"):
             if key not in valid:
                 selected[key] = job
@@ -240,10 +245,10 @@ def _blockers(
     needs: Mapping[TaskKey, tuple[Need, ...]],
     states: Mapping[TaskKey, object] | None = None,
 ) -> list[dict[str, object]]:
-    workflow_id, _ = key
+    project_id, workflow_id, _ = key
     blockers: list[dict[str, object]] = []
     for task_id, condition in needs[key]:
-        dependency_key = (workflow_id, task_id)
+        dependency_key = (project_id, workflow_id, task_id)
         dependency = by_key.get(dependency_key)
         if dependency is None:
             blockers.append(
@@ -290,7 +295,7 @@ def _target_key(job: Job, by_key: Mapping[TaskKey, Job]) -> TaskKey | None:
         return None
     if key not in by_key:
         raise WorkflowError(
-            f"task {key[0]!r}/{key[1]!r} is not present in jobs"
+            f"task {key[0]!r}/{key[1]!r}/{key[2]!r} is not present in jobs"
         )
     return key
 

@@ -7,9 +7,9 @@ to-test transformation of these values.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
-
 
 JsonObject = Mapping[str, object]
 
@@ -17,10 +17,31 @@ ACTIVE_JOB_STATES = frozenset({"starting", "running", "finishing", "cancelling"}
 TERMINAL_JOB_STATES = frozenset(
     {"succeeded", "failed", "cancelled", "lost", "rejected", "skipped"}
 )
+DEFAULT_PROJECT = "default"
+_PROJECT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 
 class ModelError(ValueError):
     """Raised when persisted or programmatic model data is invalid."""
+
+
+def normalize_project_id(value: object | None = None) -> str:
+    """Return a small, filesystem-safe project name; missing means default."""
+
+    if value is None:
+        return DEFAULT_PROJECT
+    if not isinstance(value, str) or _PROJECT_PATTERN.fullmatch(value) is None:
+        raise ModelError(
+            "project_id must be 1-64 letters, digits, '.', '_' or '-', "
+            "starting with a letter or digit"
+        )
+    return value
+
+
+def job_project(job: Mapping[str, object]) -> str:
+    """Read a job's project while treating legacy records as ``default``."""
+
+    return normalize_project_id(job.get("project_id"))
 
 
 def _mapping(value: object, label: str) -> JsonObject:

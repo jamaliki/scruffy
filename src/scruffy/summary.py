@@ -6,7 +6,13 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
-from .models import ACTIVE_JOB_STATES, TERMINAL_JOB_STATES
+from .models import (
+    ACTIVE_JOB_STATES,
+    DEFAULT_PROJECT,
+    TERMINAL_JOB_STATES,
+    job_project,
+    normalize_project_id,
+)
 from .workflows import select_task_attempts
 
 ATTENTION_STATES = {"failed", "lost", "rejected", "skipped"}
@@ -31,6 +37,7 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
     progress_age = max(0.0, (current - updated).total_seconds()) if updated else None
     return {
         "id": job["id"],
+        "project_id": job_project(job),
         "name": job.get("name"),
         "state": job.get("state"),
         "reason": job.get("reason"),
@@ -65,19 +72,40 @@ def _recent_key(job: dict[str, Any]) -> str:
 
 
 def build_summary(
-    state: dict[str, Any], *, now: datetime | None = None, limit: int = 20
+    state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    limit: int = 20,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Return a bounded, action-oriented view without mutating queue state."""
 
     if limit <= 0:
         raise ValueError("summary limit must be positive")
     current = now or datetime.now(timezone.utc)
-    jobs = list(state.get("jobs", {}).values())
+    selected_project = (
+        normalize_project_id(project_id) if project_id is not None else None
+    )
+    jobs = [
+        job
+        for job in state.get("jobs", {}).values()
+        if selected_project is None or job_project(job) == selected_project
+    ]
     counts = Counter(str(job.get("state", "unknown")) for job in jobs)
+    if selected_project is None:
+        archived_counts = state.get("archived_counts", {})
+    else:
+        by_project = state.get("archived_project_counts")
+        if isinstance(by_project, dict):
+            archived_counts = by_project.get(selected_project, {})
+        elif selected_project == DEFAULT_PROJECT:
+            archived_counts = state.get("archived_counts", {})
+        else:
+            archived_counts = {}
     counts.update(
         {
             str(name): int(count)
-            for name, count in state.get("archived_counts", {}).items()
+            for name, count in archived_counts.items()
         }
     )
     submitted_jobs = sorted(
@@ -128,12 +156,13 @@ def build_summary(
     return {
         "v": 1,
         "queue_id": identity,
+        "project_id": selected_project,
         "as_of_cursor": cursor,
         "allocation": state.get("allocation"),
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
         "counts": dict(sorted(counts.items())),
-        "archived_jobs": int(state.get("archived_jobs", 0)),
+        "archived_jobs": sum(int(count) for count in archived_counts.values()),
         "nodes": state.get("nodes", {}),
         "submitted": submitted[:limit],
         "active": active[:limit],
@@ -164,7 +193,9 @@ def explain_job(state: dict[str, Any], job_id: str) -> dict[str, Any]:
     for need in job.get("needs") or []:
         if not isinstance(need, dict):
             continue
-        upstream = by_task.get((job.get("workflow_id"), need.get("task_id")))
+        upstream = by_task.get(
+            (job_project(job), job.get("workflow_id"), need.get("task_id"))
+        )
         dependencies.append(
             {
                 **need,

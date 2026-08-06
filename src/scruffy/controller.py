@@ -18,9 +18,12 @@ from .lifecycle import (
 )
 from .models import (
     ACTIVE_JOB_STATES,
+    DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
     NodeInventory,
     ResourceRequest,
+    job_project,
+    normalize_project_id,
     validate_inventory,
 )
 from .protocol import validate_event
@@ -29,38 +32,38 @@ from .scheduler import request_can_ever_fit
 from .slurm import allocation_metadata
 from .state import (
     apply_workload_event,
-    compact_journal,
     commit_snapshot,
+    compact_journal,
     emit,
     job_from_spec,
     load_recovered_state,
 )
 from .storage import (
+    StorageError,
+    TransientStorageError,
+    UnsafeRecovery,
     accept_known_requests,
-    accept_request,
     accept_reports,
+    accept_request,
     compact_report_receipts,
     controller_lock,
     ensure_layout,
     find_archived_job,
-    list_commands,
+    job_identity_digest,
     list_archived_workflow,
+    list_commands,
     list_reports,
     list_requests,
     open_journal,
     read_events,
     reject_request,
-    report_identity_digest,
-    report_was_accepted,
-    report_streams,
-    request_pending,
-    remove_command,
     remove_cold_job_directories,
-    StorageError,
-    TransientStorageError,
-    UnsafeRecovery,
+    remove_command,
+    report_identity_digest,
+    report_streams,
+    report_was_accepted,
+    request_pending,
     utc_now,
-    job_identity_digest,
 )
 from .workflows import (
     WorkflowError,
@@ -69,7 +72,6 @@ from .workflows import (
     select_task_attempts,
     validate_workflows,
 )
-
 
 MAX_REPORTS_PER_TICK = 128
 COMMAND_OUTCOME_KINDS = {
@@ -180,8 +182,13 @@ def _initialize_controller(
 def _rejected_job(
     spec: dict[str, Any], queue_order: int, job_id: str, exc: Exception
 ) -> dict[str, Any]:
+    try:
+        project_id = normalize_project_id(spec.get("project_id"))
+    except ValueError:
+        project_id = DEFAULT_PROJECT
     job = {
         "id": job_id or f"invalid-{queue_order}",
+        "project_id": project_id,
         "name": str(spec.get("name", "invalid")),
         "state": "rejected",
         "submitted_at": str(spec.get("submitted_at", utc_now())),
@@ -217,14 +224,14 @@ def _mark_workflow_rejected(job: dict[str, Any], exc: Exception) -> None:
 
 
 def _resolution_workflow_jobs(
-    jobs: Iterable[dict[str, Any]], workflow_id: str
+    jobs: Iterable[dict[str, Any]], project_id: str, workflow_id: str
 ) -> list[dict[str, Any]]:
     """Select one workflow, removing invalid edges from rejected task records."""
 
     selected = select_task_attempts(jobs)
     resolution_jobs = []
-    for (candidate_workflow, _), candidate in selected.items():
-        if candidate_workflow != workflow_id:
+    for (candidate_project, candidate_workflow, _), candidate in selected.items():
+        if candidate_project != project_id or candidate_workflow != workflow_id:
             continue
         if candidate.get("workflow_invalid"):
             candidate = {**candidate, "needs": []}
@@ -250,7 +257,7 @@ def _storage_notice(
 
 
 def _archived_workflow_jobs(
-    controller: Controller, workflow_id: str
+    controller: Controller, project_id: str, workflow_id: str
 ) -> list[dict[str, Any]] | None:
     """Load a workflow archive while surfacing only the bad entries."""
 
@@ -258,12 +265,15 @@ def _archived_workflow_jobs(
         return list_archived_workflow(
             controller.root,
             workflow_id,
+            project_id=project_id,
             on_error=lambda source, exc: _storage_notice(
                 controller, "read_workflow_archive", source.name, exc
             ),
         )
     except TransientStorageError as exc:
-        _storage_notice(controller, "read_workflow_archive", workflow_id, exc)
+        _storage_notice(
+            controller, "read_workflow_archive", f"{project_id}/{workflow_id}", exc
+        )
         return None
 
 
@@ -290,8 +300,11 @@ def _stage_job(
 
     workflow_id = job.get("workflow_id")
     task_id = job.get("task_id")
+    project_id = job_project(job)
     duplicate = (
-        select_task_attempts(prospective.values()).get((workflow_id, task_id))
+        select_task_attempts(prospective.values()).get(
+            (project_id, workflow_id, task_id)
+        )
         if isinstance(workflow_id, str) and isinstance(task_id, str)
         else None
     )
@@ -317,7 +330,7 @@ def _stage_job(
         candidates = [
             candidate
             for candidate in _resolution_workflow_jobs(
-                prospective.values(), workflow_id
+                prospective.values(), project_id, workflow_id
             )
             if candidate.get("task_id") != task_id
         ]
@@ -353,7 +366,7 @@ def _admit_job(
         return
 
     workflow_jobs = _resolution_workflow_jobs(
-        prospective.values(), job["workflow_id"]
+        prospective.values(), job_project(job), job["workflow_id"]
     )
     resolution = resolve_dependencies(job, workflow_jobs)
     job["blockers"] = resolution["blockers"]
@@ -438,16 +451,19 @@ def _ingest_requests(controller: Controller) -> None:
     # dependency decision, and a crash could make that task runnable.
     staged: list[tuple[dict[str, Any], bool]] = []
     prospective: dict[str, dict[str, Any]] = {}
-    workflow_ids = {
-        str(spec["workflow_id"])
-        for _, spec in requests
-        if spec is not None and isinstance(spec.get("workflow_id"), str)
-    }
-    deferred_workflows: set[str] = set()
-    for workflow_id in workflow_ids:
-        archived = _archived_workflow_jobs(controller, workflow_id)
+    workflow_keys: set[tuple[str, str]] = set()
+    for _, spec in requests:
+        if spec is None or not isinstance(spec.get("workflow_id"), str):
+            continue
+        try:
+            workflow_keys.add((job_project(spec), str(spec["workflow_id"])))
+        except ValueError:
+            continue
+    deferred_workflows: set[tuple[str, str]] = set()
+    for project_id, workflow_id in workflow_keys:
+        archived = _archived_workflow_jobs(controller, project_id, workflow_id)
         if archived is None:
-            deferred_workflows.add(workflow_id)
+            deferred_workflows.add((project_id, workflow_id))
             continue
         prospective.update(
             {
@@ -459,8 +475,13 @@ def _ingest_requests(controller: Controller) -> None:
     for request_id, spec in requests:
         if request_id in prospective:
             continue
-        if spec is not None and spec.get("workflow_id") in deferred_workflows:
-            continue
+        if spec is not None and isinstance(spec.get("workflow_id"), str):
+            try:
+                workflow_key = (job_project(spec), str(spec["workflow_id"]))
+            except ValueError:
+                workflow_key = None
+            if workflow_key in deferred_workflows:
+                continue
         next_order += 1
         job, malformed_identity = _stage_request(
             request_id, spec, next_order, prospective
@@ -477,28 +498,29 @@ def _ingest_requests(controller: Controller) -> None:
 def _workflow_groups(
     jobs: dict[str, dict[str, Any]],
 ) -> tuple[
-    dict[str, list[dict[str, Any]]],
-    dict[str, list[dict[str, Any]]],
-    dict[str, tuple[tuple[str, object], ...]],
+    dict[tuple[str, str], list[dict[str, Any]]],
+    dict[tuple[str, str], list[dict[str, Any]]],
+    dict[tuple[str, str], tuple[tuple[str, object], ...]],
 ]:
     """Group jobs and cheap change signatures in one allocation-wide scan."""
 
-    workflows: dict[str, list[dict[str, Any]]] = {}
-    blocked: dict[str, list[dict[str, Any]]] = {}
-    signatures: dict[str, list[tuple[str, object]]] = {}
+    workflows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    blocked: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    signatures: dict[tuple[str, str], list[tuple[str, object]]] = {}
     for job in jobs.values():
         workflow_id = job.get("workflow_id")
         task_id = job.get("task_id")
         if not isinstance(workflow_id, str) or not isinstance(task_id, str):
             continue
-        signatures.setdefault(workflow_id, []).append((job["id"], job.get("state")))
-        workflows.setdefault(workflow_id, []).append(job)
+        workflow_key = (job_project(job), workflow_id)
+        signatures.setdefault(workflow_key, []).append((job["id"], job.get("state")))
+        workflows.setdefault(workflow_key, []).append(job)
         if job.get("state") == "blocked" and not job.get("workflow_invalid"):
-            blocked.setdefault(workflow_id, []).append(job)
+            blocked.setdefault(workflow_key, []).append(job)
     return (
         workflows,
         blocked,
-        {workflow_id: tuple(items) for workflow_id, items in signatures.items()},
+        {workflow_key: tuple(items) for workflow_key, items in signatures.items()},
     )
 
 
@@ -512,30 +534,32 @@ def _refresh_dependencies(controller: Controller) -> None:
         list(signatures)
         if previous is None
         else [
-            workflow_id
-            for workflow_id, signature in signatures.items()
-            if previous.get(workflow_id) != signature
+            workflow_key
+            for workflow_key, signature in signatures.items()
+            if previous.get(workflow_key) != signature
         ]
     )
     if not dirty:
         controller.workflow_signatures = signatures
         return
 
-    retry_invalid: set[str] = set()
-    for workflow_id in dirty:
-        blocked_jobs = blocked_by_workflow.get(workflow_id, [])
+    retry_invalid: set[tuple[str, str]] = set()
+    for workflow_key in dirty:
+        project_id, workflow_id = workflow_key
+        blocked_jobs = blocked_by_workflow.get(workflow_key, [])
         if not blocked_jobs:
             continue
-        archived = _archived_workflow_jobs(controller, workflow_id)
+        archived = _archived_workflow_jobs(controller, project_id, workflow_id)
         if archived is None:
-            retry_invalid.add(workflow_id)
+            retry_invalid.add(workflow_key)
             continue
         try:
             resolution_jobs = _resolution_workflow_jobs(
                 [
                     *archived,
-                    *workflows[workflow_id],
+                    *workflows[workflow_key],
                 ],
+                project_id,
                 workflow_id,
             )
             resolutions = resolve_blocked_jobs(resolution_jobs)
@@ -545,11 +569,11 @@ def _refresh_dependencies(controller: Controller) -> None:
             job = blocked_jobs[0]
             _mark_workflow_rejected(job, exc)
             emit(controller, "job.rejected", job=job)
-            retry_invalid.add(workflow_id)
+            retry_invalid.add(workflow_key)
             continue
 
         jobs_by_key = {
-            (workflow_id, job["task_id"]): job for job in blocked_jobs
+            (project_id, workflow_id, job["task_id"]): job for job in blocked_jobs
         }
         # The batch resolver returns topological order, so predicted upstream
         # queued/skipped states become real before dependent events are emitted.
@@ -577,9 +601,9 @@ def _refresh_dependencies(controller: Controller) -> None:
     # revalidate every blocked graph in the allocation.
     _, _, current = _workflow_groups(jobs)
     controller.workflow_signatures = {
-        workflow_id: signature
-        for workflow_id, signature in current.items()
-        if workflow_id not in retry_invalid
+        workflow_key: signature
+        for workflow_key, signature in current.items()
+        if workflow_key not in retry_invalid
     }
 
 

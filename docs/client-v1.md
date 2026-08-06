@@ -23,6 +23,11 @@ All operations use `--root ROOT` or `SCRUFFY_ROOT`. Every participant must see
 that directory at the same absolute path. CLI commands emit JSON except `logs`
 and `observe --follow`, which are streaming interfaces.
 
+Submission, full-state views, summaries, explanations, and observations accept
+a project selector through `--project`, `SCRUFFY_PROJECT`, or the Python
+`project_id` argument. Submission defaults to `default`; read operations remain
+allocation-wide when no project is selected.
+
 ## Job states
 
 | State | Meaning | Holds resources | Terminal |
@@ -54,6 +59,7 @@ set described under Retention.
 Important hot-job fields are:
 
 - `id`, `name`, `state`, and `submitted_at`.
+- `project_id`, with legacy records normalized to `default`.
 - `request` and, while resources are held, `assignment`.
 - `started_at`, `finished_at`, `exit_code`, `signal`, `reason`, and `error`.
 - Optional `workflow_id`, `task_id`, `needs`, and `blockers`.
@@ -79,6 +85,7 @@ A successful submission returns:
 ```json
 {
   "job_id": "job-...",
+  "project_id": "koochak",
   "state": "submitted",
   "deduplicated": false
 }
@@ -90,7 +97,7 @@ identity receipt was found; `state: "submitted"` is an acknowledgement, not the
 job's current lifecycle state. Query `status` when that distinction matters.
 Submission never waits for admission, dependencies, earlier jobs, or startup.
 
-`request_id` is an idempotency key scoped to the queue. Reusing it with an
+`request_id` is an idempotency key scoped to the project. Reusing it with an
 identical specification returns the same job ID with `deduplicated: true`.
 Reusing it with a different specification raises `ConflictError`. Omitting it
 creates a new job on every call. Its exact identity digest is retained in the
@@ -104,8 +111,9 @@ directory, are rejected and permanently consume that ID.
 CLI resource defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per
 GPU. Python callers provide an explicit `ResourceRequest`.
 
-Workflow task IDs cannot contain `:`. A succeeded task identity remains unique
-for the workflow. A terminal non-success attempt (`failed`, `cancelled`, `lost`,
+Workflow identity is `(project_id, workflow_id, task_id)`; dependencies only
+resolve inside that project. Task IDs cannot contain `:`. A succeeded task
+identity remains unique for the workflow and project. A terminal non-success attempt (`failed`, `cancelled`, `lost`,
 `rejected`, or `skipped`) may be replaced by a new job using the same
 `workflow_id` and `task_id` with a new `request_id`. Resolution and explanation
 use the newest valid attempt. Scruffy does not retry skipped dependants
@@ -149,13 +157,19 @@ an initial snapshot followed by events as JSON Lines. It emits another snapshot
 after a cursor reset. Use one-shot observation when the caller must persist
 resumable state.
 
+A project-filtered observer receives job events only for that project, while
+allocation-wide events remain visible. Its cursor still advances over every
+suppressed global-journal record, so unrelated project traffic is not replayed.
+Node capacity and free resources remain allocation-wide.
+
 ## Journal events
 
 Controller events contain these common fields:
 
 - `v`, `queue_id`, `seq`, `event_id`, `kind`, and `allocation_id`.
 - `recorded_at`, the controller recording time.
-- Optional `job_id`, complete `job` image, and event-specific `data`.
+- Optional `job_id`, its authoritative `project_id`, complete `job` image, and
+  event-specific `data`.
 
 Lifecycle kinds use `allocation.*` and `job.*`. A `job.output` event has this
 `data` object:

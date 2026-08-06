@@ -8,7 +8,9 @@ canonical response, state, cursor, and exit-code contract is
 
 When the Scruffy MCP tools are available, use this loop:
 
-1. Call `overview` and save its `as_of_cursor` privately.
+1. Call `overview`, verify its `project_id`, and save its `as_of_cursor`
+   privately. A project-specific agent should use an MCP server pinned with
+   `scruffy-mcp --project PROJECT`.
 2. Submit jobs through the existing CLI or Python API without waiting.
 3. Call `wait_for_updates` with that cursor instead of calling `sleep`.
 4. Replace the cursor with every returned `next_cursor`, including on timeout.
@@ -24,6 +26,7 @@ Without MCP, use the equivalent CLI loop:
 
 ```bash
 export SCRUFFY_ROOT=/shared/run/scruffy
+export SCRUFFY_PROJECT=koochak
 
 # 1. Orient and save the returned as_of_cursor.
 scruffy summary --limit 20
@@ -50,7 +53,10 @@ agents; reading does not consume events for anyone else. Use
 
 ## Rules
 
-- Use a stable, queue-wide `request_id` for every retryable submission. A useful
+- Choose one project for the task and keep `SCRUFFY_PROJECT` fixed. A project
+  scopes request and workflow identities plus monitoring; it does not reserve
+  resources or provide security. Omit it only for allocation-wide operations.
+- Use a stable, project-local `request_id` for every retryable submission. A useful
   convention is `<agent>/<campaign>/<task>/<attempt>`. Identical reuse is safe;
   different reuse raises `ConflictError`. This exact identity survives detailed
   job eviction through a compact archive receipt.
@@ -62,7 +68,8 @@ agents; reading does not consume events for anyone else. Use
   selected worker nodes.
 - Workflow tasks use `--workflow-id`, `--task-id`, and repeated
   `--needs TASK[:succeeded|terminal]`. Dependencies may be submitted later by
-  another agent. Task IDs cannot contain `:`. A succeeded task identity is
+  another agent in the same project; they never resolve across projects. Task
+  IDs cannot contain `:`. A succeeded task identity is
   final; after any other terminal result, retry it with a new `request_id` in
   the same workflow.
 - Prefer `summary` for bounded orientation, `explain` for one dependency chain,
@@ -92,8 +99,8 @@ agents; reading does not consume events for anyone else. Use
   submitted through Scruffy; do not launch out-of-band work on its inventory.
 - `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
   every node. Lustre `localflock` is not sufficient for a multi-node queue.
-- `SCRUFFY_ROOT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE` are
-  controller-owned inside a worker.
+- `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and
+  `SCRUFFY_NODE` are controller-owned inside a worker.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.

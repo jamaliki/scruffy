@@ -59,7 +59,9 @@ read error leaves the report pending for a later controller poll.
 
 The controller validates and sequences a report, then adds its queue identity,
 allocation identity, global sequence, recording timestamp, canonical event ID,
-and the original `event_id` as `source_event_id`. Every observer has an
+the authoritative job `project_id`, and the original `event_id` as
+`source_event_id`. The project is derived from the admitted job; producers
+cannot choose or change it. Every observer has an
 independent cursor; reading never consumes an event for another observer.
 Every accepted report is preserved in the retained journal generations, while
 the bounded current projection compares producer timestamps and does not let a

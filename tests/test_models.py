@@ -11,11 +11,19 @@ from scruffy.models import (
     NodeReservation,
     QueuedJob,
     ResourceRequest,
+    normalize_project_id,
     validate_inventory,
 )
 
 
 class ModelTests(unittest.TestCase):
+    def test_project_ids_are_small_safe_names_and_legacy_defaults(self) -> None:
+        self.assertEqual("default", normalize_project_id())
+        self.assertEqual("koochak.train-1", normalize_project_id("koochak.train-1"))
+        for value in ("", " project", "project/name", "x" * 65):
+            with self.subTest(value=value), self.assertRaises(ModelError):
+                normalize_project_id(value)
+
     def test_node_inventory_is_canonical_and_frozen(self) -> None:
         node = NodeInventory("gpu-0", (3, 1, 2), 112, 2040)
 

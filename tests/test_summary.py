@@ -133,6 +133,31 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual("upstream", result["dependencies"][0]["job_id"])
         self.assertEqual("succeeded", result["dependencies"][0]["state"])
 
+    def test_project_summary_keeps_global_capacity_but_filters_jobs(self) -> None:
+        state = {
+            "queue_id": "queue-test",
+            "last_seq": 3,
+            "journal_offset": 99,
+            "nodes": {"node-a": {"free": {"gpu_ids": [1]}}},
+            "jobs": {
+                "a": {"id": "a", "project_id": "project-a", "state": "running"},
+                "b": {"id": "b", "project_id": "project-b", "state": "failed"},
+            },
+            "archived_counts": {"succeeded": 7},
+            "archived_project_counts": {
+                "project-a": {"succeeded": 2},
+                "project-b": {"succeeded": 5},
+            },
+        }
+
+        result = build_summary(state, project_id="project-a")
+
+        self.assertEqual("project-a", result["project_id"])
+        self.assertEqual({"running": 1, "succeeded": 2}, result["counts"])
+        self.assertEqual(2, result["archived_jobs"])
+        self.assertEqual(state["nodes"], result["nodes"])
+        self.assertEqual(["a"], [job["id"] for job in result["active"]])
+
 
 if __name__ == "__main__":
     unittest.main()

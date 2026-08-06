@@ -15,6 +15,7 @@ from typing import Any
 
 from .client import explain, observe, summary
 from .mcp_gateway import RemoteCall, remote_caller
+from .models import DEFAULT_PROJECT, job_project, normalize_project_id
 from .summary import build_summary, job_view
 
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
@@ -46,6 +47,7 @@ COMPACT_EVENT_FIELDS = (
     "occurred_at",
     "source_event_id",
     "job_id",
+    "project_id",
     "source",
     "data",
 )
@@ -92,6 +94,7 @@ def event_matches(
     workflow_id: str | None = None,
     job_ids: Collection[str] | None = None,
     event_kinds: Collection[str] | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Return whether one event should wake the current observer."""
 
@@ -107,6 +110,13 @@ def event_matches(
     job_id = event.get("job_id")
     if not isinstance(job_id, str):
         return True  # Allocation-wide events matter to every scoped observer.
+    if project_id is not None:
+        event_project = event.get("project_id")
+        if not isinstance(event_project, str):
+            job = _event_job(event, snapshot)
+            event_project = job_project(job) if job is not None else DEFAULT_PROJECT
+        if event_project != project_id:
+            return False
     if job_ids and job_id not in job_ids:
         return False
     if workflow_id is not None:
@@ -161,6 +171,7 @@ async def wait_for_updates(
     workflow_id: str | None = None,
     job_ids: Collection[str] | None = None,
     event_kinds: Collection[str] | None = None,
+    project_id: str | None = None,
     poll_seconds: float = POLL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> dict[str, Any]:
@@ -176,12 +187,25 @@ async def wait_for_updates(
     )
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll_seconds must be positive")
-    cursor = summary(root, limit=1)["as_of_cursor"] if after is None else after
+    selected_project = (
+        normalize_project_id(project_id) if project_id is not None else None
+    )
+    cursor = (
+        summary(root, limit=1, project_id=selected_project)["as_of_cursor"]
+        if after is None
+        else after
+    )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
 
     while True:
-        response = observe(root, after=cursor, include_output=False, limit=PAGE_SIZE)
+        response = observe(
+            root,
+            after=cursor,
+            include_output=False,
+            limit=PAGE_SIZE,
+            project_id=selected_project,
+        )
         cursor = response["next_cursor"]
         if response["reset"]:
             return {
@@ -191,7 +215,9 @@ async def wait_for_updates(
                 "more": False,
                 "reset": True,
                 "timed_out": False,
-                "overview": build_summary(response["snapshot"], limit=20),
+                "overview": build_summary(
+                    response["snapshot"], limit=20, project_id=selected_project
+                ),
             }
         matches = [
             compact_event(event, response["snapshot"])
@@ -202,6 +228,7 @@ async def wait_for_updates(
                 workflow_id=workflow_id,
                 job_ids=selected_jobs,
                 event_kinds=selected_kinds,
+                project_id=selected_project,
             )
         ]
         if matches:
@@ -246,23 +273,38 @@ def _only(params: dict[str, Any], allowed: set[str]) -> None:
         raise ValueError(f"unexpected parameters: {', '.join(unexpected)}")
 
 
-async def dispatch_tool(root: Path, tool: str, params: dict[str, Any]) -> dict[str, Any]:
+async def dispatch_tool(
+    root: Path,
+    tool: str,
+    params: dict[str, Any],
+    *,
+    project_id: str | None = None,
+) -> dict[str, Any]:
     """Execute one validated read-only tool call against a local queue root."""
 
     if not isinstance(params, dict):
         raise TypeError("tool parameters must be a JSON object")
+    params = dict(params)
+    forwarded_project = params.pop("_project_id", None)
+    if forwarded_project is not None:
+        forwarded_project = normalize_project_id(forwarded_project)
+        if project_id is not None and forwarded_project != project_id:
+            raise ValueError("conflicting project scopes")
+        project_id = forwarded_project
+    if project_id is not None:
+        project_id = normalize_project_id(project_id)
     if tool == "overview":
         _only(params, {"limit"})
         limit = params.get("limit", 20)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
-        return summary(root, limit=limit)
+        return summary(root, limit=limit, project_id=project_id)
     if tool == "inspect_job":
         _only(params, {"job_id"})
         job_id = params.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("job_id must not be empty")
-        return compact_explanation(explain(root, job_id))
+        return compact_explanation(explain(root, job_id, project_id=project_id))
     if tool == "wait_for_updates":
         _only(
             params,
@@ -275,13 +317,21 @@ async def dispatch_tool(root: Path, tool: str, params: dict[str, Any]) -> dict[s
             workflow_id=params.get("workflow_id"),
             job_ids=params.get("job_ids"),
             event_kinds=params.get("event_kinds"),
+            project_id=project_id,
         )
     raise ValueError(f"unknown MCP tool {tool!r}")
 
 
-def create_server(root: Path, caller: RemoteCall | None = None) -> Any:
+def create_server(
+    root: Path,
+    caller: RemoteCall | None = None,
+    *,
+    project_id: str | None = None,
+) -> Any:
     """Create the optional FastMCP server bound to one queue root."""
 
+    if project_id is not None:
+        project_id = normalize_project_id(project_id)
     try:
         from mcp.server.fastmcp import FastMCP
     except ModuleNotFoundError as exc:
@@ -289,12 +339,18 @@ def create_server(root: Path, caller: RemoteCall | None = None) -> Any:
             raise
         raise RuntimeError("the MCP extra is not installed; install 'scruffy-gpu[mcp]'") from exc
 
-    server = FastMCP("Scruffy", instructions=SERVER_INSTRUCTIONS, json_response=True)
+    instructions = SERVER_INSTRUCTIONS
+    if project_id is not None:
+        instructions += f"\nThis server is pinned to project {project_id!r}.\n"
+    server = FastMCP("Scruffy", instructions=instructions, json_response=True)
 
     async def call(tool: str, params: dict[str, Any]) -> dict[str, Any]:
         if caller is not None:
-            return await caller(tool, params)
-        return await dispatch_tool(root, tool, params)
+            forwarded = dict(params)
+            if project_id is not None:
+                forwarded["_project_id"] = project_id
+            return await caller(tool, forwarded)
+        return await dispatch_tool(root, tool, params, project_id=project_id)
 
     @server.tool()
     async def overview(limit: int = 20) -> dict[str, Any]:
@@ -347,6 +403,11 @@ def _parser() -> argparse.ArgumentParser:
         help="shared queue root (defaults to SCRUFFY_ROOT)",
     )
     parser.add_argument(
+        "--project",
+        default=os.environ.get("SCRUFFY_PROJECT"),
+        help="pin all tools to one project (defaults to SCRUFFY_PROJECT)",
+    )
+    parser.add_argument(
         "--connect-command",
         help="run locally and invoke each tool through this command, such as tokyo-ssh",
     )
@@ -383,6 +444,14 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if not arguments.root:
         parser.error("set --root or SCRUFFY_ROOT")
+    try:
+        project_id = (
+            normalize_project_id(arguments.project)
+            if arguments.project is not None
+            else None
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     gateway_options = (arguments.connect_command, arguments.remote_command)
     if any(gateway_options) and not all(gateway_options):
         parser.error("--connect-command and --remote-command must be used together")
@@ -412,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         caller = remote_caller(connect_command, remote_command, arguments.root)
     try:
         root = Path(arguments.root) if caller else Path(arguments.root).expanduser().resolve()
-        server = create_server(root, caller)
+        server = create_server(root, caller, project_id=project_id)
     except RuntimeError as exc:
         parser.exit(2, f"scruffy-mcp: {exc}\n")
     server.run(transport="stdio")

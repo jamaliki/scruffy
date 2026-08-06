@@ -16,13 +16,14 @@ from scruffy.storage import (
     RequestConflict,
     TransientStorageError,
     accept_known_requests,
-    accept_request,
     accept_reports,
+    accept_request,
     activate_journal_generation,
     append_event,
     archive_terminal_job,
     compact_report_receipts,
     controller_lock,
+    create_job_id,
     create_journal_generation,
     find_archived_job,
     find_request,
@@ -31,19 +32,18 @@ from scruffy.storage import (
     list_archived_workflow,
     list_reports,
     list_requests,
-    open_journal,
     next_journal_generation,
+    open_journal,
+    prune_report_receipts,
     read_event_page,
     read_events,
     reject_request,
     report_identity_digest,
     report_was_accepted,
-    prune_report_receipts,
     submit_report,
     submit_request,
     tail_bytes,
 )
-
 
 PROCESS_TIMEOUT = 15.0
 
@@ -185,6 +185,13 @@ class StorageTestCase(unittest.TestCase):
 
 
 class SubmitRequestTests(StorageTestCase):
+    def test_request_ids_are_scoped_by_project(self) -> None:
+        self.assertEqual(create_job_id("run-1"), create_job_id("run-1", project_id="default"))
+        self.assertNotEqual(
+            create_job_id("run-1", project_id="project-a"),
+            create_job_id("run-1", project_id="project-b"),
+        )
+
     def test_concurrent_retries_create_one_request(self) -> None:
         specs = [
             _job_spec(
@@ -353,6 +360,42 @@ class SubmitRequestTests(StorageTestCase):
             [item["id"] for item in list_archived_workflow(self.root, "flow-1")],
         )
         self.assertEqual((job["id"], True), submit_request(self.root, spec))
+
+    def test_workflow_archives_are_project_scoped(self) -> None:
+        for project_id in ("project-a", "project-b"):
+            archive_terminal_job(
+                self.root,
+                {
+                    "id": f"job-{project_id}",
+                    "project_id": project_id,
+                    "name": "train",
+                    "state": "succeeded",
+                    "queue_order": 1,
+                    "request_digest": "a" * 64,
+                    "workflow_id": "shared-flow",
+                    "task_id": "train",
+                    "needs": [],
+                },
+            )
+
+        self.assertEqual(
+            ["job-project-a"],
+            [
+                job["id"]
+                for job in list_archived_workflow(
+                    self.root, "shared-flow", project_id="project-a"
+                )
+            ],
+        )
+        self.assertEqual(
+            ["job-project-b"],
+            [
+                job["id"]
+                for job in list_archived_workflow(
+                    self.root, "shared-flow", project_id="project-b"
+                )
+            ],
+        )
 
     def test_legacy_job_without_identity_archives_fail_closed(self) -> None:
         job = {

@@ -25,7 +25,12 @@ from .client import (
     wait_for_job,
 )
 from .controller import run_controller
-from .models import ResourceRequest, TERMINAL_JOB_STATES
+from .models import (
+    DEFAULT_PROJECT,
+    TERMINAL_JOB_STATES,
+    ResourceRequest,
+    normalize_project_id,
+)
 from .protocol import EVENT_KINDS
 from .slurm import discover_slurm_inventory, load_inventory
 from .storage import StorageError, tail_window
@@ -40,6 +45,19 @@ def _root(arguments: argparse.Namespace) -> Path:
     if not value:
         raise ValueError("set --root or SCRUFFY_ROOT")
     return Path(value)
+
+
+def _project(
+    arguments: argparse.Namespace, *, default: str | None = None
+) -> str | None:
+    """Resolve an optional project selector from the CLI or environment."""
+
+    value = getattr(arguments, "project", None)
+    if value is None:
+        value = os.environ.get("SCRUFFY_PROJECT")
+    if value is None:
+        value = default
+    return normalize_project_id(value) if value is not None else None
 
 
 def _environment(values: list[str]) -> dict[str, str]:
@@ -153,6 +171,7 @@ def _submit(arguments: argparse.Namespace) -> int:
         environment=_environment(arguments.env),
         request=request,
         request_id=arguments.request_id,
+        project_id=_project(arguments, default=DEFAULT_PROJECT) or DEFAULT_PROJECT,
         workflow_id=arguments.workflow_id,
         task_id=arguments.task_id,
         needs=_needs(arguments.needs),
@@ -162,17 +181,31 @@ def _submit(arguments: argparse.Namespace) -> int:
 
 
 def _status(arguments: argparse.Namespace) -> int:
-    _json(status(_root(arguments), arguments.job_id))
+    _json(
+        status(
+            _root(arguments),
+            arguments.job_id,
+            project_id=_project(arguments),
+        )
+    )
     return 0
 
 
 def _summary(arguments: argparse.Namespace) -> int:
-    _json(summary(_root(arguments), limit=arguments.limit))
+    _json(
+        summary(
+            _root(arguments), limit=arguments.limit, project_id=_project(arguments)
+        )
+    )
     return 0
 
 
 def _explain(arguments: argparse.Namespace) -> int:
-    _json(explain(_root(arguments), arguments.job_id))
+    _json(
+        explain(
+            _root(arguments), arguments.job_id, project_id=_project(arguments)
+        )
+    )
     return 0
 
 
@@ -207,6 +240,7 @@ def _observe(arguments: argparse.Namespace) -> int:
                 wait_seconds=wait_seconds,
                 include_output=arguments.output,
                 limit=arguments.limit,
+                project_id=_project(arguments),
             )
         )
         return 0
@@ -220,6 +254,7 @@ def _observe(arguments: argparse.Namespace) -> int:
             wait_seconds=wait_seconds,
             include_output=arguments.output,
             limit=arguments.limit,
+            project_id=_project(arguments),
         )
         if first or response["reset"]:
             print(
@@ -383,7 +418,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="worker override",
     )
-    submit.add_argument("--request-id", help="global idempotency key for this queue")
+    submit.add_argument("--project", help="project namespace (or SCRUFFY_PROJECT)")
+    submit.add_argument("--request-id", help="idempotency key within the project")
     submit.add_argument("--workflow-id", help="workflow namespace for this task")
     submit.add_argument("--task-id", help="task name without ':'")
     submit.add_argument(
@@ -398,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = commands.add_parser("status", help="show the queue or one job")
     show.add_argument("job_id", nargs="?", help="omit for the complete queue")
+    show.add_argument("--project", help="show only this project")
     show.set_defaults(handler=_status)
 
     summary_parser = commands.add_parser(
@@ -407,6 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
     summary_parser.add_argument(
         "--limit", type=int, default=20, help="jobs per section (default: 20)"
     )
+    summary_parser.add_argument("--project", help="show only this project")
     summary_parser.set_defaults(handler=_summary)
 
     explain_parser = commands.add_parser(
@@ -414,6 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="explain one job and its dependency states",
     )
     explain_parser.add_argument("job_id", help="job to explain")
+    explain_parser.add_argument("--project", help="require this job's project")
     explain_parser.set_defaults(handler=_explain)
 
     report = commands.add_parser("report", help="publish a semantic workload event")
@@ -463,6 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit snapshot/event JSON lines continuously",
     )
+    observe_parser.add_argument("--project", help="emit only this project's jobs")
     observe_parser.set_defaults(handler=_observe)
 
     logs = commands.add_parser("logs", help="read a job's raw output")

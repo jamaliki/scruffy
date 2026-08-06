@@ -32,23 +32,22 @@ from scruffy.slurm import SlurmStep
 from scruffy.slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
 from scruffy.state import compact_journal, emit, load_recovered_state
 from scruffy.storage import (
+    TransientStorageError,
     append_event,
     archive_terminal_job,
     create_journal_generation,
+    job_directory,
     list_commands,
     list_reports,
     load_state,
-    job_directory,
     open_journal,
     queue_id,
     read_events,
     submit_command,
-    TransientStorageError,
     utc_now,
     write_state,
 )
 from scruffy.workflows import resolve_blocked_jobs
-
 
 REQUEST = ResourceRequest(1, 1, 1, 1)
 
@@ -206,6 +205,7 @@ class RecoverySafetyTests(unittest.TestCase):
             environment={},
             request=REQUEST,
             request_id="retention/train",
+            project_id="retention-project",
             workflow_id="retention-flow",
             task_id="train",
         )
@@ -244,6 +244,10 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertFalse((self.root / "jobs" / train["job_id"]).exists())
         self.assertTrue((self.root / "jobs" / recent["job_id"]).exists())
         self.assertEqual(1, status(self.root)["archived_jobs"])
+        self.assertEqual(
+            {"succeeded": 1},
+            controller.state["archived_project_counts"]["retention-project"],
+        )
 
         infer = submit_job(
             self.root,
@@ -253,6 +257,7 @@ class RecoverySafetyTests(unittest.TestCase):
             environment={},
             request=REQUEST,
             request_id="retention/infer",
+            project_id="retention-project",
             workflow_id="retention-flow",
             task_id="infer",
             needs=({"task_id": "train", "condition": "succeeded"},),

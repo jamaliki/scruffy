@@ -63,6 +63,7 @@ class SubmitCliTests(unittest.TestCase):
                 memory_gb_per_node=384,
             ),
             request_id="agent-a/run-1",
+            project_id="default",
             workflow_id=None,
             task_id=None,
             needs=[],
@@ -102,6 +103,31 @@ class SubmitCliTests(unittest.TestCase):
             ],
             submit.call_args.kwargs["needs"],
         )
+
+    def test_submit_uses_explicit_project_namespace(self) -> None:
+        with (
+            mock.patch(
+                "scruffy.cli.submit_job",
+                return_value={"job_id": "job-1", "state": "submitted"},
+            ) as submit,
+            mock.patch("scruffy.cli._json"),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "submit",
+                    "--project",
+                    "koochak",
+                    "--request-id",
+                    "train-1",
+                    "--",
+                    "true",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual("koochak", submit.call_args.kwargs["project_id"])
 
     def test_submit_rejects_ambiguous_colons_in_task_ids(self) -> None:
         stderr = io.StringIO()

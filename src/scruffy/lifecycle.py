@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .models import Assignment, QueuedJob, ResourceRequest
+from .models import Assignment, QueuedJob, ResourceRequest, job_project
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_oldest_fitting_job
 from .slurm import (
@@ -21,7 +21,6 @@ from .slurm import (
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
 from .state import active_assignments, emit
 from .storage import atomic_write_json, job_directory, utc_now
-
 
 MAX_MESSAGES_PER_TICK = 256
 
@@ -80,6 +79,7 @@ def start_job(
     worker_document = {
         "root": str(controller.root),
         "job_id": job["id"],
+        "project_id": job_project(job),
         "argv": job["argv"],
         "cwd": job["cwd"],
         "env": job["env"],
