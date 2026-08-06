@@ -28,6 +28,7 @@ from scruffy.controller import (
     _report_batch,
 )
 from scruffy.lifecycle import (
+    _launch_arguments,
     begin_shutdown,
     drain_messages,
     poll_processes,
@@ -700,6 +701,35 @@ class LaunchCleanupTests(unittest.TestCase):
         self.assertEqual("launch_failed", job["reason"])
         self.assertIsNone(job["assignment"])
         self.assertIsNotNone(job["last_assignment"])
+
+
+class SlurmLaunchTests(unittest.TestCase):
+    def test_worker_gets_managed_cpu_pool_not_individual_job_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = mock.Mock(
+                inventory=(NodeInventory("gpu-3", (0,), 112, 1024),),
+                launcher="slurm",
+                slurm_job_id="240292",
+            )
+            request = ResourceRequest(1, 1, 14, 128)
+            assigned = Assignment(
+                "job-1",
+                request,
+                (NodeReservation("gpu-3", (0,), 14, 128),),
+            )
+
+            argv, _ = _launch_arguments(
+                controller,
+                {"launch_token": "scruffy-token"},
+                assigned,
+                root / "assignment.json",
+                root / "stdout.log",
+                root / "stderr.log",
+            )
+
+        self.assertIn("--cpus-per-task=112", argv)
+        self.assertEqual(14, assigned.request.cpus_per_node)
 
 
 class AsyncCommandRaceTests(unittest.TestCase):

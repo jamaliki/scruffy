@@ -212,6 +212,10 @@ def build_srun_argv(
     Scruffy deliberately uses ``--overlap`` because the outer allocation owns
     the full GPU pool. Its own per-node ledger selects disjoint GPU IDs, and the
     worker narrows ``CUDA_VISIBLE_DEVICES`` before executing the user command.
+    ``cpus_per_node`` is therefore the managed node capacity, not an individual
+    job's admission budget. Giving every overlapping step the managed CPU pool
+    prevents Slurm from pinning all workers to the same first CPU slice; Scruffy
+    still limits their aggregate requested CPU budget in its scheduler.
     """
 
     if not slurm_job_id:

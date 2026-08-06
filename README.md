@@ -27,8 +27,11 @@ GPU processes against its configured inventory.
 
 GPU IDs are node-local values passed through `CUDA_VISIBLE_DEVICES`. CPU and
 memory values are cooperative admission budgets, not physical isolation. The
-queue trusts every process able to write `SCRUFFY_ROOT`; it is not a multi-user
-security boundary.
+Slurm worker step sees Scruffy's managed node CPU pool so overlapping jobs are
+not all pinned to the same first CPU slice. The workload should still size its
+own workers and thread pools to the CPU budget it requested. Scruffy trusts
+every process able to write `SCRUFFY_ROOT`; it is not a multi-user security
+boundary.
 
 ## Quick start
 
