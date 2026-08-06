@@ -237,7 +237,9 @@ CLI exit conventions are:
 - `1..125` for `wait` on a failed process, derived from its exit code.
 - `2` for invalid input, unknown jobs, conflicts, storage errors, or wait timeout.
 - `130` when Ctrl-C reaches a client command such as `observe --follow`.
-  `serve` handles SIGINT/SIGTERM as a graceful shutdown and returns `0`.
+  `serve` handles SIGINT/SIGTERM as a graceful shutdown and returns `0`. In
+  Slurm mode it leaves worker steps running for the next controller to reattach;
+  replacing the outer allocation still makes unresolved active jobs `lost`.
 
 Python callers should expect `ValueError` for invalid input, `KeyError` for an
 unknown job, `ConflictError` for idempotency-key reuse, and `TimeoutError` from a

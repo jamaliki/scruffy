@@ -16,6 +16,7 @@ from .slurm import (
     build_local_argv,
     build_srun_argv,
     build_srun_environment,
+    completed_step,
     new_step_name,
 )
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
@@ -46,6 +47,8 @@ def _launch_arguments(
     job: dict[str, Any],
     assignment: Assignment,
     assignment_file: Path,
+    stdout_file: Path,
+    stderr_file: Path,
 ) -> tuple[list[str], dict[str, str] | None]:
     if controller.launcher == "slurm":
         return (
@@ -53,6 +56,8 @@ def _launch_arguments(
                 slurm_job_id=controller.slurm_job_id or "",
                 name=job["launch_token"],
                 assignment_file=assignment_file,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
                 node_names=[item.node for item in assignment.reservations],
                 cpus_per_node=assignment.request.cpus_per_node,
                 memory_gb_per_node=assignment.request.memory_gb_per_node,
@@ -76,6 +81,8 @@ def start_job(
 
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
+    stdout_file = directory / "stdout.log"
+    stderr_file = directory / "stderr.log"
     worker_document = {
         "root": str(controller.root),
         "job_id": job["id"],
@@ -88,12 +95,25 @@ def start_job(
     try:
         atomic_write_json(assignment_file, worker_document)
         argv, environment = _launch_arguments(
-            controller, job, assignment, assignment_file
+            controller,
+            job,
+            assignment,
+            assignment_file,
+            stdout_file,
+            stderr_file,
         )
         process = subprocess.Popen(
             argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=(
+                subprocess.DEVNULL
+                if controller.launcher == "slurm"
+                else subprocess.PIPE
+            ),
+            stderr=(
+                subprocess.DEVNULL
+                if controller.launcher == "slurm"
+                else subprocess.PIPE
+            ),
             env=environment,
             start_new_session=True,
         )
@@ -103,8 +123,6 @@ def start_job(
 
     running = RunningProcess(process, job.get("launch_token"))
     controller.running[job["id"]] = running
-    stdout_file = directory / "stdout.log"
-    stderr_file = directory / "stderr.log"
     job.update(
         {
             "pid": process.pid,
@@ -112,21 +130,25 @@ def start_job(
             "stderr": f"jobs/{job['id']}/stderr.log",
         }
     )
-    try:
-        start_readers(
-            running,
-            job_id=job["id"],
-            stdout_file=stdout_file,
-            stderr_file=stderr_file,
-            messages=controller.messages,
-            output=controller.output,
-        )
-    except Exception as exc:
-        running.final_state = "failed"
-        running.final_reason = "launch_failed"
-        job["error"] = str(exc)
-        stop_launcher(controller, running)
-        return
+    if controller.launcher == "slurm":
+        running.closed_streams.update({"stdout", "stderr"})
+        running.output_offsets = {"stdout": 0, "stderr": 0}
+    else:
+        try:
+            start_readers(
+                running,
+                job_id=job["id"],
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                messages=controller.messages,
+                output=controller.output,
+            )
+        except Exception as exc:
+            running.final_state = "failed"
+            running.final_reason = "launch_failed"
+            job["error"] = str(exc)
+            stop_launcher(controller, running)
+            return
 
     # Slurm jobs become running only once reconciliation observes their step.
     if controller.launcher == "local":
@@ -258,12 +280,20 @@ def poll_processes(controller: Controller) -> None:
             controller.launcher == "local"
             and running.cancel_deadline is not None
             and now >= running.cancel_deadline
+            and running.process is not None
             and running.process.poll() is None
         ):
             signal_process(running.process, signal.SIGKILL)
             running.cancel_deadline = None
 
-        returncode = running.process.poll()
+        if controller.launcher == "slurm":
+            _poll_slurm_output(controller, job_id, running)
+        returncode = running.process.poll() if running.process is not None else None
+        pending_returncode = controller.state["jobs"][job_id].get(
+            "pending_returncode"
+        )
+        if returncode is None and isinstance(pending_returncode, int):
+            returncode = pending_returncode
         job = controller.state["jobs"][job_id]
         if returncode is not None and running.exit_seen_at is None:
             running.exit_seen_at = time.monotonic()
@@ -275,6 +305,12 @@ def poll_processes(controller: Controller) -> None:
         slurm_absent = True
         if controller.launcher == "slurm":
             slurm_absent = reconcile_slurm(controller, job, running)
+            if slurm_absent and running.process is None and returncode is None:
+                returncode = _recovered_returncode(controller, job, running)
+                if returncode is None and not job.get("slurm_step_id"):
+                    running.final_state = "lost"
+                    running.final_reason = "controller_recovery_no_step"
+                    returncode = 1
         if (
             returncode is None
             or running.closed_streams != {"stdout", "stderr"}
@@ -288,6 +324,57 @@ def poll_processes(controller: Controller) -> None:
         del controller.running[job_id]
 
 
+def _poll_slurm_output(
+    controller: Controller, job_id: str, running: RunningProcess
+) -> None:
+    """Publish ranges appended by Slurm without reading log contents."""
+
+    for stream_name in ("stdout", "stderr"):
+        source = controller.root / "jobs" / job_id / f"{stream_name}.log"
+        try:
+            size = source.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        previous = min(running.output_offsets.get(stream_name, 0), size)
+        running.output_offsets[stream_name] = size
+        if size > previous:
+            controller.output.record(job_id, stream_name, previous, size - previous)
+
+
+def _recovered_returncode(
+    controller: Controller, job: dict[str, Any], running: RunningProcess
+) -> int | None:
+    """Resolve an attached step through accounting after it leaves live state."""
+
+    snapshot_at = controller.slurm_snapshot_at
+    if running.last_accounting_snapshot_at == snapshot_at:
+        return None
+    running.last_accounting_snapshot_at = snapshot_at
+    try:
+        result = completed_step(str(job["slurm_step_id"]))
+    except Exception as exc:
+        error = str(exc)
+        if job.get("reconciliation_error") != error:
+            job["reconciliation_error"] = error
+            emit(
+                controller,
+                "notice",
+                data={
+                    "source": "slurm_accounting",
+                    "job_id": job["id"],
+                    "error": error,
+                },
+            )
+        return None
+    if result is None:
+        return None
+    job.pop("reconciliation_error", None)
+    job["slurm_state"] = result.state
+    job["pending_returncode"] = result.returncode
+    running.exit_seen_at = time.monotonic()
+    return result.returncode
+
+
 def begin_shutdown(controller: Controller) -> None:
     if controller.stop_announced:
         return
@@ -295,6 +382,8 @@ def begin_shutdown(controller: Controller) -> None:
     controller.state["draining"] = True
     controller.state["allocation"]["state"] = "stopping"
     emit(controller, "allocation.stopping")
+    if controller.launcher == "slurm":
+        return
     for running in controller.running.values():
         if running.final_state is None:
             running.final_state = "lost"

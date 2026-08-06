@@ -48,6 +48,7 @@ def refresh_slurm_snapshot(controller: Controller, now: float) -> None:
     needs_reconciliation = any(
         not controller.state["jobs"][job_id].get("slurm_step_id")
         or running.final_state is not None
+        or running.process is None
         or running.process.poll() is not None
         for job_id, running in controller.running.items()
     )
@@ -134,7 +135,10 @@ def reconcile_slurm(
         return False
 
     _job_error(controller, job, None)
-    if running.exit_seen_at is None or controller.slurm_snapshot_at < running.exit_seen_at:
+    if running.process is not None and (
+        running.exit_seen_at is None
+        or controller.slurm_snapshot_at < running.exit_seen_at
+    ):
         return False
     if running.last_absence_snapshot_at != controller.slurm_snapshot_at:
         running.last_absence_snapshot_at = controller.slurm_snapshot_at

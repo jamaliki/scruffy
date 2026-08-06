@@ -392,7 +392,12 @@ Placement is deterministic best-fit with simple backfilling, but does not
 guarantee fairness for a large queued request. Queued and dependency-blocked jobs
 can survive a replacement allocation. Active jobs from a replaced allocation
 become `lost` and are never retried automatically. Resource assignments remain
-reserved whenever Slurm reconciliation is uncertain.
+reserved whenever Slurm reconciliation is uncertain. On a controller restart
+inside the same Slurm allocation, persisted launch tokens are matched back to
+live steps and their assignments remain owned. Completed reattached steps are
+resolved through Slurm accounting; only a step that Slurm proves absent can
+release its resources. Slurm writes job logs directly to the shared queue root,
+so output does not depend on the lifetime of the original controller process.
 
 The controller deliberately runs one submitted argv per job. It is not a retry
 engine, dynamic workflow fan-out engine, or artifact store: submit retries and

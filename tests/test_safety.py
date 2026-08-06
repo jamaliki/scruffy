@@ -20,7 +20,7 @@ from scruffy.controller import (
     _refresh_dependencies,
     _report_batch,
 )
-from scruffy.lifecycle import drain_messages, poll_processes, start_job
+from scruffy.lifecycle import begin_shutdown, drain_messages, poll_processes, start_job
 from scruffy.models import (
     Assignment,
     NodeInventory,
@@ -28,7 +28,7 @@ from scruffy.models import (
     ResourceRequest,
 )
 from scruffy.runtime import Controller, OutputNotifier, RunningProcess
-from scruffy.slurm import SlurmStep
+from scruffy.slurm import SlurmStep, SlurmStepResult
 from scruffy.slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
 from scruffy.state import compact_journal, emit, load_recovered_state
 from scruffy.storage import (
@@ -104,8 +104,10 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual("old-allocation", state["allocation"]["id"])
         self.assertEqual("succeeded", state["jobs"]["job-replayed"]["state"])
 
-    def test_journal_recovery_still_refuses_same_allocation_relaunch(self) -> None:
+    def test_same_slurm_allocation_reattaches_active_jobs(self) -> None:
         job = job_image("job-active", "gpu-3")
+        job["launch_token"] = "scruffy-token"
+        job["slurm_step_id"] = "240292.7"
         with open_journal(self.root) as journal:
             append_event(
                 journal,
@@ -119,7 +121,36 @@ class RecoverySafetyTests(unittest.TestCase):
                 sync=True,
             )
 
-        with self.assertRaisesRegex(RuntimeError, "unsafe recovery"):
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(controller.journal.close)
+
+        running = controller.running["job-active"]
+        self.assertIsNone(running.process)
+        self.assertEqual("scruffy-token", running.step_name)
+        self.assertEqual("running", controller.state["jobs"]["job-active"]["state"])
+        self.assertIsNotNone(controller.state["jobs"]["job-active"]["assignment"])
+
+    def test_same_slurm_allocation_refuses_job_without_launch_token(self) -> None:
+        state = {
+            "v": 1,
+            "queue_id": queue_id(self.root),
+            "last_seq": 0,
+            "allocation": {"id": "240292"},
+            "nodes": {},
+            "jobs": {"job-active": job_image("job-active", "gpu-3")},
+            "draining": False,
+        }
+        write_state(self.root, state)
+
+        with self.assertRaisesRegex(RuntimeError, "no launch token"):
             _initialize_controller(
                 root=self.root,
                 inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
@@ -1411,6 +1442,41 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
         live.assert_called_once_with("240292")
         self.assertEqual(10, self.controller.slurm_snapshot_at)
 
+    def test_reattached_step_is_polled_until_it_disappears(self) -> None:
+        job = {
+            "id": "job-a",
+            "state": "running",
+            "slurm_step_id": "240292.7",
+            "assignment": None,
+        }
+        self.controller.state["jobs"]["job-a"] = job
+        self.controller.running["job-a"] = RunningProcess(None, "scruffy-token")
+
+        with mock.patch(
+            "scruffy.slurm_runtime.live_steps", return_value=()
+        ) as live:
+            refresh_slurm_snapshot(self.controller, 10)
+
+        live.assert_called_once_with("240292")
+
+    def test_graceful_slurm_stop_leaves_steps_for_the_next_controller(self) -> None:
+        job = {"id": "job-a", "state": "running"}
+        running = RunningProcess(self.process, "scruffy-token")
+        self.controller.state.update(
+            {
+                "allocation": {"id": "240292", "state": "running"},
+                "jobs": {"job-a": job},
+                "draining": False,
+            }
+        )
+        self.controller.running["job-a"] = running
+
+        begin_shutdown(self.controller)
+
+        self.assertIsNone(running.final_state)
+        self.process.send_signal.assert_not_called()
+        self.assertEqual("stopping", self.controller.state["allocation"]["state"])
+
     def test_reconciliation_error_is_visible_and_retries_are_bounded(self) -> None:
         job = {
             "id": "job-a",
@@ -1455,6 +1521,40 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
         self.assertFalse(reconcile_slurm(self.controller, job, self._running()))
 
         self.assertIn("multiple live steps", job["reconciliation_error"])
+
+    def test_reattached_job_finishes_from_slurm_accounting(self) -> None:
+        job = job_image("job-a", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-token",
+                "slurm_step_id": "240292.7",
+                "stdout": "jobs/job-a/stdout.log",
+                "stderr": "jobs/job-a/stderr.log",
+            }
+        )
+        self.controller.state.update(
+            {
+                "allocation": {"id": "240292", "state": "running"},
+                "jobs": {"job-a": job},
+            }
+        )
+        running = RunningProcess(None, "scruffy-token")
+        running.closed_streams.update({"stdout", "stderr"})
+        self.controller.running["job-a"] = running
+        self.controller.slurm_snapshot_at = 10
+        self.controller.slurm_steps = ()
+
+        with (
+            mock.patch("scruffy.lifecycle.refresh_slurm_snapshot"),
+            mock.patch(
+                "scruffy.lifecycle.completed_step",
+                return_value=SlurmStepResult("COMPLETED", 0),
+            ),
+        ):
+            poll_processes(self.controller)
+
+        self.assertEqual("succeeded", job["state"])
+        self.assertNotIn("job-a", self.controller.running)
 
 
 class OutputCoalescingTests(unittest.TestCase):

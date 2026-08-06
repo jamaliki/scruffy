@@ -12,6 +12,7 @@ from scruffy.slurm import (
     build_srun_argv,
     build_srun_environment,
     cancel_step,
+    completed_step,
     discover_slurm_inventory,
     live_steps,
     load_inventory,
@@ -27,6 +28,8 @@ class SlurmArgumentTests(unittest.TestCase):
             slurm_job_id="240292",
             name="scruffy-launch-token",
             assignment_file=assignment_file,
+            stdout_file=Path("/shared/scruffy/jobs/job-1/stdout.log"),
+            stderr_file=Path("/shared/scruffy/jobs/job-1/stderr.log"),
             node_names=["gpu-3", "gpu-5"],
             cpus_per_node=28,
             memory_gb_per_node=256,
@@ -50,6 +53,8 @@ class SlurmArgumentTests(unittest.TestCase):
                 "--wait=45",
                 "--wait-for-children",
                 "--label",
+                "--output=/shared/scruffy/jobs/job-1/stdout.log",
+                "--error=/shared/scruffy/jobs/job-1/stderr.log",
                 sys.executable,
                 "-m",
                 "scruffy.worker",
@@ -64,6 +69,8 @@ class SlurmArgumentTests(unittest.TestCase):
                 slurm_job_id="",
                 name="scruffy-launch-token",
                 assignment_file=Path("assignment.json"),
+                stdout_file=Path("stdout.log"),
+                stderr_file=Path("stderr.log"),
                 node_names=["gpu-3"],
                 cpus_per_node=1,
                 memory_gb_per_node=1,
@@ -74,6 +81,8 @@ class SlurmArgumentTests(unittest.TestCase):
             slurm_job_id="240292",
             name="scruffy-token",
             assignment_file=Path("assignment.json"),
+            stdout_file=Path("stdout.log"),
+            stderr_file=Path("stderr.log"),
             node_names=["gpu-3"],
             cpus_per_node=1,
             memory_gb_per_node=1,
@@ -214,6 +223,34 @@ class InventoryTests(unittest.TestCase):
 
 
 class SlurmReconciliationTests(unittest.TestCase):
+    def test_completed_step_reads_the_exact_accounting_row(self) -> None:
+        result = mock.Mock(
+            stdout=(
+                "240292|RUNNING|0:0\n"
+                "240292.17|FAILED|2:0\n"
+                "240292.17.0|FAILED|2:0\n"
+            )
+        )
+        with mock.patch("scruffy.slurm.subprocess.run", return_value=result) as run:
+            step = completed_step("240292.17")
+
+        self.assertIsNotNone(step)
+        self.assertEqual("FAILED", step.state)
+        self.assertEqual(2, step.returncode)
+        run.assert_called_once_with(
+            [
+                "sacct",
+                "--noheader",
+                "--parsable2",
+                "--jobs=240292.17",
+                "--format=JobIDRaw,State,ExitCode",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
     def test_live_steps_parses_structured_scontrol_output(self) -> None:
         result = mock.Mock(
             stdout=json.dumps(

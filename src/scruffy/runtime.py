@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
 from .models import NodeInventory
-from .slurm import SlurmStep, cancel_step, live_steps
+from .slurm import SlurmStep
 
 MessageQueue = queue.SimpleQueue[dict[str, Any]]
 MAX_OUTPUT_EVENT_BYTES = 65536
@@ -71,10 +71,12 @@ class OutputNotifier:
 
 @dataclass(slots=True)
 class RunningProcess:
-    process: subprocess.Popen[bytes]
+    # Reattached Slurm steps have no handle to the old local ``srun`` client.
+    process: subprocess.Popen[bytes] | None
     step_name: str | None
     readers: list[threading.Thread] = field(default_factory=list)
     closed_streams: set[str] = field(default_factory=set)
+    output_offsets: dict[str, int] = field(default_factory=dict)
     cancel_deadline: float | None = None
     final_state: str | None = None
     final_reason: str | None = None
@@ -83,6 +85,7 @@ class RunningProcess:
     exit_seen_at: float | None = None
     absence_confirmations: int = 0
     last_absence_snapshot_at: float = 0.0
+    last_accounting_snapshot_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -160,6 +163,8 @@ def start_readers(
 ) -> None:
     """Start both pipe drainers, closing any pipe whose thread cannot start."""
 
+    if running.process is None:
+        raise RuntimeError("local launcher process is missing")
     streams = (
         ("stdout", running.process.stdout, stdout_file),
         ("stderr", running.process.stderr, stderr_file),
@@ -200,10 +205,12 @@ def signal_process(process: subprocess.Popen[bytes], sig: signal.Signals) -> Non
 def stop_launcher(controller: Controller, running: RunningProcess) -> None:
     """Request launcher termination while retaining its resource assignment."""
 
-    if running.client_signalled or running.process.poll() is not None:
+    if running.client_signalled:
+        return
+    running.client_signalled = True
+    if running.process is None or running.process.poll() is not None:
         return
     signal_process(running.process, signal.SIGTERM)
-    running.client_signalled = True
     if controller.launcher == "local":
         running.cancel_deadline = time.monotonic() + controller.cancel_grace
 
@@ -214,28 +221,24 @@ def abandon_processes(controller: Controller) -> None:
     Persisted state keeps every assignment, so uncertainty remains fail-closed.
     """
 
-    for running in controller.running.values():
-        stop_launcher(controller, running)
     if controller.launcher == "slurm":
-        try:
-            steps = live_steps(controller.slurm_job_id or "")
-            for running in controller.running.values():
-                matches = [
-                    step for step in steps if step.name == (running.step_name or "")
-                ]
-                for step in matches:
-                    cancel_step(controller.slurm_job_id or "", step.step_id)
-        except Exception:
-            pass
+        # The replacement controller can recover these remote steps. Killing
+        # them here would turn an ordinary controller crash into lost work.
         return
 
+    for running in controller.running.values():
+        stop_launcher(controller, running)
     deadline = time.monotonic() + controller.cancel_grace
     for running in controller.running.values():
+        if running.process is None:
+            continue
         try:
             running.process.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             signal_process(running.process, signal.SIGKILL)
     for running in controller.running.values():
+        if running.process is None:
+            continue
         try:
             running.process.wait(timeout=5)
         except subprocess.TimeoutExpired:

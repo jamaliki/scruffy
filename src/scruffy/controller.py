@@ -20,6 +20,7 @@ from .models import (
     ACTIVE_JOB_STATES,
     DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
+    Assignment,
     NodeInventory,
     ResourceRequest,
     job_project,
@@ -27,8 +28,8 @@ from .models import (
     validate_inventory,
 )
 from .protocol import validate_event
-from .runtime import Controller, OutputNotifier, abandon_processes
-from .scheduler import request_can_ever_fit
+from .runtime import Controller, OutputNotifier, RunningProcess, abandon_processes
+from .scheduler import InvariantError, assert_invariants, request_can_ever_fit
 from .slurm import allocation_metadata
 from .state import (
     apply_workload_event,
@@ -101,10 +102,27 @@ def _initialize_controller(
         if job["state"] in ACTIVE_JOB_STATES
     ]
     previous = state.get("allocation") or {}
-    if active and (launcher == "local" or previous.get("id") == allocation_id):
+    same_slurm_allocation = (
+        launcher == "slurm" and previous.get("id") == allocation_id
+    )
+    if active and launcher == "local":
         raise UnsafeRecovery(
             "unresolved active jobs could still be running; refusing unsafe recovery"
         )
+    if same_slurm_allocation:
+        try:
+            assignments = tuple(
+                Assignment.from_dict(job["assignment"]) for job in active
+            )
+            assert_invariants(inventory, assignments)
+        except (KeyError, ValueError, InvariantError) as exc:
+            raise UnsafeRecovery(
+                f"invalid active Slurm assignments; refusing recovery: {exc}"
+            ) from exc
+        if active and any(not job.get("launch_token") for job in active):
+            raise UnsafeRecovery(
+                "active Slurm job has no launch token; refusing unsafe recovery"
+            )
 
     journal = open_journal(root, int(state.get("journal_generation", 0)))
     messages: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
@@ -122,19 +140,18 @@ def _initialize_controller(
         output=OutputNotifier(messages),
     )
 
-    # Clear every old placement before the first snapshot is rebuilt against
-    # the new inventory. This also handles replacement node-name changes.
-    for job in active:
-        job["state"] = "lost"
-        job["finished_at"] = utc_now()
-        job["reason"] = "allocation_replaced"
-        job["last_assignment"] = job.get("assignment")
-        job["assignment"] = None
-    for job in active:
-        # The old placements may name nodes outside the replacement inventory.
-        # Journal each complete image, then publish one coherent snapshot with
-        # allocation.started below. A crash is recovered by journal replay.
-        emit(controller, "job.lost", job=job, snapshot=False)
+    if same_slurm_allocation:
+        _reattach_slurm_jobs(controller, active)
+    else:
+        # Old Slurm steps cannot exist in a replacement allocation.
+        for job in active:
+            job["state"] = "lost"
+            job["finished_at"] = utc_now()
+            job["reason"] = "allocation_replaced"
+            job["last_assignment"] = job.get("assignment")
+            job["assignment"] = None
+        for job in active:
+            emit(controller, "job.lost", job=job, snapshot=False)
 
     # Queued and later workflow jobs have already crossed their dependency
     # gate. Persist the marker for snapshots created before the field existed.
@@ -142,9 +159,17 @@ def _initialize_controller(
         if isinstance(job.get("workflow_id"), str):
             job.setdefault("dependency_gate_passed", job.get("state") != "blocked")
 
+    now = utc_now()
     metadata = allocation_metadata(allocation_id, launcher)
     metadata.update(
-        {"state": "running", "started_at": utc_now(), "heartbeat_at": utc_now()}
+        {
+            "state": "running",
+            "started_at": (
+                previous.get("started_at", now) if same_slurm_allocation else now
+            ),
+            "controller_started_at": now,
+            "heartbeat_at": now,
+        }
     )
     if slurm_job_id:
         metadata["slurm_job_id"] = slurm_job_id
@@ -162,8 +187,13 @@ def _initialize_controller(
     state["drain_requested"] = preserve_drain
     emit(
         controller,
-        "allocation.started",
-        data={"nodes": [item.to_dict() for item in inventory]},
+        "allocation.resumed" if same_slurm_allocation else "allocation.started",
+        data={
+            "nodes": [item.to_dict() for item in inventory],
+            "reattached_jobs": (
+                [job["id"] for job in active] if same_slurm_allocation else []
+            ),
+        },
     )
     for job in state["jobs"].values():
         if job["state"] not in {"queued", "blocked"}:
@@ -177,6 +207,30 @@ def _initialize_controller(
         job["error"] = "request cannot fit this allocation inventory"
         emit(controller, "job.rejected", job=job)
     return controller
+
+
+def _reattach_slurm_jobs(
+    controller: Controller, jobs: list[dict[str, Any]]
+) -> None:
+    """Restore ownership of persisted steps without their old local clients."""
+
+    for job in jobs:
+        job.pop("pid", None)
+        running = RunningProcess(None, str(job["launch_token"]))
+        running.closed_streams.update({"stdout", "stderr"})
+        for stream_name in ("stdout", "stderr"):
+            relative_name = job.get(
+                stream_name, f"jobs/{job['id']}/{stream_name}.log"
+            )
+            try:
+                size = (controller.root / relative_name).stat().st_size
+            except FileNotFoundError:
+                size = 0
+            running.output_offsets[stream_name] = size
+        if job["state"] == "cancelling":
+            running.final_state = "cancelled"
+            running.final_reason = "cancelled"
+        controller.running[job["id"]] = running
 
 
 def _rejected_job(
@@ -964,7 +1018,7 @@ def _serve(controller: Controller) -> None:
             compact_journal(controller)
             if controller.stopping:
                 begin_shutdown(controller)
-                if not controller.running:
+                if controller.launcher == "slurm" or not controller.running:
                     break
             else:
                 schedule(controller)
@@ -972,9 +1026,14 @@ def _serve(controller: Controller) -> None:
             time.sleep(controller.poll_interval)
         drain_messages(controller)
         poll_processes(controller)
-        controller.state["allocation"]["state"] = "ended"
-        controller.state["allocation"]["finished_at"] = utc_now()
-        emit(controller, "allocation.ended")
+        if controller.launcher == "slurm":
+            controller.state["allocation"]["state"] = "controller_stopped"
+            controller.state["allocation"]["controller_stopped_at"] = utc_now()
+            emit(controller, "allocation.controller_stopped")
+        else:
+            controller.state["allocation"]["state"] = "ended"
+            controller.state["allocation"]["finished_at"] = utc_now()
+            emit(controller, "allocation.ended")
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)

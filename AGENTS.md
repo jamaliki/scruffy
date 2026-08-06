@@ -105,6 +105,8 @@ agents; reading does not consume events for anyone else. Use
   `drain` survives controller restarts and disables launches until the outer
   allocation is replaced.
 - GPU identity is `(node, gpu_id)`, never a bare global ordinal.
+- Restarting the controller inside the same Slurm allocation reattaches live
+  steps by their persisted launch tokens; do not resubmit those jobs.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
 - CPU and memory are cooperative budgets. GPU exclusivity covers only work
   submitted through Scruffy; do not launch out-of-band work on its inventory.

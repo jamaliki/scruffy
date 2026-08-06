@@ -23,6 +23,12 @@ class SlurmStep:
     nodes: str
 
 
+@dataclass(frozen=True, slots=True)
+class SlurmStepResult:
+    state: str
+    returncode: int
+
+
 def new_step_name() -> str:
     """Create a persisted launch token which cannot collide with user steps."""
 
@@ -194,6 +200,8 @@ def build_srun_argv(
     slurm_job_id: str,
     name: str,
     assignment_file: Path,
+    stdout_file: Path,
+    stderr_file: Path,
     node_names: list[str],
     cpus_per_node: int,
     memory_gb_per_node: int,
@@ -225,6 +233,8 @@ def build_srun_argv(
         f"--wait={wait_seconds}",
         "--wait-for-children",
         "--label",
+        f"--output={stdout_file}",
+        f"--error={stderr_file}",
         sys.executable,
         "-m",
         "scruffy.worker",
@@ -272,6 +282,51 @@ def live_steps(slurm_job_id: str) -> tuple[SlurmStep, ...]:
             )
         )
     return tuple(steps)
+
+
+def completed_step(step_id: str) -> SlurmStepResult | None:
+    """Return one completed step's exit status, or ``None`` while it settles."""
+
+    result = subprocess.run(
+        [
+            "sacct",
+            "--noheader",
+            "--parsable2",
+            f"--jobs={step_id}",
+            "--format=JobIDRaw,State,ExitCode",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    for line in result.stdout.splitlines():
+        job_id, separator, remainder = line.partition("|")
+        if not separator or job_id != step_id:
+            continue
+        state, separator, encoded_exit = remainder.partition("|")
+        if not separator or state.split(maxsplit=1)[0] in {
+            "PENDING",
+            "RUNNING",
+            "COMPLETING",
+            "CONFIGURING",
+        }:
+            return None
+        code, separator, signal_number = encoded_exit.partition(":")
+        if (
+            not separator
+            or not code.isascii()
+            or not code.isdecimal()
+            or not signal_number.isascii()
+            or not signal_number.isdecimal()
+        ):
+            raise RuntimeError(f"sacct returned invalid exit code {encoded_exit!r}")
+        signal_value = int(signal_number)
+        return SlurmStepResult(
+            state=state,
+            returncode=-signal_value if signal_value else int(code),
+        )
+    return None
 
 
 def cancel_step(slurm_job_id: str, step_id: str) -> None:
