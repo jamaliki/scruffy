@@ -19,6 +19,7 @@ from scruffy.mcp_server import (
 )
 from scruffy.storage import (
     append_event,
+    list_requests,
     load_state,
     open_journal,
     queue_id,
@@ -286,6 +287,39 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
                 {"_project_id": "project-a", "job_id": "job-b"},
             )
 
+    async def test_submission_requires_project_and_deduplicates_retries(self) -> None:
+        params = {
+            "request_id": "agent/campaign/train/attempt-1",
+            "name": "train",
+            "argv": ["/shared/env/bin/python", "train.py"],
+            "cwd": "/shared/code/project",
+            "gpus_per_node": 2,
+        }
+
+        with self.assertRaisesRegex(ValueError, "project-pinned"):
+            await dispatch_tool(self.root, "submit_job", params)
+        first = await dispatch_tool(
+            self.root, "submit_job", {**params, "_project_id": "project-a"}
+        )
+        second = await dispatch_tool(
+            self.root, "submit_job", {**params, "_project_id": "project-a"}
+        )
+
+        self.assertFalse(first["deduplicated"])
+        self.assertTrue(second["deduplicated"])
+        self.assertEqual(first["job_id"], second["job_id"])
+        spec = dict(list_requests(self.root))[first["job_id"]]
+        self.assertEqual("project-a", spec["project_id"])
+        self.assertEqual(
+            {
+                "nodes": 1,
+                "gpus_per_node": 2,
+                "cpus_per_node": 28,
+                "memory_gb_per_node": 256,
+            },
+            spec["resources"],
+        )
+
     async def test_stale_cursor_returns_authoritative_overview(self) -> None:
         _commit(self.root, [], jobs={"job-1": _job("job-1")})
 
@@ -424,6 +458,49 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["timed_out"])
         self.assertNotIn("argv", result["events"][0]["job"])
 
+    async def test_project_pinned_server_exposes_idempotent_submission(self) -> None:
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(source_root), environment.get("PYTHONPATH")))
+        )
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m",
+                "scruffy.mcp_server",
+                "--root",
+                str(self.root),
+                "--project",
+                "project-a",
+            ],
+            env=environment,
+        )
+        submission = {
+            "request_id": "agent/campaign/train/attempt-1",
+            "name": "train",
+            "argv": [sys.executable, "-c", "print('queued')"],
+            "cwd": str(self.root.parent),
+        }
+
+        async with (
+            stdio_client(parameters) as (reader, writer),
+            ClientSession(reader, writer) as session,
+        ):
+            await session.initialize()
+            tools = await session.list_tools()
+            self.assertEqual(
+                {"overview", "inspect_job", "wait_for_updates", "submit_job"},
+                {tool.name for tool in tools.tools},
+            )
+            first = self.structured(await session.call_tool("submit_job", submission))
+            second = self.structured(await session.call_tool("submit_job", submission))
+
+        self.assertFalse(first["deduplicated"])
+        self.assertTrue(second["deduplicated"])
+        self.assertEqual("project-a", first["project_id"])
+        self.assertEqual(first["job_id"], second["job_id"])
+
     async def test_local_gateway_survives_remote_failure_and_cancellation(self) -> None:
         connector = self.root.parent / "connector.py"
         counter = self.root.parent / "connector-count"
@@ -463,6 +540,8 @@ os.execv(command[0], command)
                 "scruffy.mcp_server",
                 "--root",
                 str(self.root),
+                "--project",
+                "project-a",
                 "--connect-command",
                 connect_command,
                 "--remote-command",
@@ -501,6 +580,19 @@ os.execv(command[0], command)
 
             after_cancel = self.structured(await session.call_tool("overview", {}))
             self.assertEqual(self.identity, after_cancel["queue_id"])
+
+            submitted = self.structured(
+                await session.call_tool(
+                    "submit_job",
+                    {
+                        "request_id": "gateway/train/attempt-1",
+                        "name": "remote-train",
+                        "argv": [sys.executable, "-c", "print('queued')"],
+                        "cwd": str(self.root.parent),
+                    },
+                )
+            )
+            self.assertEqual("project-a", submitted["project_id"])
 
         self.assertGreaterEqual(int(counter.read_text()), 4)
 

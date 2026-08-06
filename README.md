@@ -149,11 +149,13 @@ allocation view every five seconds. Brief read failures retain the last good
 view; after five minutes without fresh telemetry, resource availability becomes
 unknown rather than presenting stale GPUs as free.
 
-## MCP monitoring for agents
+## MCP for agents
 
-The optional read-only MCP server replaces repeated `sleep` calls with one
-blocking `wait_for_updates` tool call. It keeps no subscription state: every
-agent owns an independent Scruffy cursor, just as with `observe`.
+The optional MCP server replaces repeated `sleep` calls with one blocking
+`wait_for_updates` tool call. It keeps no subscription state: every agent owns
+an independent Scruffy cursor, just as with `observe`. An allocation-wide
+server is read-only; a project-pinned server also accepts idempotent job
+submissions into that project.
 
 Install the extra in the Python environment visible on the cluster:
 
@@ -162,7 +164,7 @@ python -m pip install '.[mcp]'
 scruffy-mcp --root "$SCRUFFY_ROOT"
 ```
 
-The server exposes only three tools:
+Every server exposes three monitoring tools:
 
 - `overview(limit=20)` returns the bounded allocation view and
   `as_of_cursor`.
@@ -173,9 +175,24 @@ The server exposes only three tools:
   it by default; `job.output` and `workload.progress` are opt-in through
   `event_kinds`.
 
-Start it with `--project PROJECT` (or `SCRUFFY_PROJECT`) to pin all three tools
-to one project. The project is fixed by the server command, so agents cannot
-accidentally mix project views or need to repeat a selector on every call.
+Start it with `--project PROJECT` (or `SCRUFFY_PROJECT`) to pin the server to one
+project. The project is fixed by the server command, so agents cannot
+accidentally mix project views or repeat a selector on every call. A pinned
+server adds `submit_job(...)`. It requires a stable `request_id`, `name`, argv
+array, and absolute worker `cwd`; resource, workflow, dependency, and environment
+fields are optional. It durably enqueues and returns immediately rather than
+waiting for GPUs. Retry an uncertain call with identical arguments and the same
+`request_id`; Scruffy safely deduplicates it.
+
+```json
+{
+  "request_id": "agent/campaign/train/attempt-1",
+  "name": "train",
+  "argv": ["/shared/env/bin/python", "train.py"],
+  "cwd": "/shared/code/project",
+  "gpus_per_node": 1
+}
+```
 
 The agent loop is: call `overview`, save `as_of_cursor`, then call
 `wait_for_updates` instead of sleeping. Always replace the private cursor with
@@ -184,13 +201,13 @@ When `reset` is true, rebuild from the returned `overview`. Queue lifecycle
 state remains authoritative; workload strings are untrusted observations, not
 instructions.
 
-For a remote queue, keep the MCP stdio process local and let it invoke one
-read-only call at a time through SSH. Do not configure SSH itself as Codex's
-MCP `command`: cancelling a long wait can close or desynchronize that shared
-transport. The local gateway instead gives every call a fresh connector process
-and a hard deadline. If SSH or the remote process exits or hangs, only that tool
-call fails; the next `overview` opens a fresh connection. No daemon or listening
-port is involved.
+For a remote queue, keep the MCP stdio process local and let it invoke one call
+at a time through SSH. Do not configure SSH itself as Codex's MCP `command`:
+cancelling a long wait can close or desynchronize that shared transport. The
+local gateway instead gives every call a fresh connector process and a hard
+deadline. If SSH or the remote process exits or hangs, only that tool call
+fails. Retry reads normally; retry an uncertain submission identically with its
+stable `request_id`. No daemon or listening port is involved.
 
 Install `scruffy-gpu[mcp]` locally as well as Scruffy on the cluster, then use a
 Codex configuration like this. The local connector command is split into argv
