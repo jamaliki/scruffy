@@ -17,6 +17,10 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             mcp_gateway.CALL_TIMEOUT_SECONDS,
             mcp_gateway._call_timeout("overview", {}),
         )
+        self.assertEqual(
+            mcp_gateway.CALL_TIMEOUT_SECONDS,
+            mcp_gateway._call_timeout("wait_for_updates", {"timeout_seconds": 3601}),
+        )
 
     async def test_wedged_remote_wait_is_stopped(self) -> None:
         async def hang() -> tuple[bytes, bytes]:

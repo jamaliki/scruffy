@@ -20,6 +20,7 @@ class GatewayError(RuntimeError):
 RemoteCall = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 CALL_TIMEOUT_SECONDS = 120.0
+MAX_WAIT_SECONDS = 60.0 * 60
 WAIT_TIMEOUT_GRACE_SECONDS = 5.0
 
 
@@ -32,7 +33,7 @@ def _call_timeout(tool: str, params: dict[str, Any]) -> float:
         and not isinstance(requested, bool)
         and isinstance(requested, (int, float))
         and math.isfinite(requested)
-        and requested >= 0
+        and 0 <= requested <= MAX_WAIT_SECONDS
     ):
         return float(requested) + WAIT_TIMEOUT_GRACE_SECONDS
     return CALL_TIMEOUT_SECONDS
