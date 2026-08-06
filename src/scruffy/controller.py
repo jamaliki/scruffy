@@ -82,6 +82,8 @@ COMMAND_OUTCOME_KINDS = {
     "command.rejected",
     "allocation.draining",
     "allocation.drain_ignored",
+    "allocation.launches_resumed",
+    "allocation.resume_ignored",
 }
 
 
@@ -185,6 +187,9 @@ def _initialize_controller(
     state["allocation"] = metadata
     state["draining"] = preserve_drain
     state["drain_requested"] = preserve_drain
+    # Recovery owns existing steps but never admits additional work implicitly.
+    # An operator must explicitly resume after checking the recovered snapshot.
+    state["launches_paused"] = same_slurm_allocation
     emit(
         controller,
         "allocation.resumed" if same_slurm_allocation else "allocation.started",
@@ -195,6 +200,12 @@ def _initialize_controller(
             ),
         },
     )
+    if same_slurm_allocation:
+        emit(
+            controller,
+            "allocation.launches_paused",
+            data={"reason": "controller_restart"},
+        )
     for job in state["jobs"].values():
         if job["state"] not in {"queued", "blocked"}:
             continue
@@ -729,6 +740,23 @@ def _ingest_commands(controller: Controller) -> None:
                 controller.state["drain_requested"] = True
                 controller.state["allocation"]["state"] = "draining"
                 emit(controller, "allocation.draining", data=data)
+        elif kind == "resume":
+            data = {"request_id": command.get("request_id")}
+            if controller.state["draining"]:
+                emit(
+                    controller,
+                    "allocation.resume_ignored",
+                    data={**data, "reason": "allocation_draining"},
+                )
+            elif not controller.state.get("launches_paused", False):
+                emit(
+                    controller,
+                    "allocation.resume_ignored",
+                    data={**data, "reason": "launches_not_paused"},
+                )
+            else:
+                controller.state["launches_paused"] = False
+                emit(controller, "allocation.launches_resumed", data=data)
         if not deferred:
             remove_command(source)
 

@@ -9,7 +9,14 @@ from unittest import mock
 
 import scruffy.state as state_module
 import scruffy.storage as storage_module
-from scruffy.client import cancel_job, observe, publish_event, status, submit_job
+from scruffy.client import (
+    cancel_job,
+    observe,
+    publish_event,
+    resume_queue,
+    status,
+    submit_job,
+)
 from scruffy.controller import (
     _discard_journaled_commands,
     _discard_journaled_reports,
@@ -20,7 +27,13 @@ from scruffy.controller import (
     _refresh_dependencies,
     _report_batch,
 )
-from scruffy.lifecycle import begin_shutdown, drain_messages, poll_processes, start_job
+from scruffy.lifecycle import (
+    begin_shutdown,
+    drain_messages,
+    poll_processes,
+    schedule,
+    start_job,
+)
 from scruffy.models import (
     Assignment,
     NodeInventory,
@@ -137,6 +150,83 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual("scruffy-token", running.step_name)
         self.assertEqual("running", controller.state["jobs"]["job-active"]["state"])
         self.assertIsNotNone(controller.state["jobs"]["job-active"]["assignment"])
+        self.assertTrue(controller.state["launches_paused"])
+
+    def test_same_allocation_restart_requires_explicit_resume_to_launch(self) -> None:
+        queued = job_image("job-queued", "gpu-3")
+        queued.update({"state": "queued", "assignment": None})
+        upstream = job_image("job-upstream", "gpu-3")
+        upstream.update(
+            {
+                "state": "succeeded",
+                "assignment": None,
+                "workflow_id": "recovery-flow",
+                "task_id": "upstream",
+                "needs": [],
+            }
+        )
+        blocked = job_image("job-blocked", "gpu-3")
+        blocked.update(
+            {
+                "state": "blocked",
+                "assignment": None,
+                "queue_order": 2,
+                "workflow_id": "recovery-flow",
+                "task_id": "blocked",
+                "needs": [{"task_id": "upstream", "condition": "succeeded"}],
+                "blockers": [],
+                "dependency_gate_passed": False,
+            }
+        )
+        state = {
+            "v": 1,
+            "queue_id": queue_id(self.root),
+            "last_seq": 0,
+            "allocation": {"id": "240292"},
+            "nodes": {},
+            "jobs": {
+                "job-queued": queued,
+                "job-upstream": upstream,
+                "job-blocked": blocked,
+            },
+            "draining": False,
+        }
+        write_state(self.root, state)
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(controller.journal.close)
+
+        _refresh_dependencies(controller)
+        self.assertEqual("queued", controller.state["jobs"]["job-blocked"]["state"])
+        with mock.patch("scruffy.lifecycle.start_job") as start:
+            schedule(controller)
+        start.assert_not_called()
+
+        requested = resume_queue(self.root)
+        _ingest_commands(controller)
+        self.assertFalse(controller.state["launches_paused"])
+        resumed = next(
+            event
+            for event in read_events(self.root)
+            if event["kind"] == "allocation.launches_resumed"
+        )
+        self.assertEqual(requested["request_id"], resumed["data"]["request_id"])
+
+        def mark_started(
+            _controller: Controller, job: dict[str, object], _assignment: Assignment
+        ) -> None:
+            job["state"] = "starting"
+
+        with mock.patch("scruffy.lifecycle.start_job", side_effect=mark_started) as start:
+            schedule(controller)
+        self.assertEqual(2, start.call_count)
 
     def test_same_slurm_allocation_refuses_job_without_launch_token(self) -> None:
         state = {

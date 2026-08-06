@@ -156,13 +156,14 @@ function renderProjects(snapshot) {
 function renderConnection(snapshot) {
   const allocation = snapshot.allocation || {};
   const stale = telemetryIsStale(snapshot);
-  byId("allocation-state").textContent = stale ? "Telemetry stale" : String(allocation.state || "No allocation");
+  const paused = Boolean(snapshot.launches_paused);
+  byId("allocation-state").textContent = stale ? "Telemetry stale" : paused ? "Recovery paused" : String(allocation.state || "No allocation");
   byId("allocation-id").textContent = allocation.id || "Waiting for controller";
   const connectionTone = stale ? "stale" : view.connected ? "live" : "degraded";
   byId("connection-dot").className = `connection-dot ${connectionTone}`;
   byId("stale-banner").hidden = !stale;
   byId("stale-banner").textContent = "Queue telemetry has not refreshed for five minutes. Resource availability is unknown.";
-  byId("freshness").textContent = `Heartbeat ${formatAge(allocation.heartbeat_at)}`;
+  byId("freshness").textContent = `Heartbeat ${formatAge(allocation.heartbeat_at)}${paused ? " · launches paused" : ""}`;
   byId("queue-id").textContent = snapshot.queue_id || "Queue not identified";
   document.body.classList.toggle("data-stale", stale);
 }

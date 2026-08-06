@@ -153,6 +153,13 @@ def drain_queue(root: Path) -> dict[str, Any]:
     return {"request_id": request_id, "state": "drain_requested"}
 
 
+def resume_queue(root: Path) -> dict[str, Any]:
+    """Resume launches after a controller-recovery pause."""
+
+    request_id = submit_command(root, {"kind": "resume", "submitted_at": utc_now()})
+    return {"request_id": request_id, "state": "resume_requested"}
+
+
 def _submitted_from_spec(
     job_id: str, spec: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -247,6 +254,7 @@ def status(
             "archived_project_counts": {},
             "draining": False,
             "drain_requested": False,
+            "launches_paused": False,
         }
     state.pop("report_acks", None)
     state.pop("report_ack_v", None)

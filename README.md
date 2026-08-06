@@ -369,12 +369,15 @@ scruffy explain JOB_ID
 scruffy wait JOB_ID
 scruffy cancel JOB_ID
 scruffy drain
+scruffy resume
 ```
 
-Cancellation and drain requests are asynchronous and return a `request_id` that
-appears on their journal outcome. `drain` disables new launches for the current
-allocation; running jobs continue and queued jobs remain durable. The drain
-survives controller restarts and clears when a replacement allocation starts.
+Cancellation, drain, and resume requests are asynchronous and return a
+`request_id` that appears on their journal outcome. `drain` disables new
+launches for the current allocation; running jobs continue and queued jobs
+remain durable. The drain survives controller restarts and clears when a
+replacement allocation starts. `resume` clears only the automatic launch pause
+created by a same-allocation controller restart; it cannot override `drain`.
 Cancelling an archived terminal job produces `job.cancel_ignored`, just like
 cancelling a terminal job still in hot state.
 
@@ -398,6 +401,9 @@ live steps and their assignments remain owned. Completed reattached steps are
 resolved through Slurm accounting; only a step that Slurm proves absent can
 release its resources. Slurm writes job logs directly to the shared queue root,
 so output does not depend on the lifetime of the original controller process.
+Every same-allocation restart begins with launches paused: queued jobs remain
+durable and dependencies may resolve, but nothing new starts until an operator
+checks the recovered state and runs `scruffy --root "$SCRUFFY_ROOT" resume`.
 
 The controller deliberately runs one submitted argv per job. It is not a retry
 engine, dynamic workflow fan-out engine, or artifact store: submit retries and

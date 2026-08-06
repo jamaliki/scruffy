@@ -19,6 +19,7 @@ from .client import (
     explain,
     observe,
     publish_event,
+    resume_queue,
     status,
     submit_job,
     summary,
@@ -326,6 +327,11 @@ def _drain(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _resume(arguments: argparse.Namespace) -> int:
+    _json(resume_queue(_root(arguments)))
+    return 0
+
+
 def _dashboard(arguments: argparse.Namespace) -> int:
     run_dashboard(
         str(_root(arguments)),
@@ -545,6 +551,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     drain.set_defaults(handler=_drain)
+
+    resume = commands.add_parser(
+        "resume",
+        help="resume launches after controller recovery",
+        description=(
+            "Clear a controller-recovery launch pause. This does not override "
+            "an allocation drain."
+        ),
+    )
+    resume.set_defaults(handler=_resume)
 
     dashboard = commands.add_parser(
         "dashboard",

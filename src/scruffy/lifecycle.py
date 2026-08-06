@@ -157,7 +157,11 @@ def start_job(
 
 
 def schedule(controller: Controller) -> None:
-    while not controller.stopping and not controller.state["draining"]:
+    while (
+        not controller.stopping
+        and not controller.state["draining"]
+        and not controller.state.get("launches_paused", False)
+    ):
         queued = sorted(
             (
                 QueuedJob(job["id"], ResourceRequest.from_dict(job["request"]))

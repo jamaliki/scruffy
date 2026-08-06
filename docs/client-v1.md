@@ -18,6 +18,7 @@ include the effects of returned events.
 | Publish workload state | `scruffy report KIND` | `publish_event(...)` |
 | Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
+| Resume after recovery | `scruffy resume` | `resume_queue(root)` |
 
 All operations use `--root ROOT` or `SCRUFFY_ROOT`. Every participant must see
 that directory at the same absolute path. CLI commands emit JSON except `logs`
@@ -211,7 +212,8 @@ even though retained terminal-job detail and journal history are bounded.
 
 ## Commands and process exit
 
-`cancel_job` and `drain_queue` durably spool a command and return immediately:
+`cancel_job`, `drain_queue`, and `resume_queue` durably spool a command and
+return immediately:
 
 ```json
 {"job_id": "job-...", "request_id": "...", "state": "cancel_requested"}
@@ -219,6 +221,10 @@ even though retained terminal-job detail and journal history are bounded.
 
 ```json
 {"request_id": "...", "state": "drain_requested"}
+```
+
+```json
+{"request_id": "...", "state": "resume_requested"}
 ```
 
 The corresponding outcome event repeats `request_id`. Cancellation retains its
@@ -229,6 +235,13 @@ release safe. Cancelling any terminal job, including an archived one, produces
 Drain disables new launches for the current allocation. Running jobs continue,
 queued jobs remain durable, and controller restarts preserve the drain. A
 replacement allocation clears it.
+
+A same-allocation controller restart reattaches existing Slurm steps but starts
+with new launches paused. Queued jobs and dependency transitions remain durable
+without consuming resources. `scruffy resume` asynchronously clears this
+recovery pause after the operator has checked the snapshot; it never overrides
+an explicit drain. Its outcome is `allocation.launches_resumed` or
+`allocation.resume_ignored`, correlated by `request_id`.
 
 CLI exit conventions are:
 

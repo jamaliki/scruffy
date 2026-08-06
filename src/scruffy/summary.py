@@ -165,6 +165,7 @@ def build_summary(
         "allocation": state.get("allocation"),
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
+        "launches_paused": bool(state.get("launches_paused", False)),
         "counts": dict(sorted(counts.items())),
         "archived_jobs": sum(int(count) for count in archived_counts.values()),
         "nodes": state.get("nodes", {}),

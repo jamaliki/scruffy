@@ -68,6 +68,7 @@ OVERVIEW_FIELDS = (
     "allocation",
     "updated_at",
     "draining",
+    "launches_paused",
     "counts",
     "archived_jobs",
     "truncated",
