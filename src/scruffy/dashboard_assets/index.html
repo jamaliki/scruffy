@@ -18,9 +18,9 @@
       </div>
     </div>
     <nav class="deck-nav" aria-label="Console sections">
-      <a href="#topology">Topology</a>
+      <a href="#topology">Resources</a>
       <a href="#signals">Signals</a>
-      <a href="#jobs">Jobs</a>
+      <a href="#jobs">Scheduler</a>
       <a href="#projects">Projects</a>
     </nav>
     <div class="allocation-identity">
@@ -56,10 +56,7 @@
     <div class="dashboard-grid">
       <section id="topology" class="panel resource-panel">
         <header class="panel-header">
-          <div>
-            <p class="eyebrow">Resources</p>
-            <h1>GPU topology</h1>
-          </div>
+          <h1>Resources</h1>
           <div class="resource-summary">
             <p id="resource-note" class="panel-note">Loading node inventory</p>
             <div id="project-legend" class="project-legend" aria-label="GPU project colours"></div>
@@ -71,14 +68,14 @@
       <aside id="signals" class="side-stack">
         <section class="panel compact-panel">
           <header class="panel-header small-header">
-            <div><p class="eyebrow">Signals</p><h2>Attention</h2></div>
+            <h2>Signals</h2>
             <span id="attention-count" class="count-tag">0</span>
           </header>
           <div id="attention" class="job-list compact-list"></div>
         </section>
         <section class="panel compact-panel">
           <header class="panel-header small-header">
-            <div><p class="eyebrow">History</p><h2>Recent</h2></div>
+            <h2>History</h2>
             <span id="recent-count" class="count-tag quiet">0</span>
           </header>
           <div id="recent" class="job-list compact-list"></div>
@@ -88,7 +85,7 @@
 
     <section id="jobs" class="panel queue-panel">
       <header class="panel-header">
-        <div><p class="eyebrow">Scheduler</p><h2>Jobs</h2></div>
+        <h2>Scheduler</h2>
         <p class="panel-note">Select a row for placement, dependencies and telemetry.</p>
       </header>
       <div class="queue-columns">
@@ -100,7 +97,7 @@
 
     <section id="projects" class="panel projects-panel">
       <header class="panel-header">
-        <div><p class="eyebrow">Projects</p><h2>Project queues</h2></div>
+        <h2>Projects</h2>
         <p class="panel-note"><span id="project-count">0</span> projects with active, queued or blocked work.</p>
       </header>
       <div id="project-board" class="project-board"></div>

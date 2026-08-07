@@ -104,7 +104,6 @@ button.legend-item.selected { box-shadow:inset 0 -2px 0 var(--project-color); }
 .resource-panel { overflow:hidden; border-color:var(--rule); border-top:3px solid var(--teal); background:var(--surface); }
 .resource-panel .panel-header { border-color:var(--rule); background:var(--surface); }
 .resource-panel .panel-header h1 { color:var(--heading); font-family:var(--sans); font-weight:650; letter-spacing:-.02em; white-space:nowrap; }
-.resource-panel .eyebrow { color:var(--accent-dark); }
 .resource-panel .panel-note { color:var(--muted); }
 .nodes { display:grid; }
 .node-card { position:relative; padding:22px 24px; border-bottom:1px solid var(--rule); background:linear-gradient(110deg,rgba(11,32,35,.98),rgba(7,25,27,.96)); }
