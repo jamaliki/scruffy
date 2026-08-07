@@ -37,7 +37,12 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-scruffy = ["dashboard_assets/*.html", "dashboard_assets/*.css", "dashboard_assets/*.js"]
+scruffy = [
+  "dashboard_assets/*.html",
+  "dashboard_assets/*.css",
+  "dashboard_assets/*.js",
+  "dashboard_assets/*.png",
+]
 
 [tool.ruff]
 line-length = 100

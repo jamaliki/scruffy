@@ -23,6 +23,7 @@ ASSETS = {
     "/assets/app.css": ("app.css", "text/css; charset=utf-8"),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/assets/model.js": ("model.js", "text/javascript; charset=utf-8"),
+    "/assets/scruffy-pixel.png": ("scruffy-pixel.png", "image/png"),
 }
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
