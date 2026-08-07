@@ -10,7 +10,6 @@ import math
 import os
 import shlex
 from collections.abc import Awaitable, Callable, Collection
-from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Any
 
@@ -558,7 +557,6 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     stateless_http: bool = False,
-    lifespan: Callable[[Any], AbstractAsyncContextManager[dict[str, Any]]] | None = None,
     health: Callable[[], dict[str, Any]] | None = None,
 ) -> Any:
     """Create the optional FastMCP server bound to one queue root."""
@@ -592,7 +590,6 @@ def create_server(
         host=host,
         port=port,
         stateless_http=stateless_http,
-        lifespan=lifespan,
     )
 
     def request_project() -> str | None:
@@ -843,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = Path(arguments.root) if caller else Path(arguments.root).expanduser().resolve()
         if arguments.transport == "streamable-http":
-            from .mcp_hub import HubCaller, UpdateBroker, hub_lifespan
+            from .mcp_hub import HubCaller, UpdateBroker, run_hub
 
             if not 1 <= arguments.port <= 65535:
                 parser.error("--port must be between 1 and 65535")
@@ -862,14 +859,16 @@ def main(argv: list[str] | None = None) -> int:
                 host="127.0.0.1",
                 port=arguments.port,
                 stateless_http=True,
-                lifespan=hub_lifespan(broker),
                 health=broker.health,
             )
         else:
             server = create_server(root, caller, project_id=project_id)
     except RuntimeError as exc:
         parser.exit(2, f"scruffy-mcp: {exc}\n")
-    server.run(transport=arguments.transport)
+    if arguments.transport == "streamable-http":
+        run_hub(server, broker)
+    else:
+        server.run(transport="stdio")
     return 0
 
 

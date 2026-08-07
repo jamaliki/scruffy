@@ -97,6 +97,7 @@ class UpdateBroker:
 
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="scruffy-mcp-observer")
+            await asyncio.sleep(0)  # Let lifespan start the observer before yielding.
 
     async def close(self) -> None:
         """Cancel the observer and its current connector process."""
@@ -113,9 +114,13 @@ class UpdateBroker:
     def health(self) -> dict[str, Any]:
         """Return bounded process and upstream status for launch supervision."""
 
+        task_state = "stopped"
+        if self._task is not None:
+            task_state = "failed" if self._task.done() else "running"
         return {
             "status": "ok",
             "observer": "connected" if self.current_cursor else "starting",
+            "task": task_state,
             "cursor": self.current_cursor,
             "buffered_events": self._event_count,
             "last_error": self.last_error,
@@ -325,18 +330,36 @@ class HubCaller:
         return await self.broker.wait(project_id=project_id, **values)
 
 
-def hub_lifespan(broker: UpdateBroker):
-    """Bind broker lifetime to the HTTP MCP application's lifetime."""
+def hub_app(server: Any, broker: UpdateBroker) -> Any:
+    """Build the HTTP app with the broker bound to its process lifetime."""
+
+    app = server.streamable_http_app()
+    session_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
-    async def lifespan(server: Any):
-        await broker.start()
-        try:
-            yield {}
-        finally:
-            await broker.close()
+    async def lifespan(application: Any):
+        async with session_lifespan(application) as state:
+            await broker.start()
+            try:
+                yield state
+            finally:
+                await broker.close()
 
-    return lifespan
+    app.router.lifespan_context = lifespan
+    return app
 
 
-__all__ = ["HubCaller", "UpdateBroker", "hub_lifespan", "parse_cursor"]
+def run_hub(server: Any, broker: UpdateBroker) -> None:
+    """Run the supervised loopback HTTP endpoint until interrupted."""
+
+    import uvicorn
+
+    uvicorn.run(
+        hub_app(server, broker),
+        host=server.settings.host,
+        port=server.settings.port,
+        log_level=server.settings.log_level.lower(),
+    )
+
+
+__all__ = ["HubCaller", "UpdateBroker", "hub_app", "parse_cursor", "run_hub"]

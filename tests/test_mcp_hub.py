@@ -26,6 +26,11 @@ def _cursor(sequence: int) -> str:
     return f"queue-test:0:{sequence}:{sequence * 100}"
 
 
+def _read_url(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=0.2) as response:
+        return response.read()
+
+
 def _page(*events: dict[str, Any], reset: bool = False) -> dict[str, Any]:
     sequence = max((int(event["_seq"]) for event in events), default=0)
     return {
@@ -293,8 +298,8 @@ class HttpHubTests(unittest.IsolatedAsyncioTestCase):
         health = f"http://127.0.0.1:{self.port}/health"
         for _ in range(100):
             try:
-                await asyncio.to_thread(urllib.request.urlopen, health, timeout=0.2)
-                break
+                if b'"observer":"connected"' in await asyncio.to_thread(_read_url, health):
+                    break
             except OSError:
                 if self.process.poll() is not None:
                     self.log.seek(0)
