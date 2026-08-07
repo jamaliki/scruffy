@@ -15,6 +15,43 @@ from typing import Any
 
 from .models import NodeInventory, validate_inventory
 
+# SchedMD documents these as outer allocation, array, cluster, or submission
+# metadata. ``build_srun_argv`` pins the few that are also accepted as options
+# (job ID, job name, and node count), so their inherited values cannot steer the
+# child step.
+_ALLOCATION_ENVIRONMENT_KEYS = frozenset(
+    {
+        "SLURM_ARRAY_JOB_ID",
+        "SLURM_ARRAY_TASK_COUNT",
+        "SLURM_ARRAY_TASK_ID",
+        "SLURM_ARRAY_TASK_MAX",
+        "SLURM_ARRAY_TASK_MIN",
+        "SLURM_ARRAY_TASK_STEP",
+        "SLURM_CLUSTER_NAME",
+        "SLURM_CONF",
+        "SLURM_JOBID",  # Legacy spelling of SLURM_JOB_ID.
+        "SLURM_JOB_ACCOUNT",
+        "SLURM_JOB_CPUS_PER_NODE",
+        "SLURM_JOB_DEPENDENCY",
+        "SLURM_JOB_END_TIME",
+        "SLURM_JOB_GPUS",
+        "SLURM_JOB_ID",
+        "SLURM_JOB_LICENSES",
+        "SLURM_JOB_NAME",
+        "SLURM_JOB_NODELIST",
+        "SLURM_JOB_NODES",
+        "SLURM_JOB_NUM_NODES",
+        "SLURM_JOB_PARTITION",
+        "SLURM_JOB_QOS",
+        "SLURM_JOB_RESERVATION",
+        "SLURM_JOB_SEGMENT_SIZE",
+        "SLURM_JOB_START_TIME",
+        "SLURM_SUBMIT_DIR",
+        "SLURM_SUBMIT_HOST",
+    }
+)
+_SLURM_ENVIRONMENT_PREFIXES = ("SLURM_", "SLURMD_", "SRUN_")
+
 
 @dataclass(frozen=True, slots=True)
 class SlurmStep:
@@ -237,6 +274,7 @@ def build_srun_argv(
         "--kill-on-bad-exit=1",
         f"--wait={wait_seconds}",
         "--wait-for-children",
+        "--export=ALL",
         "--label",
         f"--output={stdout_file}",
         f"--error={stderr_file}",
@@ -247,14 +285,28 @@ def build_srun_argv(
     ]
 
 
-def build_srun_environment() -> dict[str, str]:
-    """Return the controller environment without controller-only placement."""
+def build_srun_environment(
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return allocation-level state safe for launching a nested ``srun``.
 
-    environment = os.environ.copy()
+    A controller launched inside a Slurm step inherits that step's rank,
+    binding, memory, GPU, task, and ``srun`` option variables. Passing those
+    variables to a child ``srun`` can override or constrain the child's
+    explicit resource request. Preserve only outer-allocation identity,
+    capacity, and provenance. The generated command explicitly overrides the
+    allocation variables that are also accepted as ``srun`` inputs and asks
+    Slurm to export every remaining variable to the worker.
+    """
+
+    environment = dict(os.environ if source is None else source)
     environment.pop("SCRUFFY_NODE", None)
     for name in tuple(environment):
-        if name.startswith("SLURM_CPU_BIND"):
-            environment.pop(name)
+        if (
+            name.startswith(_SLURM_ENVIRONMENT_PREFIXES)
+            and name not in _ALLOCATION_ENVIRONMENT_KEYS
+        ):
+            del environment[name]
     return environment
 
 

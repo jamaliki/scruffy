@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import tempfile
 import time
@@ -730,6 +731,81 @@ class SlurmLaunchTests(unittest.TestCase):
 
         self.assertIn("--cpus-per-task=112", argv)
         self.assertEqual(14, assigned.request.cpus_per_node)
+
+    def test_start_job_passes_only_sanitized_environment_to_srun(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("gpu-3", (0,), 112, 1024),),
+                launcher="slurm",
+                allocation_id="240292",
+                slurm_job_id="240292",
+                poll_interval=0.1,
+                cancel_grace=30,
+            )
+            self.addCleanup(lambda: controller.journal.close())
+            request = ResourceRequest(1, 1, 14, 128)
+            job = {
+                "id": "job-1",
+                "name": "job-1",
+                "state": "queued",
+                "submitted_at": utc_now(),
+                "queue_order": 1,
+                "argv": ["true"],
+                "cwd": "/tmp",
+                "env": {},
+                "request": request.to_dict(),
+                "assignment": None,
+                "started_at": None,
+                "finished_at": None,
+                "exit_code": None,
+                "signal": None,
+                "reason": None,
+                "error": None,
+            }
+            controller.state["jobs"][job["id"]] = job
+            assigned = Assignment(
+                job["id"], request, (NodeReservation("gpu-3", (0,), 14, 128),)
+            )
+            process = mock.Mock(pid=12345)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "PATH": "/usr/bin",
+                        "SLURM_JOB_ID": "240292",
+                        "SLURM_JOB_NODELIST": "gpu-[0,3]",
+                        "SLURM_GRES": "gpu:h100:8",
+                        "SLURM_HINT": "nomultithread",
+                        "SLURM_EXPORT_ENV": "NONE",
+                        "SRUN_EXPORT_ENV": "NONE",
+                    },
+                    clear=True,
+                ),
+                mock.patch(
+                    "scruffy.lifecycle.new_step_name", return_value="scruffy-token"
+                ),
+                mock.patch(
+                    "scruffy.lifecycle.subprocess.Popen", return_value=process
+                ) as popen,
+            ):
+                start_job(controller, job, assigned)
+
+        argv = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertIn("--export=ALL", argv)
+        self.assertEqual(
+            {
+                "PATH": "/usr/bin",
+                "SLURM_JOB_ID": "240292",
+                "SLURM_JOB_NODELIST": "gpu-[0,3]",
+            },
+            environment,
+        )
+        self.assertEqual("starting", job["state"])
+        self.assertIn(job["id"], controller.running)
 
 
 class AsyncCommandRaceTests(unittest.TestCase):

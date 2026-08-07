@@ -53,6 +53,7 @@ class SlurmArgumentTests(unittest.TestCase):
                 "--kill-on-bad-exit=1",
                 "--wait=45",
                 "--wait-for-children",
+                "--export=ALL",
                 "--label",
                 "--output=/shared/scruffy/jobs/job-1/stdout.log",
                 "--error=/shared/scruffy/jobs/job-1/stderr.log",
@@ -93,25 +94,132 @@ class SlurmArgumentTests(unittest.TestCase):
         self.assertIn("--wait-for-children", argv)
 
     def test_srun_does_not_inherit_controller_placement(self) -> None:
+        source = {
+            "PATH": "/usr/bin",
+            "SCRUFFY_NODE": "stale-node",
+            "SLURMD_NODENAME": "controller-node",
+            "SRUN_CONTAINER": "/stale/controller.sqsh",
+            "SRUN_EXPORT_ENV": "NONE",
+            "SLURM_JOB_ID": "263105",
+            "SLURM_JOBID": "263105",
+            "SLURM_JOB_NODELIST": "gpu-[0,5,8,13]",
+            "SLURM_JOB_NODES": "gpu-[0,5,8,13]",
+            "SLURM_JOB_NUM_NODES": "4",
+            "SLURM_JOB_CPUS_PER_NODE": "112(x4)",
+            "SLURM_JOB_GPUS": "0,1,2,3,4,5,6,7",
+            "SLURM_JOB_END_TIME": "1786150800",
+            "SLURM_CLUSTER_NAME": "tokyo",
+            "SLURM_CONF": "/etc/slurm/slurm.conf",
+            "SLURM_SUBMIT_DIR": "/shared/run",
+            "SLURM_SUBMIT_HOST": "login-0",
+            "SLURM_CPUS_PER_TASK": "112",
+            "SLURM_CPUS_PER_GPU": "14",
+            "SLURM_CPUS_ON_NODE": "112",
+            "SLURM_CPU_FREQ_REQ": "high",
+            "SLURM_CORE_SPEC": "2",
+            "SLURM_HINT": "nomultithread",
+            "SLURM_THREAD_SPEC": "2",
+            "SLURM_GPUS": "8",
+            "SLURM_GPUS_PER_TASK": "1",
+            "SLURM_GPUS_ON_NODE": "8",
+            "SLURM_GPU_FREQ": "high",
+            "SLURM_GRES": "gpu:h100:8",
+            "SLURM_GRES_FLAGS": "enforce-binding",
+            "SLURM_SHARDS_ON_NODE": "8",
+            "SLURM_MEM_PER_CPU": "1024",
+            "SLURM_MEM_PER_GPU": "128G",
+            "SLURM_MEM_PER_NODE": "1T",
+            "SLURM_STEP_ID": "3",
+            "SLURM_STEP_NODELIST": "gpu-13",
+            "SLURM_STEP_NUM_TASKS": "1",
+            "SLURM_STEPID": "3",
+            "SLURM_PROCID": "0",
+            "SLURM_LOCALID": "0",
+            "SLURM_NODEID": "0",
+            "SLURM_NTASKS": "1",
+            "SLURM_NTASKS_PER_NODE": "1",
+            "SLURM_NPROCS": "1",
+            "SLURM_TASKS_PER_NODE": "1",
+            "SLURM_THREADS_PER_CORE": "1",
+            "SLURM_CPU_BIND": "quiet,mask_cpu:0x1",
+            "SLURM_CPU_BIND_LIST": "0x1",
+            "SLURM_CPU_BIND_TYPE": "mask_cpu:",
+            "SLURM_CPU_BIND_VERBOSE": "quiet",
+            "SLURM_MEM_BIND": "local",
+            "SLURM_GPU_BIND": "closest",
+            "SLURM_TRES_BIND": "gres/gpu:per_task:1",
+            "SLURM_TRES_PER_TASK": "cpu=112",
+            "SLURM_TRES_FREQ": "gpu=high",
+            "SLURM_DISTRIBUTION": "block",
+            "SLURM_CONSTRAINT": "h100",
+            "SLURM_EXCLUSIVE": "1",
+            "SLURM_OVERCOMMIT": "1",
+            "SLURM_SPREAD_JOB": "1",
+            "SLURM_EXPORT_ENV": "NONE",
+            "SLURM_GTIDS": "0",
+            "SLURM_TASK_PID": "12345",
+            "SLURM_TASK_PROLOG": "/stale/task-prolog",
+            "SLURM_SRUN_COMM_HOST": "10.0.0.1",
+            "SLURM_CONTAINER": "/stale/controller.sqsh",
+            "SLURM_JOB_UNRECOGNIZED": "unsafe-by-default",
+        }
+        original = dict(source)
+
+        environment = build_srun_environment(source)
+
+        self.assertEqual(original, source)
+        self.assertEqual(
+            {
+                "PATH": "/usr/bin",
+                "SLURM_JOB_ID": "263105",
+                "SLURM_JOBID": "263105",
+                "SLURM_JOB_NODELIST": "gpu-[0,5,8,13]",
+                "SLURM_JOB_NODES": "gpu-[0,5,8,13]",
+                "SLURM_JOB_NUM_NODES": "4",
+                "SLURM_JOB_CPUS_PER_NODE": "112(x4)",
+                "SLURM_JOB_GPUS": "0,1,2,3,4,5,6,7",
+                "SLURM_JOB_END_TIME": "1786150800",
+                "SLURM_CLUSTER_NAME": "tokyo",
+                "SLURM_CONF": "/etc/slurm/slurm.conf",
+                "SLURM_SUBMIT_DIR": "/shared/run",
+                "SLURM_SUBMIT_HOST": "login-0",
+            },
+            environment,
+        )
+
+    def test_srun_strips_exact_v20_cpu_environment(self) -> None:
+        mask = "0x0000000FFFFFFF0000000FFFFFFF0000000FFFFFFF0000000FFFFFFF"
+
+        environment = build_srun_environment(
+            {
+                "SLURM_JOB_ID": "263105",
+                "SLURM_CPUS_PER_TASK": "112",
+                "SLURM_CPU_BIND": f"quiet,mask_cpu:{mask}",
+                "SLURM_CPU_BIND_LIST": mask,
+                "SLURM_CPU_BIND_TYPE": "mask_cpu:",
+                "SLURM_CPU_BIND_VERBOSE": "quiet",
+            }
+        )
+
+        self.assertEqual({"SLURM_JOB_ID": "263105"}, environment)
+
+    def test_srun_sanitizes_the_default_process_environment(self) -> None:
         with mock.patch.dict(
             os.environ,
             {
-                "SCRUFFY_NODE": "stale-node",
-                "SLURM_CPU_BIND": "verbose,mask_cpu:0x1",
-                "SLURM_CPU_BIND_LIST": "0x1",
-                "SLURM_CPU_BIND_TYPE": "mask_cpu",
-                "SLURM_CPU_BIND_VERBOSE": "verbose",
-                "KEPT": "yes",
+                "PATH": "/usr/bin",
+                "SLURM_JOB_ID": "263105",
+                "SLURM_GRES": "gpu:h100:8",
+                "SLURM_GPUS_ON_NODE": "8",
+                "SRUN_EXPORT_ENV": "NONE",
             },
             clear=True,
         ):
             environment = build_srun_environment()
 
-        self.assertNotIn("SCRUFFY_NODE", environment)
-        self.assertFalse(
-            any(name.startswith("SLURM_CPU_BIND") for name in environment)
+        self.assertEqual(
+            {"PATH": "/usr/bin", "SLURM_JOB_ID": "263105"}, environment
         )
-        self.assertEqual("yes", environment["KEPT"])
 
 
 class InventoryTests(unittest.TestCase):
