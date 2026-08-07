@@ -19,6 +19,7 @@ from scruffy.mcp_server import (
     wait_for_updates,
 )
 from scruffy.storage import (
+    TransientStorageError,
     append_event,
     list_requests,
     load_state,
@@ -285,6 +286,34 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(update["timed_out"])
         self.assertEqual(["workload.milestone"], [item["kind"] for item in update["events"]])
+
+    async def test_wait_retries_a_transient_state_read(self) -> None:
+        job = _job("job-1")
+        event = self.event(1, "job.running")
+        response = {
+            "snapshot": {"jobs": {"job-1": job}},
+            "events": [event],
+            "next_cursor": f"{self.identity}:0:1:100",
+            "latest_cursor": f"{self.identity}:0:1:100",
+            "more": False,
+            "reset": False,
+        }
+        sleep = mock.AsyncMock()
+
+        with mock.patch(
+            "scruffy.mcp_server.observe",
+            side_effect=[TransientStorageError("temporary read failure"), response],
+        ):
+            result = await wait_for_updates(
+                self.root,
+                after=f"{self.identity}:0:0:0",
+                timeout_seconds=1,
+                poll_seconds=0.01,
+                sleep=sleep,
+            )
+
+        self.assertEqual(["job.running"], [item["kind"] for item in result["events"]])
+        sleep.assert_awaited_once()
 
     async def test_filtered_backlog_is_drained_page_by_page(self) -> None:
         events = [self.event(seq, "workload.progress") for seq in range(1, 66)]

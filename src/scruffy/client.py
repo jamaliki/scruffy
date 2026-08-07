@@ -18,6 +18,7 @@ from .models import (
 )
 from .protocol import validate_event
 from .storage import (
+    StorageError,
     create_job_id,
     find_archived_job,
     list_archived_workflow,
@@ -285,11 +286,15 @@ def status(
     raise KeyError(f"unknown job {job_id}")
 
 
-def _snapshot_cursor(root: Path) -> tuple[int, int, int]:
+def _snapshot_cursor(root: Path) -> tuple[str, int, int, int]:
     snapshot = load_state(root)
     if snapshot is None:
-        return 0, 0, 0
+        return queue_id(root), 0, 0, 0
+    identity = snapshot.get("queue_id")
+    if not isinstance(identity, str) or not identity:
+        raise StorageError("queue state has no valid identity")
     return (
+        identity,
         int(snapshot.get("journal_generation", 0)),
         int(snapshot.get("last_seq", 0)),
         int(snapshot.get("journal_offset", 0)),
@@ -312,8 +317,11 @@ def _event_project(event: dict[str, Any], snapshot: dict[str, Any]) -> str | Non
     return job_project(candidate) if isinstance(candidate, dict) else DEFAULT_PROJECT
 
 
-def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, bool]:
-    """Return generation, sequence, offset, and whether the cursor reset."""
+def _parse_cursor(
+    cursor: str | int | None,
+    current: tuple[str, int, int, int],
+) -> tuple[int, int, int, bool]:
+    """Parse one cursor against an already-read committed watermark."""
 
     def component(value: object) -> int:
         try:
@@ -324,7 +332,7 @@ def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, b
             raise ValueError("invalid cursor")
         return parsed
 
-    current_generation, current_sequence, current_offset = _snapshot_cursor(root)
+    identity, current_generation, current_sequence, current_offset = current
     if cursor is None:
         return current_generation, current_sequence, current_offset, False
     if isinstance(cursor, int):
@@ -352,9 +360,15 @@ def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, b
     parsed_generation = component(generation)
     parsed_sequence = component(sequence)
     parsed_offset = component(offset)
-    if cursor_queue != queue_id(root) or parsed_generation != current_generation:
+    if cursor_queue != identity or parsed_generation != current_generation:
         return current_generation, current_sequence, current_offset, True
     return current_generation, parsed_sequence, parsed_offset, False
+
+
+def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, bool]:
+    """Return generation, sequence, offset, and whether the cursor reset."""
+
+    return _parse_cursor(cursor, _snapshot_cursor(root))
 
 
 def observe(
@@ -370,13 +384,12 @@ def observe(
 
     if limit <= 0:
         raise ValueError("limit must be positive")
-    generation, sequence, offset, reset = parse_cursor(root, after)
+    committed_cursor = _snapshot_cursor(root)
+    identity = committed_cursor[0]
+    generation, sequence, offset, reset = _parse_cursor(after, committed_cursor)
     page_limit = min(limit, 64) if include_output else limit
     deadline = time.monotonic() + max(wait_seconds, 0)
-    committed = _snapshot_cursor(root)
-    if committed[0] != generation:
-        generation, sequence, offset = committed
-        reset = True
+    committed = committed_cursor[1:]
     page, offset, more = read_event_page(
         root,
         after=sequence,
@@ -389,7 +402,14 @@ def observe(
         if page or more or time.monotonic() >= deadline:
             break
         time.sleep(min(0.2, max(deadline - time.monotonic(), 0)))
-        current = _snapshot_cursor(root)
+        current_cursor = _snapshot_cursor(root)
+        current_identity = current_cursor[0]
+        current = current_cursor[1:]
+        if current_identity != identity:
+            identity = current_identity
+            generation, sequence, offset = current
+            page, more, reset = [], False, True
+            break
         if current == committed:
             continue
         if current[0] != generation:
@@ -432,11 +452,14 @@ def observe(
         visible.append(event)
     if selected_project is not None:
         _scope_state(snapshot, selected_project)
-    identity = queue_id(root)
+    snapshot_identity = snapshot.get("queue_id")
+    if not isinstance(snapshot_identity, str) or not snapshot_identity:
+        raise StorageError("queue state has no valid identity")
     snapshot_generation = int(snapshot.get("journal_generation", 0))
     latest_sequence = int(snapshot.get("last_seq", 0))
     latest_offset = int(snapshot.get("journal_offset", 0))
-    if snapshot_generation != generation:
+    if snapshot_identity != identity or snapshot_generation != generation:
+        identity = snapshot_identity
         generation = snapshot_generation
         next_sequence = latest_sequence
         offset = latest_offset

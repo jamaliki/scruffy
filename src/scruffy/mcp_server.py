@@ -24,12 +24,14 @@ from .models import (
     job_project,
     normalize_project_id,
 )
+from .storage import TransientStorageError
 from .summary import build_summary, job_view
 
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
 MAX_TIMEOUT_SECONDS = 60 * 60
 PAGE_SIZE = 64
 POLL_SECONDS = 1.0
+MAX_TRANSIENT_READ_FAILURES = 3
 QUIET_EVENT_KINDS = frozenset({"job.output", "workload.progress"})
 
 SERVER_INSTRUCTIONS = """\
@@ -314,22 +316,32 @@ async def wait_for_updates(
     selected_project = (
         normalize_project_id(project_id) if project_id is not None else None
     )
-    cursor = (
-        summary(root, limit=1, project_id=selected_project)["as_of_cursor"]
-        if after is None
-        else after
-    )
+    cursor = after
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    transient_failures = 0
 
     while True:
-        response = observe(
-            root,
-            after=cursor,
-            include_output=False,
-            limit=PAGE_SIZE,
-            project_id=selected_project,
-        )
+        try:
+            if cursor is None:
+                cursor = summary(root, limit=1, project_id=selected_project)[
+                    "as_of_cursor"
+                ]
+            response = observe(
+                root,
+                after=cursor,
+                include_output=False,
+                limit=PAGE_SIZE,
+                project_id=selected_project,
+            )
+        except TransientStorageError:
+            transient_failures += 1
+            remaining = deadline - loop.time()
+            if transient_failures >= MAX_TRANSIENT_READ_FAILURES or remaining <= 0:
+                raise
+            await sleep(min(poll_seconds, remaining))
+            continue
+        transient_failures = 0
         cursor = response["next_cursor"]
         if response["reset"]:
             return {

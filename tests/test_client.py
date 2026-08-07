@@ -374,12 +374,16 @@ class ObserveTests(unittest.TestCase):
 
     def test_observe_closes_append_between_size_check_and_first_read(self) -> None:
         event = {"seq": 1, "kind": "job.queued"}
+        identity = queue_id(self.root)
         with (
             mock.patch("scruffy.client.time.monotonic", return_value=0),
             mock.patch("scruffy.client.time.sleep"),
             mock.patch(
                 "scruffy.client._snapshot_cursor",
-                side_effect=[(0, 0, 0), (0, 0, 0), (0, 1, 10)],
+                side_effect=[
+                    (identity, 0, 0, 0),
+                    (identity, 0, 1, 10),
+                ],
             ),
             mock.patch(
                 "scruffy.client.read_event_page",
