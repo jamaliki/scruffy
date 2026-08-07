@@ -11,7 +11,7 @@ from typing import Any
 
 from .models import Assignment, QueuedJob, ResourceRequest, job_project
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
-from .scheduler import choose_oldest_fitting_job
+from .scheduler import choose_first_fitting_job, project_gpu_usage, queue_priority_key
 from .slurm import (
     build_local_argv,
     build_srun_argv,
@@ -164,15 +164,17 @@ def schedule(controller: Controller) -> None:
         and not controller.state["draining"]
         and not controller.state.get("launches_paused", False)
     ):
-        queued = sorted(
-            (
-                QueuedJob(job["id"], ResourceRequest.from_dict(job["request"]))
-                for job in controller.state["jobs"].values()
-                if job["state"] == "queued"
-            ),
-            key=lambda item: controller.state["jobs"][item.job_id]["queue_order"],
+        jobs = controller.state["jobs"]
+        usage = project_gpu_usage(jobs.values())
+        queued_images = sorted(
+            (job for job in jobs.values() if job["state"] == "queued"),
+            key=lambda job: queue_priority_key(job, usage),
         )
-        choice = choose_oldest_fitting_job(
+        queued = [
+            QueuedJob(job["id"], ResourceRequest.from_dict(job["request"]))
+            for job in queued_images
+        ]
+        choice = choose_first_fitting_job(
             controller.inventory, active_assignments(controller.state), queued
         )
         if choice is None:

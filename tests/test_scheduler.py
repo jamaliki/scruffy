@@ -14,7 +14,9 @@ from scruffy.scheduler import (
     assert_invariants,
     available_resources,
     choose_assignment,
-    choose_oldest_fitting_job,
+    choose_first_fitting_job,
+    project_gpu_usage,
+    queue_priority_key,
     request_can_ever_fit,
 )
 
@@ -140,7 +142,7 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaisesRegex(InvariantError, "non-rectangular"):
             assert_invariants(self.inventory, (malformed,))
 
-    def test_oldest_fit_backfills_around_blocked_job(self) -> None:
+    def test_first_fit_backfills_around_job_that_cannot_fit(self) -> None:
         active = (
             self.assignment_for(
                 "fills-b", "gpu-b", (0, 1, 2, 3), cpus=56, memory_gb=512
@@ -155,7 +157,7 @@ class SchedulerTests(unittest.TestCase):
         oldest = QueuedJob("oldest", request(nodes=2, gpus=5, cpus=1, memory_gb=1))
         newer = QueuedJob("newer", request())
 
-        choice = choose_oldest_fitting_job(
+        choice = choose_first_fitting_job(
             self.inventory, active, (oldest, newer)
         )
 
@@ -163,11 +165,35 @@ class SchedulerTests(unittest.TestCase):
         assert choice is not None
         self.assertEqual(choice[0], newer)
 
+    def test_queue_priority_favors_projects_using_fewer_gpus_then_fifo(self) -> None:
+        active = {
+            "id": "heavy-active",
+            "project_id": "heavy",
+            "state": "running",
+            "assignment": self.assignment_for(
+                "heavy-active", "gpu-a", (0, 1, 2, 3)
+            ).to_dict(),
+        }
+        queued = [
+            {"id": "heavy-old", "project_id": "heavy", "queue_order": 1},
+            {"id": "light-new", "project_id": "light", "queue_order": 3},
+            {"id": "light-old", "project_id": "light", "queue_order": 2},
+        ]
+
+        usage = project_gpu_usage([active, *queued])
+        ordered = sorted(queued, key=lambda job: queue_priority_key(job, usage))
+
+        self.assertEqual({"heavy": 4}, usage)
+        self.assertEqual(
+            ["light-old", "light-new", "heavy-old"],
+            [job["id"] for job in ordered],
+        )
+
     def test_duplicate_queued_jobs_are_rejected_before_planning(self) -> None:
         duplicate = QueuedJob("same", request())
 
         with self.assertRaisesRegex(InvariantError, "IDs must be unique"):
-            choose_oldest_fitting_job(
+            choose_first_fitting_job(
                 self.inventory, (), (duplicate, duplicate)
             )
 

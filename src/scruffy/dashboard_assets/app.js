@@ -260,7 +260,7 @@ function render() {
   renderConnection(snapshot); renderMetrics(snapshot, stale); renderProjects(snapshot); renderNodes(snapshot);
   renderProjectLegend(snapshot); renderProjectBoard(snapshot);
   renderList("active", snapshot.active, "No jobs are using resources.");
-  renderList("queued", [...(snapshot.submitted || []), ...(snapshot.queued || [])], "No jobs are waiting for placement.");
+  renderList("queued", [...(snapshot.queued || []), ...(snapshot.submitted || [])], "No jobs are waiting for placement.");
   renderList("blocked", snapshot.blocked, "No workflows are dependency-blocked.");
   const attention = renderList("attention", snapshot.requires_attention, "Nothing requires attention.", true);
   byId("attention-count").textContent = String(attention);

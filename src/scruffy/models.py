@@ -208,8 +208,9 @@ class ResourceRequest:
 class QueuedJob:
     """The scheduling portion of a queued job.
 
-    A sequence of ``QueuedJob`` objects is ordered oldest first.  Keeping age
-    out of this model avoids trusting timestamps supplied by concurrent clients.
+    A sequence of ``QueuedJob`` objects is ordered by scheduling priority.
+    Keeping policy metadata out of this model leaves ordering with the
+    single-writer controller.
     """
 
     job_id: str

@@ -41,7 +41,7 @@ export function projectSummaries(snapshot) {
     if (!summary[lane].some((candidate) => candidate.id === job.id)) summary[lane].push(job);
   };
   for (const job of snapshot?.active || []) add(job, "active");
-  for (const job of [...(snapshot?.submitted || []), ...(snapshot?.queued || [])]) add(job, "queued");
+  for (const job of [...(snapshot?.queued || []), ...(snapshot?.submitted || [])]) add(job, "queued");
   for (const job of snapshot?.blocked || []) add(job, "blocked");
 
   const jobs = uniqueJobs(snapshot);

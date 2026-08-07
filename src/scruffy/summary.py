@@ -14,6 +14,7 @@ from .models import (
     job_project,
     normalize_project_id,
 )
+from .scheduler import project_gpu_usage, queue_priority_key
 from .workflows import select_task_attempts
 
 ATTENTION_STATES = {"failed", "lost", "rejected", "skipped"}
@@ -114,13 +115,15 @@ def compact_job_page(
         and (selected_states is None or job.get("state") in selected_states)
         and (project_id is None or job_project(job) == project_id)
     ]
-    jobs.sort(
-        key=lambda job: (
-            _queue_order(job),
-            str(job.get("submitted_at") or ""),
-            str(job.get("id") or ""),
-        )
-    )
+    if selected_states == set(QUEUE_VIEW_STATES):
+        usage = project_gpu_usage(state.get("jobs", {}).values())
+        jobs.sort(key=lambda job: queue_priority_key(job, usage))
+    elif selected_states == set(RUNNING_VIEW_STATES):
+        jobs.sort(key=_running_recency_key, reverse=True)
+    elif selected_states == set(BLOCKED_VIEW_STATES):
+        jobs.sort(key=_accepted_recency_key, reverse=True)
+    else:
+        jobs.sort(key=lambda job: (_queue_order(job), str(job.get("id") or "")))
     page = jobs[offset : offset + limit]
     return {
         "v": 1,
@@ -222,6 +225,18 @@ def _queue_order(job: dict[str, Any]) -> int:
     return value if type(value) is int else 0
 
 
+def _accepted_recency_key(job: dict[str, Any]) -> tuple[int, str]:
+    return _queue_order(job), str(job.get("id") or "")
+
+
+def _running_recency_key(job: dict[str, Any]) -> tuple[str, int, str]:
+    return (
+        str(job.get("started_at") or ""),
+        _queue_order(job),
+        str(job.get("id") or ""),
+    )
+
+
 def _recent_key(job: dict[str, Any]) -> str:
     workload = job.get("workload")
     workload_at = workload.get("last_update_at") if isinstance(workload, dict) else None
@@ -271,15 +286,18 @@ def build_summary(
     )
     active_jobs = sorted(
         (job for job in jobs if job.get("state") in ACTIVE_JOB_STATES),
-        key=_queue_order,
+        key=_running_recency_key,
+        reverse=True,
     )
+    usage = project_gpu_usage(jobs)
     queued_jobs = sorted(
         (job for job in jobs if job.get("state") == "queued"),
-        key=_queue_order,
+        key=lambda job: queue_priority_key(job, usage),
     )
     blocked_jobs = sorted(
         (job for job in jobs if job.get("state") == "blocked"),
-        key=_queue_order,
+        key=_accepted_recency_key,
+        reverse=True,
     )
     attention_jobs = sorted(
         (

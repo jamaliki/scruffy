@@ -89,6 +89,10 @@ agents; reading does not consume events for anyone else. Use
 - Prefer `summary` for bounded orientation; `resources`, `running`, `queue`, or
   `blocked` for compact operational views; `explain` for one dependency chain;
   and `observe` for incremental monitoring.
+- Focused job views are already operationally ordered: newest-started running
+  jobs first, highest-priority queued jobs first, and newest-admitted blocked
+  jobs first. Queue priority favors projects currently holding fewer GPUs, then
+  preserves controller-owned FIFO order.
 - Use `scruffy dashboard` for human allocation orientation. It is read-only,
   loopback-only, and uses the same compact views; do not infer queue state by
   scraping its HTML.

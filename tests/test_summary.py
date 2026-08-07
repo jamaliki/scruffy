@@ -16,6 +16,26 @@ from scruffy.summary import (
 
 
 class SummaryTests(unittest.TestCase):
+    @staticmethod
+    def assignment(job_id: str, gpu_ids: list[int]) -> dict[str, object]:
+        return {
+            "job_id": job_id,
+            "request": {
+                "nodes": 1,
+                "gpus_per_node": len(gpu_ids),
+                "cpus_per_node": 1,
+                "memory_gb_per_node": 1,
+            },
+            "reservations": [
+                {
+                    "node": "gpu-0",
+                    "gpu_ids": gpu_ids,
+                    "cpus": 1,
+                    "memory_gb": 1,
+                }
+            ],
+        }
+
     def test_operational_views_are_compact_and_state_specific(self) -> None:
         state = {
             "queue_id": "queue-test",
@@ -119,6 +139,108 @@ class SummaryTests(unittest.TestCase):
             [node["name"] for node in result["nodes"]],
         )
         self.assertNotIn("assignments", str(result))
+
+    def test_operational_views_use_scheduler_and_recency_order(self) -> None:
+        state = {
+            "queue_id": "queue-test",
+            "jobs": {
+                "heavy-active": {
+                    "id": "heavy-active",
+                    "project_id": "heavy",
+                    "name": "heavy active",
+                    "state": "running",
+                    "queue_order": 1,
+                    "started_at": "2026-08-07T10:00:00+00:00",
+                    "assignment": self.assignment("heavy-active", [0, 1, 2, 3]),
+                },
+                "light-active": {
+                    "id": "light-active",
+                    "project_id": "light",
+                    "name": "light active",
+                    "state": "running",
+                    "queue_order": 2,
+                    "started_at": "2026-08-07T11:00:00+00:00",
+                    "assignment": self.assignment("light-active", [4]),
+                },
+                "heavy-queued": {
+                    "id": "heavy-queued",
+                    "project_id": "heavy",
+                    "name": "heavy queued",
+                    "state": "queued",
+                    "queue_order": 3,
+                },
+                "light-queued": {
+                    "id": "light-queued",
+                    "project_id": "light",
+                    "name": "light queued",
+                    "state": "queued",
+                    "queue_order": 4,
+                },
+                "blocked-old": {
+                    "id": "blocked-old",
+                    "name": "blocked old",
+                    "state": "blocked",
+                    "queue_order": 5,
+                },
+                "blocked-new": {
+                    "id": "blocked-new",
+                    "name": "blocked new",
+                    "state": "blocked",
+                    "queue_order": 6,
+                },
+            },
+        }
+
+        result = build_summary(state)
+        running = compact_job_page(
+            state,
+            states=RUNNING_VIEW_STATES,
+            offset=0,
+            limit=20,
+            project_id=None,
+            include_elapsed=True,
+        )
+        queued = compact_job_page(
+            state,
+            states=QUEUE_VIEW_STATES,
+            offset=0,
+            limit=20,
+            project_id=None,
+            include_elapsed=False,
+        )
+        blocked = compact_job_page(
+            state,
+            states=BLOCKED_VIEW_STATES,
+            offset=0,
+            limit=20,
+            project_id=None,
+            include_elapsed=False,
+        )
+
+        self.assertEqual(
+            ["light-active", "heavy-active"],
+            [job["id"] for job in result["active"]],
+        )
+        self.assertEqual(
+            ["light-queued", "heavy-queued"],
+            [job["id"] for job in result["queued"]],
+        )
+        self.assertEqual(
+            ["blocked-new", "blocked-old"],
+            [job["id"] for job in result["blocked"]],
+        )
+        self.assertEqual(
+            ["light-active", "heavy-active"],
+            [job["id"] for job in running["jobs"]],
+        )
+        self.assertEqual(
+            ["light-queued", "heavy-queued"],
+            [job["id"] for job in queued["jobs"]],
+        )
+        self.assertEqual(
+            ["blocked-new", "blocked-old"],
+            [job["id"] for job in blocked["jobs"]],
+        )
 
     def test_artifact_projection_replaces_a_replayed_event_id(self) -> None:
         job: dict[str, object] = {"id": "job-1", "state": "running"}

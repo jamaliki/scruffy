@@ -115,8 +115,9 @@ returned snapshot. See [the client contract](docs/client-v1.md).
 
 Projects isolate names and monitoring without dividing the allocation. There is
 still one controller, one global resource ledger, and one scheduling queue, so
-GPU exclusivity holds across every project. A project is not an access-control,
-quota, or fairness boundary.
+GPU exclusivity holds across every project. Projects provide a small dynamic
+fair-share signal, not a quota or access-control boundary: the scheduler prefers
+the project currently holding fewer GPUs, then preserves FIFO order.
 
 Set `--project` on submission and observation, or export `SCRUFFY_PROJECT` for
 an agent session:
@@ -421,9 +422,13 @@ The active and immediately previous journal generations are retained.
 Compact request receipts and workflow indexes last for the queue root's lifetime,
 so archive storage grows as O(total jobs) small files and inodes.
 
-Placement is deterministic best-fit with simple backfilling, but does not
-guarantee fairness for a large queued request. Queued and dependency-blocked jobs
-can survive a replacement allocation. Active jobs from a replaced allocation
+Placement is deterministic best-fit with simple backfilling. Before every
+placement, queued jobs are ordered by their project's currently assigned GPU
+count and then by controller-owned queue order. This balances concurrent GPU use
+without storing historical usage or blocking smaller jobs that fit. It does not
+reserve a fixed share or prevent a large request from waiting for enough GPUs.
+Queued and dependency-blocked jobs can survive a replacement allocation. Active
+jobs from a replaced allocation
 become `lost` and are never retried automatically. Resource assignments remain
 reserved whenever Slurm reconciliation is uncertain. On a controller restart
 inside the same Slurm allocation, persisted launch tokens are matched back to

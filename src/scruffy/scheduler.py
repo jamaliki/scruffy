@@ -8,21 +8,66 @@ impossible through Scruffy's queue API.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from .models import (
+    ACTIVE_JOB_STATES,
     Assignment,
+    ModelError,
     NodeAvailability,
     NodeInventory,
     NodeReservation,
     QueuedJob,
     ResourceRequest,
+    job_project,
     validate_inventory,
 )
 
 
 class InvariantError(RuntimeError):
     """Raised when resource state is inconsistent or overcommitted."""
+
+
+def project_gpu_usage(jobs: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Return GPUs currently assigned to each project.
+
+    This is deliberately based only on live reservations. Queued demand does
+    not make a project look busy, and completed work earns no lasting credit.
+    """
+
+    usage: Counter[str] = Counter()
+    for job in jobs:
+        if (
+            job.get("state") not in ACTIVE_JOB_STATES
+            or job.get("assignment") is None
+        ):
+            continue
+        try:
+            assignment = Assignment.from_dict(job["assignment"])
+        except ModelError:
+            # Read-only views should remain available if an old record has no
+            # decodable reservation. The controller still validates its full
+            # active ledger before it can place anything.
+            continue
+        usage[job_project(job)] += sum(
+            len(reservation.gpu_ids) for reservation in assignment.reservations
+        )
+    return dict(usage)
+
+
+def queue_priority_key(
+    job: dict[str, Any], usage: dict[str, int]
+) -> tuple[int, int, str]:
+    """Order lower-usage projects first, then preserve FIFO within a tie."""
+
+    queue_order = job.get("queue_order")
+    return (
+        usage.get(job_project(job), 0),
+        queue_order if type(queue_order) is int else 2**63 - 1,
+        str(job.get("id") or ""),
+    )
 
 
 def _inventory_by_name(
@@ -219,15 +264,15 @@ def _candidate_assignment(
     return assignment
 
 
-def choose_oldest_fitting_job(
+def choose_first_fitting_job(
     inventory: Sequence[NodeInventory],
     assignments: Sequence[Assignment],
     queued_jobs: Sequence[QueuedJob],
 ) -> tuple[QueuedJob, Assignment] | None:
-    """Return the oldest queued job that currently fits.
+    """Return the first queued job that currently fits.
 
-    The input is ordered oldest first.  Skipping a blocked job provides simple
-    backfilling without making submission wait for unrelated work.
+    The caller owns priority order. Skipping a job that cannot fit provides
+    simple backfilling without making submission wait for unrelated work.
     """
 
     if not all(isinstance(job, QueuedJob) for job in queued_jobs):

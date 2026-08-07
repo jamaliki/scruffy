@@ -85,6 +85,13 @@ resource-holding active state; `blocked` contains only dependency-blocked jobs.
 capacity without assignment details. Paginate job views while `more` is true,
 then inspect only the selected job that needs detail.
 
+Operational job views use scheduler-relevant order: running jobs are newest
+started first, blocked jobs are newest admitted first, and queued jobs are
+highest priority first. Queue priority is dynamic: projects holding fewer GPUs
+come first, with controller-owned FIFO order breaking ties. The scheduler
+recomputes that order after every placement and backfills past requests that do
+not currently fit.
+
 `explain(root, job_id)` returns the job, its resolved upstream job IDs and
 states, current blockers, and a short explanation. Compact archived job and
 workflow metadata remains sufficient for older terminal-job lookup and
