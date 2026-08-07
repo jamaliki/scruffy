@@ -90,11 +90,18 @@ def _job(
 
 class ProjectionTests(unittest.TestCase):
     def test_compact_views_exclude_process_details(self) -> None:
-        job = _job("job-1")
+        job = {
+            **_job("job-1"),
+            "submitted_at": "2026-08-07T12:00:00+00:00",
+            "request": {"gpus_per_node": 8},
+            "stdout": "jobs/job-1/stdout.log",
+        }
         event = {
             "v": 1,
+            "queue_id": "queue-1",
             "seq": 1,
             "event_id": "queue:1",
+            "at": "2026-08-07T12:01:00+00:00",
             "kind": "job.running",
             "job_id": "job-1",
             "job": job,
@@ -105,12 +112,66 @@ class ProjectionTests(unittest.TestCase):
             {"v": 1, "job": job, "dependencies": [], "explanation": "running"}
         )
 
-        for view in (compact["job"], explanation["job"]):
-            self.assertEqual("running", view["state"])
-            self.assertEqual({"phase": "training"}, view["workload"])
-            self.assertNotIn("argv", view)
-            self.assertNotIn("cwd", view)
-            self.assertNotIn("environment", view)
+        self.assertEqual(
+            {
+                "kind": "job.running",
+                "job_id": "job-1",
+                "project_id": "default",
+                "name": "training",
+            },
+            compact,
+        )
+        self.assertEqual("running", explanation["job"]["state"])
+        self.assertEqual({"phase": "training"}, explanation["job"]["workload"])
+        for field in (
+            "argv",
+            "cwd",
+            "environment",
+            "request",
+            "assignment",
+            "stdout",
+            "submitted_at",
+            "queue_id",
+            "seq",
+            "event_id",
+            "at",
+            "v",
+        ):
+            self.assertNotIn(field, compact)
+
+    def test_compact_events_keep_only_semantic_data(self) -> None:
+        job = _job("job-1")
+        snapshot = {"jobs": {"job-1": job}}
+
+        lifecycle = compact_event(
+            {
+                "kind": "job.cancelled",
+                "job_id": "job-1",
+                "data": {
+                    "request_id": "cancel-1",
+                    "reason": "cancelled",
+                    "nodes": [{"name": "gpu-0", "gpu_ids": list(range(8))}],
+                },
+            },
+            snapshot,
+        )
+        workload = compact_event(
+            {
+                "kind": "workload.milestone",
+                "job_id": "job-1",
+                "data": {"name": "accuracy_target", "value": 0.9},
+            },
+            snapshot,
+        )
+
+        self.assertEqual(
+            {"request_id": "cancel-1", "reason": "cancelled"},
+            lifecycle["data"],
+        )
+        self.assertNotIn("nodes", json.dumps(lifecycle))
+        self.assertEqual(
+            {"name": "accuracy_target", "value": 0.9}, workload["data"]
+        )
 
     def test_default_and_exact_kind_filters(self) -> None:
         snapshot = {"jobs": {}}
@@ -322,7 +383,9 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
 
         result = await wait_for_updates(self.root, after="0", timeout_seconds=1)
 
-        self.assertEqual([66], [event["seq"] for event in result["events"]])
+        self.assertEqual(
+            ["job.succeeded"], [event["kind"] for event in result["events"]]
+        )
         self.assertFalse(result["more"])
 
     async def test_readers_keep_independent_cursors(self) -> None:
@@ -335,7 +398,9 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
         first = await wait_for_updates(self.root, after="0", timeout_seconds=0)
         second = await wait_for_updates(self.root, after="0", timeout_seconds=0)
 
-        self.assertEqual([1], [event["seq"] for event in first["events"]])
+        self.assertEqual(
+            ["job.running"], [event["kind"] for event in first["events"]]
+        )
         self.assertEqual(first["events"], second["events"])
         self.assertEqual(first["next_cursor"], second["next_cursor"])
 
@@ -360,7 +425,10 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
             project_id="project-a",
         )
 
-        self.assertEqual(["job-selected"], [event["job_id"] for event in result["events"]])
+        self.assertEqual(
+            ["job-selected"], [event["job_id"] for event in result["events"]]
+        )
+        self.assertNotIn("project_id", result["events"][0])
 
     async def test_forwarded_project_pins_overview_and_inspection(self) -> None:
         _commit(
@@ -602,9 +670,19 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             _commit(self.root, [event], jobs={self.job_id: finished})
             result = self.structured(await pending)
 
-        self.assertEqual(["job.succeeded"], [event["kind"] for event in result["events"]])
+        self.assertEqual(
+            ["job.succeeded"], [event["kind"] for event in result["events"]]
+        )
         self.assertFalse(result["timed_out"])
-        self.assertNotIn("argv", result["events"][0]["job"])
+        self.assertEqual(
+            {
+                "kind",
+                "job_id",
+                "project_id",
+                "name",
+            },
+            result["events"][0].keys(),
+        )
 
     async def test_project_pinned_server_exposes_idempotent_submission(self) -> None:
         source_root = Path(__file__).resolve().parents[1] / "src"
