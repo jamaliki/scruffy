@@ -1,6 +1,6 @@
 import {
   allocationIsStale, formatAge, formatDuration, formatNumber, gpuOwners,
-  progressLabel, projectColor, projects, resourceLabel, resourceTotals,
+  progressLabel, projectColor, projects, projectSummaries, resourceLabel, resourceTotals,
   scalarTelemetry, stateTone, TELEMETRY_STALE_AFTER_MS, uniqueJobs, visibleJobs,
 } from "/assets/model.js";
 
@@ -107,6 +107,29 @@ function renderNodes(snapshot) {
   byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available`;
 }
 
+function legendItem(label, color = null, project = null) {
+  const item = element(project ? "button" : "span", "legend-item");
+  if (project) {
+    item.type = "button";
+    item.dataset.projectFilter = project;
+    item.style.setProperty("--project-color", color);
+    item.classList.toggle("selected", view.project === project);
+    item.title = `Filter dashboard to ${project}`;
+  }
+  const swatch = element("i", color ? "legend-swatch" : "legend-swatch free");
+  if (color) swatch.style.setProperty("--project-color", color);
+  item.append(swatch, element("span", "", label));
+  return item;
+}
+
+function renderProjectLegend(snapshot) {
+  const activeProjects = projectSummaries(snapshot).filter((summary) => summary.gpus > 0);
+  replace(byId("project-legend"), [
+    legendItem("Free"),
+    ...activeProjects.map((summary) => legendItem(summary.project, projectColor(summary.project), summary.project)),
+  ]);
+}
+
 function projectTag(project) {
   const tag = element("span", "project-tag", project || "default");
   tag.style.setProperty("--project-color", projectColor(project));
@@ -141,6 +164,59 @@ function renderList(targetId, jobs, emptyMessage, compact = false) {
   return selected.length;
 }
 
+function projectLane(label, jobs, emptyMessage) {
+  const lane = element("section", "project-lane");
+  const heading = element("h4", "");
+  heading.append(element("span", "", label), element("strong", "", String(jobs.length)));
+  const list = element("div", "job-list");
+  list.append(...(jobs.length ? jobs.map((job) => jobRow(job, true)) : [empty(emptyMessage)]));
+  lane.append(heading, list);
+  return lane;
+}
+
+function projectCard(summary) {
+  const card = element("article", "project-card");
+  card.style.setProperty("--project-color", projectColor(summary.project));
+  const header = element("header", "project-card-header");
+  const identity = element("div", "project-identity");
+  identity.append(element("span", "project-swatch"));
+  const name = element("button", "project-name", summary.project);
+  name.type = "button"; name.dataset.projectFilter = summary.project;
+  identity.append(name);
+  const stats = element("div", "project-stats");
+  stats.append(
+    element("span", "", `${summary.gpus} GPU${summary.gpus === 1 ? "" : "s"}`),
+    element("span", "", `${summary.active.length} running`),
+    element("span", "", `${summary.queued.length} queued`),
+    element("span", "", `${summary.blocked.length} blocked`),
+  );
+  header.append(identity, stats);
+  const lanes = element("div", "project-lanes");
+  lanes.append(
+    projectLane("Running", summary.active, "No running jobs."),
+    projectLane("Queued", summary.queued, "No jobs awaiting placement."),
+    projectLane("Blocked", summary.blocked, "No dependency-blocked jobs."),
+  );
+  card.append(header, lanes);
+  return card;
+}
+
+function renderProjectBoard(snapshot) {
+  const summaries = projectSummaries(snapshot)
+    .filter((summary) => view.project === "all" || summary.project === view.project)
+    .map((summary) => ({
+      ...summary,
+      active: visibleJobs(summary.active, "all", view.search),
+      queued: visibleJobs(summary.queued, "all", view.search),
+      blocked: visibleJobs(summary.blocked, "all", view.search),
+    }))
+    .filter((summary) => summary.active.length || summary.queued.length || summary.blocked.length);
+  byId("project-count").textContent = String(summaries.length);
+  replace(byId("project-board"), summaries.length
+    ? summaries.map(projectCard)
+    : [empty("No project has matching active, queued or blocked work.")]);
+}
+
 function renderProjects(snapshot) {
   const select = byId("project-filter");
   const choices = [element("option", "", "All projects")];
@@ -173,6 +249,7 @@ function render() {
   if (!snapshot) return;
   const stale = telemetryIsStale(snapshot);
   renderConnection(snapshot); renderMetrics(snapshot, stale); renderProjects(snapshot); renderNodes(snapshot);
+  renderProjectLegend(snapshot); renderProjectBoard(snapshot);
   renderList("active", snapshot.active, "No jobs are using resources.");
   renderList("queued", [...(snapshot.submitted || []), ...(snapshot.queued || [])], "No jobs are waiting for placement.");
   renderList("blocked", snapshot.blocked, "No workflows are dependency-blocked.");
@@ -240,6 +317,12 @@ async function loadOverview() {
 }
 
 document.addEventListener("click", (event) => {
+  const projectFilter = event.target.closest("[data-project-filter]");
+  if (projectFilter) {
+    view.project = projectFilter.dataset.projectFilter;
+    render();
+    return;
+  }
   const target = event.target.closest("[data-job-id]");
   if (target) openJob(target.dataset.jobId);
 });

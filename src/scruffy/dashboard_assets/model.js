@@ -1,11 +1,17 @@
-const PROJECT_COLORS = ["#ff6b42", "#58c8bf", "#8aa6ff", "#d78ac7", "#91c96f", "#ff8b78"];
+const PROJECT_COLORS = [
+  "#ff6b42", "#58c8bf", "#8aa6ff", "#d78ac7", "#91c96f", "#ff8b78",
+  "#f4c15d", "#6fd9e7", "#b69cff", "#72d6a0", "#ff8bd8", "#b8d66a",
+];
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "lost", "rejected", "skipped"]);
 export const TELEMETRY_STALE_AFTER_MS = 5 * 60 * 1000;
 
 export function projectColor(project) {
   if (!project || project === "default") return "#78979a";
-  let hash = 0;
-  for (const character of project) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  let hash = 2166136261;
+  for (const character of project) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
   return PROJECT_COLORS[hash % PROJECT_COLORS.length];
 }
 
@@ -19,6 +25,39 @@ export function uniqueJobs(snapshot) {
 
 export function projects(snapshot) {
   return [...new Set([...uniqueJobs(snapshot).values()].map((job) => job.project_id || "default"))].sort();
+}
+
+export function projectSummaries(snapshot) {
+  const summaries = new Map();
+  const summaryFor = (project) => {
+    if (!summaries.has(project)) {
+      summaries.set(project, {project, gpus: 0, active: [], queued: [], blocked: []});
+    }
+    return summaries.get(project);
+  };
+  const add = (job, lane) => {
+    const project = job.project_id || "default";
+    const summary = summaryFor(project);
+    if (!summary[lane].some((candidate) => candidate.id === job.id)) summary[lane].push(job);
+  };
+  for (const job of snapshot?.active || []) add(job, "active");
+  for (const job of [...(snapshot?.submitted || []), ...(snapshot?.queued || [])]) add(job, "queued");
+  for (const job of snapshot?.blocked || []) add(job, "blocked");
+
+  const jobs = uniqueJobs(snapshot);
+  for (const node of Object.values(snapshot?.nodes || {})) {
+    for (const [jobId, assignment] of Object.entries(node.assignments || {})) {
+      const job = jobs.get(jobId);
+      if (!job) continue;
+      const project = job.project_id || "default";
+      summaryFor(project).gpus += assignment.gpu_ids?.length || 0;
+    }
+  }
+  return [...summaries.values()].sort((left, right) =>
+    right.gpus - left.gpus
+    || (right.active.length + right.queued.length + right.blocked.length) - (left.active.length + left.queued.length + left.blocked.length)
+    || left.project.localeCompare(right.project),
+  );
 }
 
 export function resourceTotals(nodes = {}) {

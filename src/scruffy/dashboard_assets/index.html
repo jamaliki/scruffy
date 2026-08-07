@@ -21,6 +21,7 @@
       <a href="#topology"><span>01</span> Topology</a>
       <a href="#signals"><span>02</span> Signals</a>
       <a href="#jobs"><span>03</span> Jobs</a>
+      <a href="#projects"><span>04</span> Projects</a>
     </nav>
     <div class="allocation-identity">
       <span id="connection-dot" class="connection-dot"></span>
@@ -59,7 +60,10 @@
             <p class="eyebrow">01 / Resources</p>
             <h1>GPU topology</h1>
           </div>
-          <p id="resource-note" class="panel-note">Loading node inventory</p>
+          <div class="resource-summary">
+            <p id="resource-note" class="panel-note">Loading node inventory</p>
+            <div id="project-legend" class="project-legend" aria-label="GPU project colours"></div>
+          </div>
         </header>
         <div id="nodes" class="nodes"></div>
       </section>
@@ -92,6 +96,14 @@
         <section><h3>Queued <span id="queued-count">0</span></h3><div id="queued" class="job-list"></div></section>
         <section><h3>Blocked <span id="blocked-count">0</span></h3><div id="blocked" class="job-list"></div></section>
       </div>
+    </section>
+
+    <section id="projects" class="panel projects-panel">
+      <header class="panel-header">
+        <div><p class="eyebrow">04 / Projects</p><h2>Project queues</h2></div>
+        <p class="panel-note"><span id="project-count">0</span> projects with active, queued or blocked work.</p>
+      </header>
+      <div id="project-board" class="project-board"></div>
     </section>
   </main>
 
