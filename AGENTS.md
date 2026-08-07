@@ -9,8 +9,8 @@ canonical response, state, cursor, and exit-code contract is
 When the Scruffy MCP tools are available, use this loop:
 
 1. Call `overview`, verify its `project_id`, and save its `as_of_cursor`
-   privately. A project-specific agent should use an MCP server pinned with
-   `scruffy-mcp --project PROJECT`.
+   privately. A project-specific agent should use an MCP entry pinned by its
+   connection configuration.
 2. Call `queue`, `running_jobs`, `blocked_jobs`, or `resources` only when that
    focused view is needed. Use `list_jobs` for another exact state, then use
    `inspect_job` for one selected job.
@@ -98,13 +98,18 @@ agents; reading does not consume events for anyone else. Use
   scraping its HTML.
 - Prefer MCP `wait_for_updates` whenever it is available. Do not spend agent
   turns repeatedly invoking shell `sleep` while waiting for queue activity.
-- For a remote queue, run the MCP server locally with `--connect-command`.
-  Never use SSH itself as the persistent MCP command: cancellation can poison
-  that shared transport.
-- A remote MCP connector error affects only the current call. Retry reads with
-  `overview`. Retry an uncertain `submit_job` with the identical arguments and
-  stable `request_id`; the local gateway opens a fresh remote process and the
-  queue deduplicates a request that was already made durable.
+- For a remote team queue, use one loopback Streamable HTTP hub. It keeps one
+  upstream observer and serves every agent's private cursor without opening one
+  SSH wait per agent. Pin projects with `X-Scruffy-Project` in MCP connection
+  configuration, not as a tool argument.
+- A hub or connector error affects only the current call. Retry reads with
+  `overview`. Retry an uncertain `submit_job` with identical arguments and its
+  stable `request_id`; the queue deduplicates a request already made durable.
+  A hub restart may return `reset=true`, in which case rebuild from its overview.
+- Hub implementation upgrades require no Codex restart while its loopback URL
+  and tool schemas remain stable. Restart the supervised hub and retry an
+  overlapping wait with its last cursor. Tool-list or schema changes additionally
+  require Codex's lightweight MCP configuration reload.
 - Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000
   terminal jobs. Older lookups carry `archived: true` and retain lifecycle and
   workflow metadata, but resource requests, cwd, assignments, logs, argv,
