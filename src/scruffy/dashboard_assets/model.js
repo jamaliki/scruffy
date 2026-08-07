@@ -1,9 +1,9 @@
-const PROJECT_COLORS = ["#f97316", "#0E6E66", "#3F4FA8", "#7E3F70", "#5A7A3C", "#B7472A"];
+const PROJECT_COLORS = ["#ff6b42", "#58c8bf", "#8aa6ff", "#d78ac7", "#91c96f", "#ff8b78"];
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "lost", "rejected", "skipped"]);
 export const TELEMETRY_STALE_AFTER_MS = 5 * 60 * 1000;
 
 export function projectColor(project) {
-  if (!project || project === "default") return "#64748b";
+  if (!project || project === "default") return "#78979a";
   let hash = 0;
   for (const character of project) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
   return PROJECT_COLORS[hash % PROJECT_COLORS.length];
