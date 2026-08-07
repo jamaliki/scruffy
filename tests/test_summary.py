@@ -4,10 +4,110 @@ import unittest
 from datetime import datetime, timezone
 
 from scruffy.state import apply_workload_event
-from scruffy.summary import build_summary, explain_job
+from scruffy.summary import (
+    BLOCKED_VIEW_STATES,
+    QUEUE_VIEW_STATES,
+    RUNNING_VIEW_STATES,
+    build_summary,
+    compact_job_page,
+    explain_job,
+    resource_view,
+)
 
 
 class SummaryTests(unittest.TestCase):
+    def test_operational_views_are_compact_and_state_specific(self) -> None:
+        state = {
+            "queue_id": "queue-test",
+            "last_seq": 7,
+            "journal_offset": 91,
+            "jobs": {
+                state: {
+                    "id": state,
+                    "project_id": "project-a",
+                    "name": f"{state}-job",
+                    "state": state,
+                    "started_at": "2026-08-03T12:00:00+00:00",
+                    "argv": ["secret"],
+                }
+                for state in (
+                    "submitted",
+                    "queued",
+                    "blocked",
+                    "starting",
+                    "running",
+                    "finishing",
+                    "cancelling",
+                )
+            },
+        }
+
+        queue = compact_job_page(
+            state,
+            states=QUEUE_VIEW_STATES,
+            offset=0,
+            limit=50,
+            project_id=None,
+            include_elapsed=False,
+        )
+        running = compact_job_page(
+            state,
+            states=RUNNING_VIEW_STATES,
+            offset=0,
+            limit=50,
+            project_id=None,
+            include_elapsed=True,
+        )
+        blocked = compact_job_page(
+            state,
+            states=BLOCKED_VIEW_STATES,
+            offset=0,
+            limit=50,
+            project_id=None,
+            include_elapsed=False,
+        )
+
+        self.assertEqual(
+            {"submitted", "queued"}, {job["state"] for job in queue["jobs"]}
+        )
+        self.assertEqual(
+            {"starting", "running", "finishing", "cancelling"},
+            {job["state"] for job in running["jobs"]},
+        )
+        self.assertEqual(["blocked"], [job["state"] for job in blocked["jobs"]])
+        self.assertNotIn("elapsed_seconds", queue["jobs"][0])
+        self.assertIn("elapsed_seconds", running["jobs"][0])
+        self.assertNotIn(
+            "argv", str({"queue": queue, "running": running, "blocked": blocked})
+        )
+        self.assertEqual("queue-test:0:7:91", queue["as_of_cursor"])
+
+    def test_resource_view_keeps_capacity_but_hides_assignments(self) -> None:
+        state = {
+            "queue_id": "queue-test",
+            "last_seq": 2,
+            "journal_offset": 40,
+            "allocation": {"id": "allocation-1", "state": "running"},
+            "nodes": {
+                "gpu-0": {
+                    "capacity": {
+                        "gpu_ids": list(range(8)),
+                        "cpus": 112,
+                        "memory_gb": 1992,
+                    },
+                    "free": {"gpu_ids": [6, 7], "cpus": 28, "memory_gb": 512},
+                    "assignments": {"job-1": {"gpu_ids": list(range(6))}},
+                }
+            },
+        }
+
+        result = resource_view(state)
+
+        self.assertEqual(2, result["totals"]["gpus_free"])
+        self.assertEqual(8, result["nodes"][0]["gpus_total"])
+        self.assertEqual(512, result["nodes"][0]["memory_gb_free"])
+        self.assertNotIn("assignments", str(result))
+
     def test_artifact_projection_replaces_a_replayed_event_id(self) -> None:
         job: dict[str, object] = {"id": "job-1", "state": "running"}
         event = {

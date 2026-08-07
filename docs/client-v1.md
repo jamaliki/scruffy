@@ -7,11 +7,15 @@ include the effects of returned events.
 
 ## Operations
 
-| Purpose | CLI | Python |
+| Purpose | CLI | Python / MCP |
 | --- | --- | --- |
 | Submit | `scruffy submit -- ...` | `submit_job(...)` |
 | Full state or one job | `scruffy status [JOB_ID]` | `status(root, job_id=None)` |
 | Bounded orientation | `scruffy summary` | `summary(root)` |
+| Resource availability | `scruffy resources` | MCP `resources()` |
+| Resource queue | `scruffy queue` | MCP `queue()` |
+| Running jobs | `scruffy running` | MCP `running_jobs()` |
+| Dependency-blocked jobs | `scruffy blocked` | MCP `blocked_jobs()` |
 | Dependency explanation | `scruffy explain JOB_ID` | `explain(root, job_id)` |
 | Snapshot and events | `scruffy observe` | `observe(root, ...)` |
 | Wait for one terminal job | `scruffy wait JOB_ID` | `wait_for_job(root, job_id)` |
@@ -73,6 +77,13 @@ grouped as `submitted`, `active`, `queued`, `blocked`, `requires_attention`, and
 `recent_terminal`. It also returns exact state `counts`, including archived
 terminal jobs, an `archived_jobs` total, node availability, and an
 `as_of_cursor` suitable for starting incremental observation.
+
+The focused CLI and MCP views return that same cursor with compact job
+identities. `queue` contains `submitted` and `queued`; `running` contains every
+resource-holding active state; `blocked` contains only dependency-blocked jobs.
+`resources` reports aggregate and per-node free and total GPU, CPU, and memory
+capacity without assignment details. Paginate job views while `more` is true,
+then inspect only the selected job that needs detail.
 
 `explain(root, job_id)` returns the job, its resolved upstream job IDs and
 states, current blockers, and a short explanation. Compact archived job and

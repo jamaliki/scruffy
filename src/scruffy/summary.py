@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +17,18 @@ from .models import (
 from .workflows import select_task_attempts
 
 ATTENTION_STATES = {"failed", "lost", "rejected", "skipped"}
+QUEUE_VIEW_STATES = frozenset({"submitted", "queued"})
+RUNNING_VIEW_STATES = ACTIVE_JOB_STATES
+BLOCKED_VIEW_STATES = frozenset({"blocked"})
+
+
+def state_cursor(state: dict[str, Any]) -> str:
+    """Return the opaque cursor for one committed state snapshot."""
+
+    return (
+        f"{state.get('queue_id')}:{state.get('journal_generation', 0)}:"
+        f"{state.get('last_seq', 0)}:{state.get('journal_offset', 0)}"
+    )
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -61,6 +74,136 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "progress_age_seconds": progress_age,
         "stdout": job.get("stdout"),
         "stderr": job.get("stderr"),
+    }
+
+
+def job_identity(
+    job: dict[str, Any], *, include_project: bool, include_elapsed: bool
+) -> dict[str, Any]:
+    """Return only the identity fields needed before inspecting a job."""
+
+    view = job_view(job)
+    result = {
+        "id": view["id"],
+        **({"project_id": view["project_id"]} if include_project else {}),
+        "name": view["name"],
+        "state": view["state"],
+    }
+    if include_elapsed:
+        elapsed = view["elapsed_seconds"]
+        result["elapsed_seconds"] = int(elapsed) if elapsed is not None else None
+    return result
+
+
+def compact_job_page(
+    state: dict[str, Any],
+    *,
+    states: Collection[str] | None,
+    offset: int,
+    limit: int,
+    project_id: str | None,
+    include_elapsed: bool,
+) -> dict[str, Any]:
+    """Return one stable page of compact job identities."""
+
+    selected_states = set(states) if states is not None else None
+    jobs = [
+        job
+        for job in state.get("jobs", {}).values()
+        if isinstance(job, dict)
+        and (selected_states is None or job.get("state") in selected_states)
+        and (project_id is None or job_project(job) == project_id)
+    ]
+    jobs.sort(
+        key=lambda job: (
+            _queue_order(job),
+            str(job.get("submitted_at") or ""),
+            str(job.get("id") or ""),
+        )
+    )
+    page = jobs[offset : offset + limit]
+    return {
+        "v": 1,
+        "queue_id": state.get("queue_id"),
+        "project_id": project_id,
+        "as_of_cursor": state_cursor(state),
+        "total": len(jobs),
+        "offset": offset,
+        "more": offset + len(page) < len(jobs),
+        "jobs": [
+            job_identity(
+                job,
+                include_project=project_id is None,
+                include_elapsed=include_elapsed,
+            )
+            for job in page
+        ],
+    }
+
+
+def resource_totals(nodes: object) -> dict[str, int]:
+    """Sum node capacity and availability without exposing assignments."""
+
+    result = {
+        "nodes": 0,
+        "gpus_total": 0,
+        "gpus_free": 0,
+        "cpus_total": 0,
+        "cpus_free": 0,
+        "memory_gb_total": 0,
+        "memory_gb_free": 0,
+    }
+    if not isinstance(nodes, dict):
+        return result
+    for node in nodes.values():
+        if not isinstance(node, dict):
+            continue
+        capacity = node.get("capacity", {})
+        free = node.get("free", {})
+        result["nodes"] += 1
+        result["gpus_total"] += len(capacity.get("gpu_ids", []))
+        result["gpus_free"] += len(free.get("gpu_ids", []))
+        for key in ("cpus", "memory_gb"):
+            result[f"{key}_total"] += int(capacity.get(key, 0) or 0)
+            result[f"{key}_free"] += int(free.get(key, 0) or 0)
+    return result
+
+
+def resource_view(state: dict[str, Any]) -> dict[str, Any]:
+    """Return aggregate and per-node physical resource availability."""
+
+    nodes = state.get("nodes", {})
+    rows = []
+    if isinstance(nodes, dict):
+        for name, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            capacity = node.get("capacity", {})
+            free = node.get("free", {})
+            rows.append(
+                {
+                    "name": name,
+                    "gpus_free": len(free.get("gpu_ids", [])),
+                    "gpus_total": len(capacity.get("gpu_ids", [])),
+                    "cpus_free": int(free.get("cpus", 0) or 0),
+                    "cpus_total": int(capacity.get("cpus", 0) or 0),
+                    "memory_gb_free": int(free.get("memory_gb", 0) or 0),
+                    "memory_gb_total": int(capacity.get("memory_gb", 0) or 0),
+                }
+            )
+    allocation = state.get("allocation")
+    allocation = allocation if isinstance(allocation, dict) else {}
+    return {
+        "v": 1,
+        "queue_id": state.get("queue_id"),
+        "project_id": state.get("project_id"),
+        "as_of_cursor": state_cursor(state),
+        "allocation": {
+            "id": allocation.get("id"),
+            "state": allocation.get("state"),
+        },
+        "totals": resource_totals(nodes),
+        "nodes": rows,
     }
 
 
@@ -153,15 +296,11 @@ def build_summary(
         reverse=True,
     )
     identity = state.get("queue_id")
-    cursor = (
-        f"{identity}:{state.get('journal_generation', 0)}:"
-        f"{state.get('last_seq', 0)}:{state.get('journal_offset', 0)}"
-    )
     return {
         "v": 1,
         "queue_id": identity,
         "project_id": selected_project,
-        "as_of_cursor": cursor,
+        "as_of_cursor": state_cursor(state),
         "allocation": state.get("allocation"),
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),

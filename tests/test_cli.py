@@ -236,6 +236,65 @@ class SubmitCliTests(unittest.TestCase):
                 submit.assert_not_called()
 
 
+class OperationalViewsCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path("/tmp/scruffy-test")
+        self.state = {
+            "queue_id": "queue-test",
+            "last_seq": 4,
+            "journal_offset": 80,
+            "allocation": {"id": "allocation-1", "state": "running"},
+            "nodes": {
+                "gpu-0": {
+                    "capacity": {"gpu_ids": [0, 1], "cpus": 28, "memory_gb": 256},
+                    "free": {"gpu_ids": [1], "cpus": 14, "memory_gb": 128},
+                    "assignments": {"running": {"gpu_ids": [0]}},
+                }
+            },
+            "jobs": {
+                "queued": {"id": "queued", "name": "queued", "state": "queued"},
+                "blocked": {"id": "blocked", "name": "blocked", "state": "blocked"},
+                "running": {
+                    "id": "running",
+                    "name": "running",
+                    "state": "running",
+                },
+            },
+        }
+
+    def test_job_view_commands_return_only_the_selected_lane(self) -> None:
+        expected = {
+            "queue": ("queued", False),
+            "running": ("running", True),
+            "blocked": ("blocked", False),
+        }
+        for command, (job_id, has_elapsed) in expected.items():
+            with self.subTest(command=command):
+                with (
+                    mock.patch("scruffy.cli.status", return_value=self.state),
+                    mock.patch("scruffy.cli._json") as print_json,
+                ):
+                    result = main(["--root", str(self.root), command])
+
+                self.assertEqual(0, result)
+                payload = print_json.call_args.args[0]
+                self.assertEqual([job_id], [job["id"] for job in payload["jobs"]])
+                self.assertEqual(has_elapsed, "elapsed_seconds" in payload["jobs"][0])
+
+    def test_resources_command_hides_assignment_details(self) -> None:
+        with (
+            mock.patch("scruffy.cli.status", return_value=self.state),
+            mock.patch("scruffy.cli._json") as print_json,
+        ):
+            result = main(["--root", str(self.root), "resources"])
+
+        self.assertEqual(0, result)
+        payload = print_json.call_args.args[0]
+        self.assertEqual(1, payload["totals"]["gpus_free"])
+        self.assertEqual(2, payload["nodes"][0]["gpus_total"])
+        self.assertNotIn("assignments", str(payload))
+
+
 class ServeCliTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()

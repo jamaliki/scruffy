@@ -36,6 +36,13 @@ from .models import (
 from .protocol import EVENT_KINDS
 from .slurm import discover_slurm_inventory, load_inventory
 from .storage import StorageError, tail_window
+from .summary import (
+    BLOCKED_VIEW_STATES,
+    QUEUE_VIEW_STATES,
+    RUNNING_VIEW_STATES,
+    compact_job_page,
+    resource_view,
+)
 
 
 def _json(value: Any) -> None:
@@ -198,6 +205,35 @@ def _summary(arguments: argparse.Namespace) -> int:
             _root(arguments), limit=arguments.limit, project_id=_project(arguments)
         )
     )
+    return 0
+
+
+def _job_list(arguments: argparse.Namespace) -> int:
+    """Print one compact operational job view."""
+
+    if arguments.offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    if not 1 <= arguments.limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    project_id = _project(arguments)
+    _json(
+        compact_job_page(
+            status(_root(arguments), project_id=project_id),
+            states=arguments.job_states,
+            offset=arguments.offset,
+            limit=arguments.limit,
+            project_id=project_id,
+            include_elapsed=arguments.include_elapsed,
+        )
+    )
+    return 0
+
+
+def _resources(arguments: argparse.Namespace) -> int:
+    """Print aggregate and per-node resource availability."""
+
+    project_id = _project(arguments)
+    _json(resource_view(status(_root(arguments), project_id=project_id)))
     return 0
 
 
@@ -461,6 +497,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     summary_parser.add_argument("--project", help="show only this project")
     summary_parser.set_defaults(handler=_summary)
+
+    job_views = (
+        (
+            "queue",
+            "list jobs waiting for admission or resources",
+            QUEUE_VIEW_STATES,
+            False,
+        ),
+        (
+            "running",
+            "list jobs currently holding resources",
+            RUNNING_VIEW_STATES,
+            True,
+        ),
+        (
+            "blocked",
+            "list jobs waiting on workflow dependencies",
+            BLOCKED_VIEW_STATES,
+            False,
+        ),
+    )
+    for name, help_text, states, include_elapsed in job_views:
+        job_list = commands.add_parser(name, help=help_text)
+        job_list.add_argument("--project", help="show only this project")
+        job_list.add_argument("--offset", type=int, default=0)
+        job_list.add_argument("--limit", type=int, default=50)
+        job_list.set_defaults(
+            handler=_job_list,
+            job_states=states,
+            include_elapsed=include_elapsed,
+        )
+
+    resources = commands.add_parser(
+        "resources", help="show per-node GPU, CPU, and memory availability"
+    )
+    resources.add_argument(
+        "--project",
+        help="label the project scope; availability remains allocation-wide",
+    )
+    resources.set_defaults(handler=_resources)
 
     explain_parser = commands.add_parser(
         "explain",

@@ -11,8 +11,9 @@ When the Scruffy MCP tools are available, use this loop:
 1. Call `overview`, verify its `project_id`, and save its `as_of_cursor`
    privately. A project-specific agent should use an MCP server pinned with
    `scruffy-mcp --project PROJECT`.
-2. Call `list_jobs(state="queued")` or `list_jobs(state="running")` only when
-   job IDs are needed, then use `inspect_job` for one selected job.
+2. Call `queue`, `running_jobs`, `blocked_jobs`, or `resources` only when that
+   focused view is needed. Use `list_jobs` for another exact state, then use
+   `inspect_job` for one selected job.
 3. On a project-pinned server, call `submit_job` with a stable `request_id`;
    otherwise use the CLI or Python API. Submission never waits for resources.
 4. Call `wait_for_updates` with that cursor instead of calling `sleep`.
@@ -35,8 +36,12 @@ Without MCP, use the equivalent CLI loop:
 export SCRUFFY_ROOT=/shared/run/scruffy
 export SCRUFFY_PROJECT=koochak
 
-# 1. Orient and save the returned as_of_cursor.
+# 1. Orient and query only the operational view you need.
 scruffy summary --limit 20
+scruffy resources
+scruffy running
+scruffy queue
+scruffy blocked
 
 # 2. Submit durably without waiting for resources or dependencies.
 scruffy submit \
@@ -81,7 +86,8 @@ agents; reading does not consume events for anyone else. Use
   IDs cannot contain `:`. A succeeded task identity is
   final; after any other terminal result, retry it with a new `request_id` in
   the same workflow.
-- Prefer `summary` for bounded orientation, `explain` for one dependency chain,
+- Prefer `summary` for bounded orientation; `resources`, `running`, `queue`, or
+  `blocked` for compact operational views; `explain` for one dependency chain;
   and `observe` for incremental monitoring.
 - Use `scruffy dashboard` for human allocation orientation. It is read-only,
   loopback-only, and uses the same compact views; do not infer queue state by

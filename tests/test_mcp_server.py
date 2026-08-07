@@ -622,10 +622,23 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual(
-                {"overview", "list_jobs", "inspect_job", "wait_for_updates"},
+                {
+                    "overview",
+                    "queue",
+                    "running_jobs",
+                    "blocked_jobs",
+                    "resources",
+                    "list_jobs",
+                    "inspect_job",
+                    "wait_for_updates",
+                },
                 {tool.name for tool in tools.tools},
             )
             overview = self.structured(await session.call_tool("overview", {}))
+            running = self.structured(await session.call_tool("running_jobs", {}))
+            queued = self.structured(await session.call_tool("queue", {}))
+            blocked = self.structured(await session.call_tool("blocked_jobs", {}))
+            resources = self.structured(await session.call_tool("resources", {}))
             listed = self.structured(
                 await session.call_tool("list_jobs", {"state": "running"})
             )
@@ -637,6 +650,10 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 listed["jobs"][0].keys(),
             )
             self.assertNotIn("jobs", overview)
+            self.assertEqual([self.job_id], [job["id"] for job in running["jobs"]])
+            self.assertEqual([], queued["jobs"])
+            self.assertEqual([], blocked["jobs"])
+            self.assertEqual(0, resources["totals"]["gpus_total"])
             self.assertNotIn("environment", inspected["job"])
             invalid = await session.call_tool("wait_for_updates", {"timeout_seconds": 3601})
             self.assertTrue(invalid.isError)
@@ -718,6 +735,10 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 {
                     "overview",
+                    "queue",
+                    "running_jobs",
+                    "blocked_jobs",
+                    "resources",
                     "list_jobs",
                     "inspect_job",
                     "wait_for_updates",
