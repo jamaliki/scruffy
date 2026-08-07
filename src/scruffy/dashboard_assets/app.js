@@ -108,15 +108,23 @@ function renderNodes(snapshot) {
 }
 
 function legendItem(label, color = null, project = null) {
-  const item = element(project ? "button" : "span", "legend-item");
-  if (project) {
+  const interactive = project !== null;
+  const item = element(interactive ? "button" : "span", "legend-item");
+  if (interactive) {
+    const selected = view.project === project;
     item.type = "button";
     item.dataset.projectFilter = project;
-    item.style.setProperty("--project-color", color);
-    item.classList.toggle("selected", view.project === project);
-    item.title = `Filter dashboard to ${project}`;
+    item.style.setProperty("--project-color", color || "var(--teal)");
+    item.classList.toggle("selected", selected);
+    item.setAttribute("aria-pressed", String(selected));
+    item.title = project === "all"
+      ? "Show all projects"
+      : selected ? "Clear project filter" : `Filter dashboard to ${project}`;
   }
-  const swatch = element("i", color ? "legend-swatch" : "legend-swatch free");
+  const swatchClass = project === "all"
+    ? "legend-swatch all"
+    : color ? "legend-swatch" : "legend-swatch free";
+  const swatch = element("i", swatchClass);
   if (color) swatch.style.setProperty("--project-color", color);
   item.append(swatch, element("span", "", label));
   return item;
@@ -125,6 +133,7 @@ function legendItem(label, color = null, project = null) {
 function renderProjectLegend(snapshot) {
   const activeProjects = projectSummaries(snapshot).filter((summary) => summary.gpus > 0);
   replace(byId("project-legend"), [
+    legendItem("All projects", null, "all"),
     legendItem("Free"),
     ...activeProjects.map((summary) => legendItem(summary.project, projectColor(summary.project), summary.project)),
   ]);
@@ -319,7 +328,8 @@ async function loadOverview() {
 document.addEventListener("click", (event) => {
   const projectFilter = event.target.closest("[data-project-filter]");
   if (projectFilter) {
-    view.project = projectFilter.dataset.projectFilter;
+    const requested = projectFilter.dataset.projectFilter;
+    view.project = requested === "all" || view.project === requested ? "all" : requested;
     render();
     return;
   }
