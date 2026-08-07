@@ -55,8 +55,12 @@ def _position(cursor: Cursor) -> tuple[int, int, int]:
     return cursor.generation, cursor.sequence, cursor.offset
 
 
-def _public_event(event: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in event.items() if not key.startswith("_")}
+def _public_event(event: dict[str, Any], *, include_project: bool) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in event.items()
+        if not key.startswith("_") and (include_project or key != "project_id")
+    }
 
 
 def _has_more(cursor: str, latest: str) -> bool:
@@ -210,7 +214,7 @@ class UpdateBroker:
             if _position(page_end) <= _position(requested):
                 continue
             matches = [
-                _public_event(event)
+                _public_event(event, include_project=project_id is None)
                 for event in page.events
                 if int(event.get("_seq", -1)) > requested.sequence
                 and event_matches(

@@ -160,6 +160,7 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_cursor(2), result["next_cursor"])
         self.assertEqual(["job.succeeded"], [event["kind"] for event in result["events"]])
+        self.assertNotIn("project_id", result["events"][0])
 
     async def test_exact_kind_filter_can_receive_quiet_events(self) -> None:
         waiting = asyncio.create_task(
