@@ -50,7 +50,6 @@ button { cursor:pointer; }
 .deck-nav a:first-child { border-left:0; }
 .deck-nav a:last-child { border-right:1px solid var(--rule); }
 .deck-nav a:hover { color:var(--heading); background:var(--accent-light); }
-.deck-nav span { margin-right:8px; color:var(--accent-dark); }
 .allocation-identity { padding:10px 13px; display:flex; justify-content:flex-end; gap:11px; align-items:center; border:1px solid var(--rule); background:rgba(3,16,18,.5); text-align:right; }
 .allocation-copy { display:grid; gap:2px; }
 .allocation-label { color:var(--muted); font-family:var(--mono); font-size:8px; text-transform:uppercase; letter-spacing:.12em; }
