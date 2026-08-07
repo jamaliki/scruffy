@@ -97,15 +97,27 @@ class SummaryTests(unittest.TestCase):
                     },
                     "free": {"gpu_ids": [6, 7], "cpus": 28, "memory_gb": 512},
                     "assignments": {"job-1": {"gpu_ids": list(range(6))}},
-                }
+                },
+                "gpu-13": {
+                    "capacity": {"gpu_ids": list(range(8)), "cpus": 112},
+                    "free": {"gpu_ids": [], "cpus": 0},
+                },
+                "gpu-5": {
+                    "capacity": {"gpu_ids": list(range(8)), "cpus": 112},
+                    "free": {"gpu_ids": list(range(8)), "cpus": 112},
+                },
             },
         }
 
         result = resource_view(state)
 
-        self.assertEqual(2, result["totals"]["gpus_free"])
+        self.assertEqual(10, result["totals"]["gpus_free"])
         self.assertEqual(8, result["nodes"][0]["gpus_total"])
         self.assertEqual(512, result["nodes"][0]["memory_gb_free"])
+        self.assertEqual(
+            ["gpu-0", "gpu-5", "gpu-13"],
+            [node["name"] for node in result["nodes"]],
+        )
         self.assertNotIn("assignments", str(result))
 
     def test_artifact_projection_replaces_a_replayed_event_id(self) -> None:

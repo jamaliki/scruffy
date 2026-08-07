@@ -169,13 +169,23 @@ def resource_totals(nodes: object) -> dict[str, int]:
     return result
 
 
+def _node_sort_key(name: str) -> tuple[str, int, str]:
+    prefix, separator, suffix = name.rpartition("-")
+    if separator and suffix.isascii() and suffix.isdecimal():
+        return prefix, int(suffix), name
+    return name, -1, name
+
+
 def resource_view(state: dict[str, Any]) -> dict[str, Any]:
     """Return aggregate and per-node physical resource availability."""
 
     nodes = state.get("nodes", {})
     rows = []
     if isinstance(nodes, dict):
-        for name, node in nodes.items():
+        ordered_nodes = sorted(
+            nodes.items(), key=lambda item: _node_sort_key(item[0])
+        )
+        for name, node in ordered_nodes:
             if not isinstance(node, dict):
                 continue
             capacity = node.get("capacity", {})
