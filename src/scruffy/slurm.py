@@ -10,6 +10,7 @@ import sys
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -372,9 +373,15 @@ def build_local_argv(
 
 
 def allocation_metadata(allocation_id: str, launcher: str) -> dict[str, Any]:
-    return {
+    deadline = os.environ.get("SLURM_JOB_END_TIME")
+    metadata = {
         "id": allocation_id,
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "launcher": launcher,
-        "deadline": os.environ.get("SLURM_JOB_END_TIME"),
+        "deadline": deadline,
     }
+    if deadline and deadline.isascii() and deadline.isdecimal():
+        metadata["deadline_at"] = datetime.fromtimestamp(
+            int(deadline), UTC
+        ).isoformat(timespec="seconds")
+    return metadata

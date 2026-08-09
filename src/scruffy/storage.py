@@ -15,14 +15,16 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from pathlib import Path
-from typing import AbstractSet, Any, BinaryIO, Callable, Iterator, Sequence, TextIO
+from typing import Any, BinaryIO, TextIO
 
 from .models import DEFAULT_PROJECT, job_project, normalize_project_id
 from .protocol import MAX_EVENT_BYTES, validate_event
 
-LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports")
+LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports", "provenance")
 LOCK_SHARDS = 64
 MAX_TAIL_BYTES = 1024 * 1024
 INVALID_REQUEST_DIGEST = "-"
@@ -59,9 +61,9 @@ class UnsafeRecovery(StorageError):
 def utc_now() -> str:
     """Return a lexically sortable UTC timestamp."""
 
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
 def queue_id(root: Path) -> str:
@@ -110,7 +112,7 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def atomic_write_json(target: Path, value: Any) -> None:
+def atomic_write_json(target: Path, value: Any, *, mode: int | None = None) -> None:
     """Atomically replace a JSON file with a complete, flushed document."""
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -121,6 +123,8 @@ def atomic_write_json(target: Path, value: Any) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(temporary, mode)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
     finally:
@@ -160,6 +164,39 @@ def job_identity_digest(spec: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_job_identity(spec)).hexdigest()
 
 
+def canonical_submission_identity(document: dict[str, Any]) -> bytes:
+    """Return the retry-stable identity of an atomic submission envelope."""
+
+    identity = {
+        key: value
+        for key, value in document.items()
+        if key not in {"submission_id", "submitted_at", "identity_sha256"}
+    }
+    jobs = identity.get("jobs")
+    if isinstance(jobs, list):
+        identity["jobs"] = [
+            {
+                key: value
+                for key, value in job.items()
+                if key not in {"job_id", "submitted_at"}
+            }
+            if isinstance(job, dict)
+            else job
+            for job in jobs
+        ]
+    if identity.get("project_id") == DEFAULT_PROJECT:
+        identity.pop("project_id")
+    return json.dumps(
+        identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+
+
+def submission_identity_digest(document: dict[str, Any]) -> str:
+    """Return the durable idempotency digest for a submission envelope."""
+
+    return hashlib.sha256(canonical_submission_identity(document)).hexdigest()
+
+
 def create_job_id(
     request_id: str | None = None, *, project_id: str = DEFAULT_PROJECT
 ) -> str:
@@ -174,6 +211,16 @@ def create_job_id(
     return f"job-{timestamp}-{uuid.uuid4().hex[:10]}"
 
 
+def create_submission_id(request_id: str, *, project_id: str = DEFAULT_PROJECT) -> str:
+    """Create the stable outer identity for an atomic multi-job submission."""
+
+    project_id = normalize_project_id(project_id)
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("workflow request_id must be a non-empty string")
+    identity = request_id if project_id == DEFAULT_PROJECT else f"{project_id}\0{request_id}"
+    return f"submission-{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
+
+
 def _existing_request(root: Path, job_id: str) -> dict[str, Any] | None:
     source = root / "requests" / job_id / "spec.json"
     if not source.exists():
@@ -181,6 +228,16 @@ def _existing_request(root: Path, job_id: str) -> dict[str, Any] | None:
     document = read_json(source)
     if not isinstance(document, dict):
         raise StorageError(f"request {job_id!r} must contain a JSON object")
+    return document
+
+
+def _existing_submission(root: Path, submission_id: str) -> dict[str, Any] | None:
+    source = root / "requests" / submission_id / "submission.json"
+    if not source.exists():
+        return None
+    document = read_json(source)
+    if not isinstance(document, dict):
+        raise StorageError(f"submission {submission_id!r} must contain a JSON object")
     return document
 
 
@@ -251,32 +308,102 @@ def submit_request(root: Path, spec: dict[str, Any]) -> tuple[str, bool]:
             shutil.rmtree(temporary)
 
 
+def submit_submission(root: Path, document: dict[str, Any]) -> tuple[str, bool]:
+    """Durably enqueue one all-or-nothing submission envelope.
+
+    The envelope is one renamed directory, so every controller observes either
+    all task specifications or none of them. The controller remains responsible
+    for validating and admitting the complete set in one journal transaction.
+    """
+
+    root = ensure_layout(root)
+    submission_id = str(document["submission_id"])
+    request_root = root / "requests"
+    destination = request_root / submission_id
+    digest = submission_identity_digest(document)
+    temporary = request_root / f".{submission_id}.{uuid.uuid4().hex}.tmp"
+    temporary.mkdir()
+    try:
+        atomic_write_json(temporary / "submission.json", document)
+        _fsync_directory(temporary)
+        with _key_lock(request_root, submission_id) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            existing = _existing_submission(root, submission_id)
+            if existing is not None:
+                if canonical_submission_identity(existing) != canonical_submission_identity(
+                    document
+                ):
+                    raise RequestConflict(
+                        f"submission ID {submission_id} was already used differently"
+                    )
+                return submission_id, True
+            receipt = _read_request_receipt(request_root, submission_id)
+            if receipt is not None:
+                if receipt.get("digest") == digest:
+                    return submission_id, True
+                raise RequestConflict(
+                    f"submission ID {submission_id} was already used differently"
+                )
+            os.rename(temporary, destination)
+            _fsync_directory(request_root)
+            return submission_id, False
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def list_submissions(
+    root: Path,
+) -> list[tuple[str, dict[str, Any] | None, bool]]:
+    """List atomic envelopes and legacy single-job requests.
+
+    The final flag is true for an atomic envelope and false for a legacy job.
+    Transient reads are deferred; malformed durable content is returned as
+    ``None`` so the controller can contain it without crashing the serve loop.
+    """
+
+    request_root = ensure_layout(root) / "requests"
+    result: list[tuple[str, dict[str, Any] | None, bool]] = []
+    for directory in sorted(request_root.iterdir()):
+        if directory.name.startswith(".") or not directory.is_dir():
+            continue
+        submission_file = directory / "submission.json"
+        source = submission_file if submission_file.exists() else directory / "spec.json"
+        atomic = source == submission_file
+        try:
+            document = read_json(source)
+        except TransientStorageError:
+            continue
+        except StorageError:
+            document = None
+        result.append(
+            (
+                directory.name,
+                document if isinstance(document, dict) else None,
+                atomic,
+            )
+        )
+    return result
+
+
 def list_requests(
     root: Path, exclude: AbstractSet[str] = frozenset()
 ) -> list[tuple[str, dict[str, Any] | None]]:
     """List requests, deferring transient reads and marking invalid documents."""
 
-    request_root = ensure_layout(root) / "requests"
     requests: list[tuple[str, dict[str, Any] | None]] = []
-    for directory in sorted(request_root.iterdir()):
-        if (
-            directory.name in exclude
-            or directory.name.startswith(".")
-            or not directory.is_dir()
-        ):
+    for submission_id, document, atomic in list_submissions(root):
+        if not atomic:
+            if submission_id not in exclude:
+                requests.append((submission_id, document))
             continue
-        spec_file = directory / "spec.json"
-        try:
-            document = read_json(spec_file)
-        except TransientStorageError:
-            # A missing file or NFS read error is not a verdict on immutable
-            # request content. Leave the directory untouched for the next poll.
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if not isinstance(jobs, list):
             continue
-        except StorageError:
-            document = None
-        requests.append(
-            (directory.name, document if isinstance(document, dict) else None)
-        )
+        for spec in jobs:
+            job_id = spec.get("job_id") if isinstance(spec, dict) else None
+            if isinstance(job_id, str) and job_id not in exclude:
+                requests.append((job_id, spec))
     return requests
 
 
@@ -287,7 +414,45 @@ def find_request(root: Path, job_id: str) -> dict[str, Any] | None:
 def request_pending(root: Path, job_id: str) -> bool:
     """Return whether the named request directory is still awaiting admission."""
 
-    return (ensure_layout(root) / "requests" / job_id).is_dir()
+    if (ensure_layout(root) / "requests" / job_id).is_dir():
+        return True
+    return any(candidate == job_id for candidate, _ in list_requests(root))
+
+
+def accept_submission(
+    root: Path, submission_id: str, *, identity_digest: str
+) -> bool:
+    """Replace an admitted atomic envelope with its compact outer receipt."""
+
+    return _finish_request(root, submission_id, identity_digest)
+
+
+def record_request_receipt(root: Path, job_id: str, identity_digest: str) -> None:
+    """Persist a job idempotency receipt when admission came from a bundle."""
+
+    request_root = ensure_layout(root) / "requests"
+    with _key_lock(request_root, job_id) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        receipt = _request_receipt(request_root, job_id)
+        existing = _read_request_receipt(request_root, job_id)
+        if existing is not None:
+            if existing.get("digest") != identity_digest:
+                raise StorageError(f"conflicting request receipt for {job_id}")
+            return
+        _mkdir(receipt.parent.parent)
+        _mkdir(receipt.parent)
+        atomic_write_json(
+            receipt,
+            {"v": 1, "job_id": job_id, "digest": identity_digest},
+        )
+
+
+def request_receipt_digest(root: Path, job_id: str) -> str | None:
+    """Return a consumed job identity digest without exposing archive details."""
+
+    receipt = _read_request_receipt(ensure_layout(root) / "requests", job_id)
+    digest = receipt.get("digest") if receipt else None
+    return digest if isinstance(digest, str) else None
 
 
 def _finish_request(root: Path, job_id: str, digest: str | None) -> bool:
@@ -364,6 +529,7 @@ def accept_known_requests(
 
 _ARCHIVED_JOB_FIELDS = (
     "id",
+    "request_id",
     "name",
     "state",
     "submitted_at",
@@ -374,6 +540,12 @@ _ARCHIVED_JOB_FIELDS = (
     "signal",
     "reason",
     "error",
+    "request",
+    "last_assignment",
+    "provenance",
+    "deadline_at",
+    "attempt",
+    "resolved_dependencies",
     "workflow_id",
     "task_id",
     "needs",

@@ -92,6 +92,7 @@ class UpdateBroker:
         self.current_cursor: str | None = None
         self.latest_cursor: str | None = None
         self.last_error: str | None = None
+        self.reset_reason: str | None = None
         self._event_count = 0
         self._condition = asyncio.Condition()
         self._task: asyncio.Task[None] | None = None
@@ -168,6 +169,7 @@ class UpdateBroker:
             self.pages.clear()
             self._event_count = 0
             self.floor_cursor = next_cursor
+            self.reset_reason = str(response.get("reset_reason") or "upstream_reset")
         elif next_cursor != after:
             events = tuple(response.get("events") or ())
             self.pages.append(EventPage(after, next_cursor, events))
@@ -181,6 +183,7 @@ class UpdateBroker:
             page = self.pages.popleft()
             self._event_count -= len(page.events)
             self.floor_cursor = page.next_cursor
+            self.reset_reason = "hub_buffer_expired"
 
     def _scan(
         self,
@@ -190,8 +193,8 @@ class UpdateBroker:
         job_ids: Collection[str] | None,
         event_kinds: Collection[str] | None,
         project_id: str | None,
-    ) -> tuple[dict[str, Any] | None, str, bool]:
-        """Scan buffered pages, returning result, advanced cursor, and reset."""
+    ) -> tuple[dict[str, Any] | None, str, str | None]:
+        """Scan buffered pages, returning result, cursor, and reset reason."""
 
         assert self.floor_cursor is not None
         assert self.current_cursor is not None
@@ -201,13 +204,13 @@ class UpdateBroker:
             floor = parse_cursor(self.floor_cursor)
             current = parse_cursor(self.current_cursor)
         except ValueError:
-            return None, self.current_cursor, True
-        if (
-            requested.queue_id != current.queue_id
-            or requested.generation != current.generation
-            or _position(requested) < _position(floor)
-        ):
-            return None, self.current_cursor, True
+            return None, self.current_cursor, "invalid_cursor"
+        if requested.queue_id != current.queue_id:
+            return None, self.current_cursor, "queue_replaced"
+        if requested.generation != current.generation:
+            return None, self.current_cursor, "journal_rotated"
+        if _position(requested) < _position(floor):
+            return None, self.current_cursor, self.reset_reason or "hub_buffer_expired"
         cursor = after
         for page in self.pages:
             page_end = parse_cursor(page.next_cursor)
@@ -238,10 +241,10 @@ class UpdateBroker:
                         "timed_out": False,
                     },
                     cursor,
-                    False,
+                    None,
                 )
             requested = page_end
-        return None, cursor, False
+        return None, cursor, None
 
     async def wait(
         self,
@@ -266,10 +269,10 @@ class UpdateBroker:
             overview = await self.remote("overview", overview_params)
             cursor = overview["as_of_cursor"]
         while True:
-            reset = False
+            reset_reason = None
             async with self._condition:
                 if self.current_cursor is not None:
-                    result, cursor, reset = self._scan(
+                    result, cursor, reset_reason = self._scan(
                         cursor,
                         workflow_id=workflow_id,
                         job_ids=selected_jobs,
@@ -279,14 +282,14 @@ class UpdateBroker:
                     if result is not None:
                         return result
                 remaining = deadline - asyncio.get_running_loop().time()
-                if reset or remaining <= 0:
+                if reset_reason or remaining <= 0:
                     break
                 try:
                     await asyncio.wait_for(self._condition.wait(), remaining)
                 except TimeoutError:
                     break
 
-        if reset:
+        if reset_reason:
             overview_params = {"_project_id": selected_project} if selected_project else {}
             overview = await self.remote("overview", overview_params)
             return {
@@ -295,6 +298,7 @@ class UpdateBroker:
                 "latest_cursor": overview["as_of_cursor"],
                 "more": False,
                 "reset": True,
+                "reset_reason": reset_reason,
                 "timed_out": False,
                 "overview": overview,
             }

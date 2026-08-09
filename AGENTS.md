@@ -13,10 +13,13 @@ When the Scruffy MCP tools are available, use this loop:
    connection configuration.
 2. Call `queue`, `running_jobs`, `blocked_jobs`, or `resources` only when that
    focused view is needed. Use `list_jobs` for another exact state, then use
-   `inspect_job` for one selected job.
-3. On a project-pinned server, call `submit_job` with a stable `request_id`;
-   otherwise use the CLI or Python API. Submission never waits for resources.
-4. Call `wait_for_updates` with that cursor instead of calling `sleep`.
+   `inspect_job` for one selected job and `tail_job_output` only for bounded
+   diagnosis.
+3. On a project-pinned server, call `submit_job` with an explicit GPU count and
+   stable `request_id`, or submit a complete DAG with `submit_workflow`.
+   Submission never waits for resources.
+4. Call `wait_job` for one terminal result or `wait_for_updates` for a set of
+   jobs instead of calling `sleep`.
 5. Replace the cursor with every returned `next_cursor`, including on timeout.
 6. Call again immediately when `more` is true. On `reset`, rebuild from the
    returned `overview`.
@@ -78,6 +81,12 @@ agents; reading does not consume events for anyone else. Use
   not reject the item or consume its idempotency key.
 - Commands are argv after `--`. Avoid nested shell strings; submit `bash -lc`
   explicitly only when shell behavior is required.
+- GPU count is mandatory. Use `--gpus-per-node 0` intentionally for CPU-only
+  work; it still reserves its requested CPU and memory.
+- Use `--time-limit-seconds` for an authoritative, restart-safe per-job limit.
+- Prefer `validate-workflow` followed by `submit-workflow` for a complete DAG.
+  Atomic workflow JSON contains `request_id`, `workflow_id`, and explicit
+  `tasks`; either every task is admitted or none is.
 - `cwd`, executables, and referenced files must exist at the same paths on the
   selected worker nodes.
 - Workflow tasks use `--workflow-id`, `--task-id`, and repeated
@@ -111,10 +120,10 @@ agents; reading does not consume events for anyone else. Use
   overlapping wait with its last cursor. Tool-list or schema changes additionally
   require Codex's lightweight MCP configuration reload.
 - Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000
-  terminal jobs. Older lookups carry `archived: true` and retain lifecycle and
-  workflow metadata, but resource requests, cwd, assignments, logs, argv,
-  environment, and workload expire. `summary.counts` includes them and
-  `archived_jobs` reports their total.
+  terminal jobs. Older lookups carry `archived: true` and retain lifecycle,
+  workflow, resource request, final placement, and provenance references. Cwd,
+  argv, environment, live assignment, blockers, logs, and workload expire.
+  `summary.counts` includes them and `archived_jobs` reports their total.
 - Compact request receipts and workflow indexes persist for the queue root's
   lifetime, so they grow as O(total jobs) small files and inodes.
 - The snapshot is authoritative. Never infer lifecycle success or failure from
@@ -134,14 +143,16 @@ agents; reading does not consume events for anyone else. Use
 - `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
   every node. Lustre `localflock` is not sufficient for a multi-node queue.
 - `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and
-  `SCRUFFY_NODE` are controller-owned inside a worker.
+  `SCRUFFY_NODE` are controller-owned inside a worker. New jobs also receive
+  `SCRUFFY_PROVENANCE_PATH`, `SCRUFFY_ASSIGNMENT_SHA256`, `SCRUFFY_GPU_IDS`, and
+  workflow/task/attempt identity.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.
 - A workload report `event_id` deduplicates only across the active and previous
   journal generations. Do not use it as a permanent exactly-once record.
-- Scruffy does not create retries, dynamically fan out workflow tasks, or store
-  artifacts. Agents must submit those jobs explicitly and retain artifacts
-  elsewhere.
+- Scruffy numbers immutable task attempts but does not automatically retry or
+  dynamically fan out tasks. Agents submit new attempts explicitly and retain
+  artifact bytes elsewhere.
 - Queue state contains argv and environment overrides in plaintext. Reference
   protected secret files instead of submitting secret values.

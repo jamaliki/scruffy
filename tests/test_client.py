@@ -442,6 +442,9 @@ class ObserveTests(unittest.TestCase):
             (2, 40, 123, True),
             parse_cursor(self.root, f"{identity}:0:39:99"),
         )
+        reset = observe(self.root, after=f"{identity}:0:39:99")
+        self.assertTrue(reset["reset"])
+        self.assertEqual("journal_rotated", reset["reset_reason"])
 
     def test_malformed_cursor_is_rejected_before_generation_reset(self) -> None:
         identity = queue_id(self.root)

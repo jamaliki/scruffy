@@ -6,10 +6,12 @@ import queue
 import signal
 import subprocess
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .models import Assignment, QueuedJob, ResourceRequest, job_project
+from .provenance import write_launch_record, write_result_record
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_first_fitting_job, project_gpu_usage, queue_priority_key
 from .slurm import (
@@ -39,7 +41,29 @@ def _fail_unlaunched(
             "error": str(exc),
         }
     )
+    write_result_record(controller.root, job)
     emit(controller, "job.failed", job=job)
+
+
+def _job_deadline(started_at: str, seconds: int | None) -> str | None:
+    """Return a restart-stable wall-clock deadline for an optional time limit."""
+
+    if seconds is None:
+        return None
+    started = datetime.fromisoformat(started_at)
+    return (started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(
+        timespec="milliseconds"
+    )
+
+
+def remaining_time_limit(job: dict[str, Any]) -> float | None:
+    """Return remaining wall time, preserving limits across controller restarts."""
+
+    deadline = job.get("deadline_at")
+    if not isinstance(deadline, str):
+        return None
+    parsed = datetime.fromisoformat(deadline)
+    return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
 
 
 def _launch_arguments(
@@ -77,24 +101,38 @@ def start_job(
     job["assignment"] = assignment.to_dict()
     job["state"] = "starting"
     job["started_at"] = utc_now()
+    job["deadline_at"] = _job_deadline(
+        job["started_at"], assignment.request.time_limit_seconds
+    )
     if controller.launcher == "slurm":
         job["launch_token"] = new_step_name()
-    emit(controller, "job.starting", job=job)
 
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
     stdout_file = directory / "stdout.log"
     stderr_file = directory / "stderr.log"
-    worker_document = {
-        "root": str(controller.root),
-        "job_id": job["id"],
-        "project_id": job_project(job),
-        "argv": job["argv"],
-        "cwd": job["cwd"],
-        "env": job["env"],
-        "assignment": [item.to_dict() for item in assignment.reservations],
-    }
     try:
+        launch_file = write_launch_record(
+            controller.root, controller.allocation_id, job, assignment
+        )
+        worker_document = {
+            "root": str(controller.root),
+            "job_id": job["id"],
+            "project_id": job_project(job),
+            "workflow_id": job.get("workflow_id"),
+            "task_id": job.get("task_id"),
+            "attempt": job.get("attempt"),
+            "provenance_path": str(launch_file),
+            "assignment_sha256": job["provenance"]["assignment_sha256"],
+            "argv": job["argv"],
+            "cwd": job["cwd"],
+            "env": job["env"],
+            "assignment": [item.to_dict() for item in assignment.reservations],
+        }
+        # The durable starting event owns the reservation before any process
+        # can be launched. The immutable launch record is already available to
+        # the worker by the time that transition is published.
+        emit(controller, "job.starting", job=job)
         atomic_write_json(assignment_file, worker_document)
         argv, environment = _launch_arguments(
             controller,
@@ -124,6 +162,9 @@ def start_job(
         return
 
     running = RunningProcess(process, job.get("launch_token"))
+    remaining = remaining_time_limit(job)
+    if remaining is not None:
+        running.time_limit_deadline = time.monotonic() + remaining
     controller.running[job["id"]] = running
     job.update(
         {
@@ -191,6 +232,7 @@ def request_cancellation(
         job["state"] = "cancelled"
         job["finished_at"] = utc_now()
         job["reason"] = "cancelled_before_start"
+        write_result_record(controller.root, job)
         emit(controller, "job.cancelled", job=job, data=data)
         return True
     if job["state"] not in {"starting", "running", "finishing"}:
@@ -254,7 +296,19 @@ def _finish_job(
     elif returncode == 0:
         state, reason = "succeeded", "process_exit"
     else:
-        state, reason = "failed", "process_exit"
+        state = "failed"
+        slurm_parts = str(job.get("slurm_state") or "").split(maxsplit=1)
+        slurm_state = slurm_parts[0] if slurm_parts else ""
+        if slurm_state == "OUT_OF_MEMORY":
+            reason = "oom_kill"
+        elif slurm_state == "TIMEOUT":
+            reason = "timeout"
+        elif slurm_state in {"BOOT_FAIL", "NODE_FAIL", "REVOKED"}:
+            reason = "infrastructure_failure"
+        elif returncode < 0:
+            reason = "signal"
+        else:
+            reason = "application_exit"
     job.update(
         {
             "state": state,
@@ -277,6 +331,7 @@ def _finish_job(
             except FileNotFoundError:
                 size = 0
             job[f"{stream_name}_bytes"] = size
+    write_result_record(controller.root, job)
     emit(controller, f"job.{state}", job=job)
 
 
@@ -284,6 +339,14 @@ def poll_processes(controller: Controller) -> None:
     now = time.monotonic()
     refresh_slurm_snapshot(controller, now)
     for job_id, running in list(controller.running.items()):
+        if (
+            running.time_limit_deadline is not None
+            and now >= running.time_limit_deadline
+            and running.final_state is None
+        ):
+            running.final_state = "failed"
+            running.final_reason = "timeout"
+            stop_launcher(controller, running)
         if (
             controller.launcher == "local"
             and running.cancel_deadline is not None

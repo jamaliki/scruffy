@@ -8,8 +8,8 @@ to-test transformation of these values.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 
 JsonObject = Mapping[str, object]
 
@@ -163,44 +163,70 @@ class NodeAvailability:
 
 @dataclass(frozen=True, slots=True)
 class ResourceRequest:
-    """A rectangular request: the same resources are needed on every node."""
+    """A rectangular request: the same resources are needed on every node.
+
+    GPU count may be zero for controller-accounted CPU work.  CPU and memory
+    remain positive because every launched process must own a real node slice.
+    The optional time limit is an execution contract rather than a placement
+    dimension, but keeping it in the immutable request makes retries and
+    provenance unambiguous.
+    """
 
     nodes: int
     gpus_per_node: int
     cpus_per_node: int
     memory_gb_per_node: int
+    time_limit_seconds: int | None = None
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "nodes",
-            "gpus_per_node",
-            "cpus_per_node",
-            "memory_gb_per_node",
-        ):
+        for field_name in ("nodes", "cpus_per_node", "memory_gb_per_node"):
             object.__setattr__(
                 self,
                 field_name,
                 _positive_int(getattr(self, field_name), field_name),
             )
+        object.__setattr__(
+            self,
+            "gpus_per_node",
+            _nonnegative_int(self.gpus_per_node, "gpus_per_node"),
+        )
+        if self.time_limit_seconds is not None:
+            object.__setattr__(
+                self,
+                "time_limit_seconds",
+                _positive_int(self.time_limit_seconds, "time_limit_seconds"),
+            )
 
     def to_dict(self) -> dict[str, int]:
-        return {
+        result = {
             "nodes": self.nodes,
             "gpus_per_node": self.gpus_per_node,
             "cpus_per_node": self.cpus_per_node,
             "memory_gb_per_node": self.memory_gb_per_node,
         }
+        if self.time_limit_seconds is not None:
+            result["time_limit_seconds"] = self.time_limit_seconds
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> ResourceRequest:
         data = _mapping(value, "resource request")
-        keys = {"nodes", "gpus_per_node", "cpus_per_node", "memory_gb_per_node"}
-        _exact_keys(data, keys, "resource request")
+        required = {"nodes", "gpus_per_node", "cpus_per_node", "memory_gb_per_node"}
+        missing = required - data.keys()
+        extra = data.keys() - (required | {"time_limit_seconds"})
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing {sorted(missing)!r}")
+            if extra:
+                details.append(f"unexpected {sorted(extra)!r}")
+            raise ModelError(f"invalid resource request: {', '.join(details)}")
         return cls(
             nodes=data["nodes"],  # type: ignore[arg-type]
             gpus_per_node=data["gpus_per_node"],  # type: ignore[arg-type]
             cpus_per_node=data["cpus_per_node"],  # type: ignore[arg-type]
             memory_gb_per_node=data["memory_gb_per_node"],  # type: ignore[arg-type]
+            time_limit_seconds=data.get("time_limit_seconds"),  # type: ignore[arg-type]
         )
 
 
@@ -233,7 +259,11 @@ class NodeReservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "node", _nonempty_string(self.node, "node"))
-        object.__setattr__(self, "gpu_ids", _gpu_ids(self.gpu_ids, "gpu_ids"))
+        object.__setattr__(
+            self,
+            "gpu_ids",
+            _gpu_ids(self.gpu_ids, "gpu_ids", allow_empty=True),
+        )
         object.__setattr__(self, "cpus", _positive_int(self.cpus, "cpus"))
         object.__setattr__(
             self,

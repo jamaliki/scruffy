@@ -245,7 +245,8 @@ class ProjectionTests(unittest.TestCase):
                 "id": "allocation-1",
                 "state": "running",
                 "heartbeat_at": "2026-08-06T12:00:00+00:00",
-                "deadline": None,
+                "deadline_at": None,
+                "remaining_seconds": None,
             },
             compact["allocation"],
         )
@@ -303,6 +304,32 @@ class ProjectionTests(unittest.TestCase):
                 snapshot,
                 project_id="project-a",
             )
+        )
+
+    def test_submission_events_keep_identity_and_project_scope(self) -> None:
+        rejected = {
+            "kind": "submission.rejected",
+            "data": {
+                "submission_id": "submission-1",
+                "workflow_id": "workflow-1",
+                "project_id": "project-b",
+                "reason": "invalid DAG",
+            },
+        }
+
+        self.assertFalse(event_matches(rejected, {}, project_id="project-a"))
+        self.assertTrue(event_matches(rejected, {}, project_id="project-b"))
+        self.assertEqual(
+            {
+                "kind": "submission.rejected",
+                "project_id": "project-b",
+                "data": {
+                    "submission_id": "submission-1",
+                    "workflow_id": "workflow-1",
+                    "reason": "invalid DAG",
+                },
+            },
+            compact_event(rejected, {}),
         )
 
 
@@ -485,6 +512,11 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
             "list_jobs",
             {"state": "running", "offset": 1, "limit": 1},
         )
+        filtered = await dispatch_tool(
+            self.root,
+            "list_jobs",
+            {"state": "running", "name_prefix": "train", "task_id": "train"},
+        )
 
         self.assertEqual(2, first["total"])
         self.assertTrue(first["more"])
@@ -492,6 +524,7 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first["jobs"][0]["id"], second["jobs"][0]["id"])
         self.assertNotIn("argv", json.dumps(first))
         self.assertNotIn("environment", json.dumps(first))
+        self.assertEqual(2, filtered["total"])
         with self.assertRaisesRegex(ValueError, "state must be one of"):
             await dispatch_tool(self.root, "list_jobs", {"state": "active"})
 
@@ -614,6 +647,9 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             args=["-m", "scruffy.mcp_server", "--root", str(self.root)],
             env=environment,
         )
+        log_directory = self.root / "jobs" / self.job_id
+        log_directory.mkdir(parents=True)
+        (log_directory / "stderr.log").write_text("old\nfinal diagnostic\n")
 
         async with (
             stdio_client(parameters) as (reader, writer),
@@ -630,7 +666,9 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                     "resources",
                     "list_jobs",
                     "inspect_job",
+                    "tail_job_output",
                     "wait_for_updates",
+                    "wait_job",
                 },
                 {tool.name for tool in tools.tools},
             )
@@ -644,6 +682,12 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             )
             inspected = self.structured(
                 await session.call_tool("inspect_job", {"job_id": self.job_id})
+            )
+            tailed = self.structured(
+                await session.call_tool(
+                    "tail_job_output",
+                    {"job_id": self.job_id, "stream": "stderr", "max_bytes": 11},
+                )
             )
             self.assertEqual(
                 {"id", "project_id", "name", "state", "elapsed_seconds"},
@@ -686,11 +730,17 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             }
             _commit(self.root, [event], jobs={self.job_id: finished})
             result = self.structured(await pending)
+            terminal = self.structured(
+                await session.call_tool("wait_job", {"job_id": self.job_id})
+            )
 
         self.assertEqual(
             ["job.succeeded"], [event["kind"] for event in result["events"]]
         )
         self.assertFalse(result["timed_out"])
+        self.assertEqual("diagnostic\n", tailed["text"])
+        self.assertTrue(tailed["truncated"])
+        self.assertEqual("succeeded", terminal["job"]["state"])
         self.assertEqual(
             {
                 "kind",
@@ -724,6 +774,7 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             "name": "train",
             "argv": [sys.executable, "-c", "print('queued')"],
             "cwd": str(self.root.parent),
+            "gpus_per_node": 1,
         }
 
         async with (
@@ -741,18 +792,51 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                     "resources",
                     "list_jobs",
                     "inspect_job",
+                    "tail_job_output",
                     "wait_for_updates",
+                    "wait_job",
                     "submit_job",
+                    "validate_workflow",
+                    "submit_workflow",
                 },
                 {tool.name for tool in tools.tools},
             )
             first = self.structured(await session.call_tool("submit_job", submission))
             second = self.structured(await session.call_tool("submit_job", submission))
+            workflow = {
+                "request_id": "agent/campaign/workflow/attempt-1",
+                "workflow_id": "campaign-workflow",
+                "tasks": [
+                    {
+                        "task_id": "train",
+                        "argv": [sys.executable, "-c", "print('train')"],
+                        "cwd": str(self.root.parent),
+                        "resources": {
+                            "nodes": 1,
+                            "gpus_per_node": 0,
+                            "cpus_per_node": 1,
+                            "memory_gb_per_node": 1,
+                        },
+                    }
+                ],
+            }
+            validated = self.structured(
+                await session.call_tool("validate_workflow", workflow)
+            )
+            workflow_first = self.structured(
+                await session.call_tool("submit_workflow", workflow)
+            )
+            workflow_second = self.structured(
+                await session.call_tool("submit_workflow", workflow)
+            )
 
         self.assertFalse(first["deduplicated"])
         self.assertTrue(second["deduplicated"])
         self.assertEqual("project-a", first["project_id"])
         self.assertEqual(first["job_id"], second["job_id"])
+        self.assertTrue(validated["valid"])
+        self.assertFalse(workflow_first["deduplicated"])
+        self.assertTrue(workflow_second["deduplicated"])
 
     async def test_local_gateway_survives_remote_failure_and_cancellation(self) -> None:
         connector = self.root.parent / "connector.py"
@@ -842,6 +926,7 @@ os.execv(command[0], command)
                         "name": "remote-train",
                         "argv": [sys.executable, "-c", "print('queued')"],
                         "cwd": str(self.root.parent),
+                        "gpus_per_node": 1,
                     },
                 )
             )

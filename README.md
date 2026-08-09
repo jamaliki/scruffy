@@ -125,7 +125,7 @@ an agent session:
 ```bash
 export SCRUFFY_PROJECT=koochak
 scruffy --root "$SCRUFFY_ROOT" submit \
-  --request-id experiment-7/train -- python train.py
+  --request-id experiment-7/train --gpus-per-node 1 -- python train.py
 scruffy --root "$SCRUFFY_ROOT" summary
 scruffy --root "$SCRUFFY_ROOT" observe --after "$CURSOR" --wait 30
 ```
@@ -201,9 +201,14 @@ Every server exposes focused monitoring tools:
   without assignment details.
 - `list_jobs(state=None, offset=0, limit=50)` returns lightweight job identity,
   name, state, and elapsed time for all jobs or another exact state such as
-  `failed` or `succeeded`.
+  `failed` or `succeeded`. Exact workflow, task, request, name-prefix, and
+  submission-time filters are available.
 - `inspect_job(job_id)` returns a compact dependency explanation without argv,
   cwd, or environment values.
+- `tail_job_output(job_id, stream, max_bytes)` returns at most 64 KiB from one
+  job-owned stdout or stderr file.
+- `wait_job(job_id, ...)` waits for one terminal result, then returns its
+  authoritative inspected state and an optional bounded stderr tail.
 - `wait_for_updates(...)` blocks for up to one hour and returns relevant events
   plus `next_cursor`. Lifecycle changes, milestones, artifacts, and notices wake
   it by default; `job.output` and `workload.progress` are opt-in through
@@ -214,12 +219,13 @@ Every server exposes focused monitoring tools:
 
 In stdio mode, start with `--project PROJECT` (or `SCRUFFY_PROJECT`) to pin the
 server to one project. In shared HTTP mode, Codex pins the project once through
-the `X-Scruffy-Project` connection header instead. `submit_job(...)` requires a
-project scope, stable `request_id`, `name`, argv array, and absolute worker
-`cwd`; resource, workflow, dependency, and environment fields are optional. It
-durably enqueues and returns immediately rather than waiting for GPUs. Retry an
-uncertain call with identical arguments and the same `request_id`; Scruffy
-safely deduplicates it.
+the `X-Scruffy-Project` connection header instead. A pinned server adds
+`submit_job`, `validate_workflow`, and `submit_workflow`. `submit_job` requires
+a stable `request_id`, name, argv array, absolute worker `cwd`, and explicit
+`gpus_per_node` (zero means CPU-only). It durably enqueues and returns without
+waiting for GPUs. Retry an uncertain call with identical arguments and the same
+`request_id`; Scruffy safely deduplicates it. A complete workflow is validated
+and admitted all-or-nothing.
 
 ```json
 {
@@ -298,9 +304,12 @@ job eviction through a compact receipt in the archive.
 Transient shared-filesystem read failures leave requests and reports pending for
 the next controller poll. They are never converted into rejection receipts.
 
-CLI defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per GPU. Requests
-are rectangular: every selected node receives the same resource shape and runs
-the same argv once. Distributed rendezvous and application ranks remain the
+The GPU count is always explicit: use `--gpus-per-node 0` deliberately for a
+CPU-only job. GPU jobs default to 14 CPUs and 128 GB per GPU; CPU-only jobs
+default to one CPU and 4 GB. `--time-limit-seconds` is enforced by the
+controller and survives a same-allocation controller restart. Requests are
+rectangular: every selected node receives the same resource shape and runs the
+same argv once. Distributed rendezvous and application ranks remain the
 workload's responsibility; Slurm rank and node variables are available.
 
 ```bash
@@ -338,17 +347,58 @@ result = submit_job(
 
 ## Workflows
 
-A task may depend on tasks that have not been submitted yet. All submissions
-still return immediately. Workflow and task identities are scoped to the job's
+For a complete DAG, prefer one atomic workflow document. `validate-workflow`
+runs the same schema, dependency, cycle, identity, and allocation-fit checks
+without writing queue state; allocation fit is checked when a live inventory is
+available and always rechecked by the controller. `submit-workflow` then
+publishes one immutable envelope; the controller creates every task or none.
+
+```json
+{
+  "request_id": "agent/experiment-7",
+  "workflow_id": "experiment-7",
+  "project_id": "koochak",
+  "tasks": [
+    {
+      "task_id": "train",
+      "argv": ["/shared/env/bin/python", "train.py"],
+      "cwd": "/shared/code/project",
+      "resources": {
+        "nodes": 1, "gpus_per_node": 1,
+        "cpus_per_node": 14, "memory_gb_per_node": 128
+      }
+    },
+    {
+      "task_id": "infer",
+      "argv": ["/shared/env/bin/python", "infer.py"],
+      "cwd": "/shared/code/project",
+      "resources": {
+        "nodes": 1, "gpus_per_node": 1,
+        "cpus_per_node": 14, "memory_gb_per_node": 128
+      },
+      "needs": [{"task_id": "train", "condition": "succeeded"}]
+    }
+  ]
+}
+```
+
+```bash
+scruffy validate-workflow workflow.json
+scruffy submit-workflow workflow.json
+```
+
+Single-task submissions remain useful when a dependency is not yet known. They
+also return immediately. Workflow and task identities are scoped to the job's
 project, and a dependency never binds across projects.
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" submit \
   --workflow-id experiment-7 --task-id infer \
-  --needs train:succeeded -- python infer.py
+  --needs train:succeeded --gpus-per-node 1 -- python infer.py
 
 scruffy --root "$SCRUFFY_ROOT" submit \
-  --workflow-id experiment-7 --task-id train -- python train.py
+  --workflow-id experiment-7 --task-id train \
+  --gpus-per-node 1 -- python train.py
 ```
 
 `succeeded` requires a successful upstream result. `terminal` accepts any
@@ -363,8 +413,16 @@ Active duplicate task IDs, self-dependencies, and cycles are rejected. Use
 ## Workload progress and output
 
 Workers receive controller-owned `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`,
-`SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and `SCRUFFY_NODE`. A workload can publish
-a bounded semantic annotation without contacting the controller process:
+`SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, `SCRUFFY_NODE`, `SCRUFFY_GPU_IDS`, and
+workflow/task/attempt identity. `SCRUFFY_PROVENANCE_PATH` names a mode-0444
+launch record containing exact argv, cwd, resources, resolved dependency
+attempts, allocation, and placement. Its sibling request and result records
+survive log and hot-state compaction; environment values are represented by a
+digest rather than copied into provenance. `SCRUFFY_ASSIGNMENT_SHA256` is a
+stable digest of the concrete node/GPU reservation.
+
+A workload can publish a bounded semantic annotation without contacting the
+controller process:
 
 ```bash
 scruffy report workload.progress \
@@ -424,9 +482,10 @@ cancelling a terminal job still in hot state.
 
 The hot snapshot keeps every nonterminal job and, after compaction, the newest
 1,000 terminal jobs. Older terminal jobs remain addressable by job ID with
-`archived: true`; compact records keep lifecycle and workflow metadata, but
-resource requests, cwd, assignments, logs, argv, environment, and workload state
-expire. `summary.counts` includes archived terminal jobs;
+`archived: true`; compact records keep lifecycle and workflow identity,
+resource requests, final placement, and provenance references. Cwd, argv,
+environment, live assignment, blockers, logs, and workload state expire.
+`summary.counts` includes archived terminal jobs;
 `summary.archived_jobs` and `status.archived_counts` expose the archived totals.
 The active and immediately previous journal generations are retained.
 Compact request receipts and workflow indexes last for the queue root's lifetime,
@@ -450,9 +509,10 @@ Every same-allocation restart begins with launches paused: queued jobs remain
 durable and dependencies may resolve, but nothing new starts until an operator
 checks the recovered state and runs `scruffy --root "$SCRUFFY_ROOT" resume`.
 
-The controller deliberately runs one submitted argv per job. It is not a retry
-engine, dynamic workflow fan-out engine, or artifact store: submit retries and
-new tasks explicitly, and keep artifacts in their normal storage.
+The controller deliberately runs one submitted argv per job. It numbers
+immutable attempts but is not an automatic retry engine, dynamic workflow
+fan-out engine, or artifact store: submit retries and new tasks explicitly, and
+keep artifact bytes in their normal storage.
 
 The shared queue stores argv, working directories, environment overrides, state,
 events, and logs in plaintext. Protect its permissions and pass paths to secret

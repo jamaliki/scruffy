@@ -10,6 +10,8 @@ include the effects of returned events.
 | Purpose | CLI | Python / MCP |
 | --- | --- | --- |
 | Submit | `scruffy submit -- ...` | `submit_job(...)` |
+| Validate complete DAG | `scruffy validate-workflow FILE` | `validate_workflow(...)` |
+| Submit complete DAG | `scruffy submit-workflow FILE` | `submit_workflow(...)` |
 | Full state or one job | `scruffy status [JOB_ID]` | `status(root, job_id=None)` |
 | Bounded orientation | `scruffy summary` | `summary(root)` |
 | Resource availability | `scruffy resources` | MCP `resources()` |
@@ -19,6 +21,8 @@ include the effects of returned events.
 | Dependency explanation | `scruffy explain JOB_ID` | `explain(root, job_id)` |
 | Snapshot and events | `scruffy observe` | `observe(root, ...)` |
 | Wait for one terminal job | `scruffy wait JOB_ID` | `wait_for_job(root, job_id)` |
+| Bounded output tail | `scruffy logs JOB_ID --tail N` | MCP `tail_job_output(...)` |
+| Wait and inspect one job | - | MCP `wait_job(...)` |
 | Publish workload state | `scruffy report KIND` | `publish_event(...)` |
 | Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
@@ -65,9 +69,11 @@ Important hot-job fields are:
 
 - `id`, `name`, `state`, and `submitted_at`.
 - `project_id`, with legacy records normalized to `default`.
-- `request` and, while resources are held, `assignment`.
+- `request`; live `assignment`; and historical `last_assignment` after release.
 - `started_at`, `finished_at`, `exit_code`, `signal`, `reason`, and `error`.
-- Optional `workflow_id`, `task_id`, `needs`, and `blockers`.
+- Optional `workflow_id`, `task_id`, `attempt`, `needs`, `blockers`, and concrete
+  `resolved_dependencies`.
+- Optional immutable `provenance` paths and content digests.
 - Optional bounded `workload` projection.
 - Optional `stdout` and `stderr` paths relative to the queue root.
 
@@ -93,9 +99,11 @@ recomputes that order after every placement and backfills past requests that do
 not currently fit.
 
 `explain(root, job_id)` returns the job, its resolved upstream job IDs and
-states, current blockers, and a short explanation. Compact archived job and
-workflow metadata remains sufficient for older terminal-job lookup and
-dependency explanation.
+states, current blockers, and a short explanation. MCP `inspect_job` is the
+bounded projection of this view. `tail_job_output` reads only stdout or stderr
+owned by that job and is capped at 64 KiB. Compact archived job and workflow
+metadata remains sufficient for older terminal-job lookup and dependency
+explanation.
 
 ## Submission
 
@@ -127,8 +135,19 @@ admission to a later poll without deleting the request or consuming its ID.
 Decodable but invalid requests, including a `job_id` that disagrees with its
 directory, are rejected and permanently consume that ID.
 
-CLI resource defaults are one node, one GPU, 14 CPUs per GPU, and 128 GB per
-GPU. Python callers provide an explicit `ResourceRequest`.
+CLI and MCP submissions require an explicit GPU count. Zero means CPU-only and
+defaults to one CPU and 4 GB; a positive count defaults to 14 CPUs and 128 GB
+per GPU. Python callers provide an explicit `ResourceRequest`. The optional
+`time_limit_seconds` is an authoritative controller deadline, not workload
+metadata.
+
+`validate_workflow` and `submit_workflow` accept one complete DAG of at most 256
+tasks. Every task has explicit argv, absolute cwd, resources, and dependency
+objects. Validation rejects missing tasks, duplicate identities, cycles, and
+requests which cannot fit the current inventory when one is available.
+Submission publishes one immutable envelope; the controller revalidates it and
+admits every task or none. Accepted tasks are recoverable from one
+`submission.admitted` journal record.
 
 Workflow identity is `(project_id, workflow_id, task_id)`; dependencies only
 resolve inside that project. Task IDs cannot contain `:`. A succeeded task
@@ -162,7 +181,8 @@ Cursors are opaque and private to one reader:
 4. Otherwise, long-poll with `wait_seconds` or CLI `--wait`.
 5. If `reset` is true, the cursor belongs to another queue or to an expired
    journal generation. Rebuild from the returned full hot snapshot and save the
-   new cursor.
+   new cursor. `reset_reason` distinguishes queue replacement, journal rotation,
+   and a bounded hub buffer miss.
 
 Calling `observe` without a cursor returns current state but does not replay old
 journal events. `latest_cursor` indicates the committed journal tail at response time.
@@ -214,11 +234,12 @@ unrelated work.
 
 After compaction, hot state contains every nonterminal job and the newest 1,000
 terminal jobs. Older terminal jobs move to records marked `archived: true`.
-These retain identity, lifecycle results and timestamps, and workflow metadata;
-they drop the resource request, cwd, argv, environment, assignments, blockers,
-workload projection, output paths, and per-job logs. The state exposes per-state
-`archived_counts`; `summary.counts` combines these with hot counts, while
-detailed summary lists and unqualified `status(root)` remain hot views.
+These retain identity, lifecycle results and timestamps, workflow metadata,
+resource request, final placement, and immutable provenance references. They
+drop cwd, argv, environment, live assignment, blockers, workload projection,
+output paths, and per-job logs. The state exposes per-state `archived_counts`;
+`summary.counts` combines these with hot counts, while detailed summary lists
+and unqualified `status(root)` remain hot views.
 
 Journal history and workload-report idempotency receipts retain the active and
 immediately previous generations. Request idempotency is different: its compact
@@ -287,6 +308,13 @@ The shared filesystem must provide atomic rename and cluster-coherent `flock`
 across all nodes. Lustre `localflock` is not sufficient, and Scruffy cannot
 detect a filesystem that silently treats these locks as node-local.
 
-The controller deliberately executes submitted jobs; it does not invent
-retries, dynamically fan out workflow tasks, or store artifact bytes. Clients
-must submit those jobs explicitly and keep artifacts elsewhere.
+For each accepted job, Scruffy writes immutable mode-0444 request, launch, and
+result records under `provenance/JOB_ID/`. The launch record is injected as
+`SCRUFFY_PROVENANCE_PATH`; it contains exact argv, placement, resource request,
+and concrete dependency attempts. `SCRUFFY_ASSIGNMENT_SHA256` identifies the
+exact reservation. Provenance stores an environment digest, not raw environment
+values.
+
+The controller numbers immutable task attempts but does not invent retries,
+dynamically fan out workflow tasks, or store artifact bytes. Clients submit
+those jobs explicitly and keep artifact bytes elsewhere.

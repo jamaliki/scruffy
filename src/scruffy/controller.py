@@ -14,6 +14,7 @@ from .lifecycle import (
     begin_shutdown,
     drain_messages,
     poll_processes,
+    remaining_time_limit,
     request_cancellation,
     schedule,
 )
@@ -29,6 +30,7 @@ from .models import (
     validate_inventory,
 )
 from .protocol import validate_event
+from .provenance import write_request_record, write_result_record
 from .runtime import Controller, OutputNotifier, RunningProcess, abandon_processes
 from .scheduler import InvariantError, assert_invariants, request_can_ever_fit
 from .slurm import allocation_metadata
@@ -37,7 +39,7 @@ from .state import (
     commit_snapshot,
     compact_journal,
     emit,
-    job_from_spec,
+    emit_submission,
     load_recovered_state,
 )
 from .storage import (
@@ -47,6 +49,7 @@ from .storage import (
     accept_known_requests,
     accept_reports,
     accept_request,
+    accept_submission,
     compact_report_receipts,
     controller_lock,
     ensure_layout,
@@ -56,8 +59,10 @@ from .storage import (
     list_commands,
     list_reports,
     list_requests,
+    list_submissions,
     open_journal,
     read_events,
+    record_request_receipt,
     reject_request,
     remove_cold_job_directories,
     remove_command,
@@ -65,8 +70,11 @@ from .storage import (
     report_streams,
     report_was_accepted,
     request_pending,
+    request_receipt_digest,
+    submission_identity_digest,
     utc_now,
 )
+from .submissions import job_from_spec
 from .workflows import (
     WorkflowError,
     resolve_blocked_jobs,
@@ -154,6 +162,7 @@ def _initialize_controller(
             job["reason"] = "allocation_replaced"
             job["last_assignment"] = job.get("assignment")
             job["assignment"] = None
+            write_result_record(root, job)
         for job in active:
             emit(controller, "job.lost", job=job, snapshot=False)
 
@@ -218,6 +227,7 @@ def _initialize_controller(
         job["finished_at"] = utc_now()
         job["reason"] = "request_cannot_fit"
         job["error"] = "request cannot fit this allocation inventory"
+        write_result_record(root, job)
         emit(controller, "job.rejected", job=job)
     return controller
 
@@ -243,6 +253,9 @@ def _reattach_slurm_jobs(
         if job["state"] == "cancelling":
             running.final_state = "cancelled"
             running.final_reason = "cancelled"
+        remaining = remaining_time_limit(job)
+        if remaining is not None:
+            running.time_limit_deadline = time.monotonic() + remaining
         controller.running[job["id"]] = running
 
 
@@ -393,6 +406,23 @@ def _stage_job(
         )
         return job
 
+    if isinstance(workflow_id, str) and isinstance(task_id, str):
+        prior_attempts = [
+            (
+                candidate["attempt"]
+                if type(candidate.get("attempt")) is int
+                else 1
+            )
+            for candidate in prospective.values()
+            if job_project(candidate) == project_id
+            and candidate.get("workflow_id") == workflow_id
+            and candidate.get("task_id") == task_id
+        ]
+        job["attempt"] = max(
+            prior_attempts,
+            default=0,
+        ) + 1
+
     if workflow_id is not None:
         candidates = [
             candidate
@@ -409,28 +439,48 @@ def _stage_job(
     return job
 
 
-def _admit_job(
+def _resolved_dependency_ids(
+    job: dict[str, Any], workflow_jobs: Iterable[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """Bind logical dependencies to the concrete attempts used at launch."""
+
+    selected = select_task_attempts(workflow_jobs)
+    project_id = job_project(job)
+    workflow_id = str(job.get("workflow_id") or "")
+    result = []
+    for need in job.get("needs") or []:
+        dependency = selected.get(
+            (project_id, workflow_id, str(need.get("task_id") or ""))
+        )
+        if dependency is not None:
+            result.append(
+                {
+                    "task_id": str(need["task_id"]),
+                    "job_id": str(dependency["id"]),
+                    "condition": str(need["condition"]),
+                }
+            )
+    return result
+
+
+def _initial_job_event(
     controller: Controller,
     job: dict[str, Any],
     prospective: dict[str, dict[str, Any]],
-) -> None:
-    """Publish one staged job's first authoritative lifecycle state."""
+) -> str:
+    """Resolve one staged job's initial state without publishing it."""
 
-    controller.state["jobs"][job["id"]] = job
     if job.get("state") == "rejected":
-        emit(controller, "job.rejected", job=job)
-        return
+        return "job.rejected"
     request = ResourceRequest.from_dict(job["request"])
     if not request_can_ever_fit(controller.inventory, request):
         job["state"] = "rejected"
         job["finished_at"] = utc_now()
         job["reason"] = "request_cannot_fit"
         job["error"] = "request cannot fit this allocation inventory"
-        emit(controller, "job.rejected", job=job)
-        return
+        return "job.rejected"
     if job.get("workflow_id") is None:
-        emit(controller, "job.queued", job=job)
-        return
+        return "job.queued"
 
     workflow_jobs = _resolution_workflow_jobs(
         prospective.values(), job_project(job), job["workflow_id"]
@@ -439,18 +489,37 @@ def _admit_job(
     job["blockers"] = resolution["blockers"]
     if resolution["decision"] == "ready":
         job["dependency_gate_passed"] = True
-        emit(controller, "job.queued", job=job)
+        job["resolved_dependencies"] = _resolved_dependency_ids(job, workflow_jobs)
+        return "job.queued"
     elif resolution["decision"] == "blocked":
         job["dependency_gate_passed"] = False
         job["state"] = "blocked"
         job["reason"] = "waiting_for_dependencies"
-        emit(controller, "job.blocked", job=job)
+        return "job.blocked"
     else:
         job["dependency_gate_passed"] = True
         job["state"] = "skipped"
         job["finished_at"] = utc_now()
         job["reason"] = "dependency_unsatisfied"
-        emit(controller, "job.skipped", job=job)
+        return "job.skipped"
+
+
+def _admit_job(
+    controller: Controller,
+    job: dict[str, Any],
+    prospective: dict[str, dict[str, Any]],
+) -> None:
+    """Publish one staged job's first authoritative lifecycle state."""
+
+    event_kind = _initial_job_event(controller, job, prospective)
+    # Invalid legacy inbox items can contain only part of a job spec.  Write
+    # request provenance only after the fields it promises have been validated.
+    if all(key in job for key in ("argv", "cwd", "env", "request")):
+        write_request_record(controller.root, job)
+    if job.get("state") in TERMINAL_JOB_STATES:
+        write_result_record(controller.root, job)
+    controller.state["jobs"][job["id"]] = job
+    emit(controller, event_kind, job=job)
 
 
 def _stage_request(
@@ -501,6 +570,161 @@ def _finish_staged_request(
         _storage_notice(controller, "finish_request", job["id"], exc)
 
 
+def _atomic_specs(
+    submission_id: str, document: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Validate an envelope's outer identity before staging any task."""
+
+    if document.get("submission_id") != submission_id:
+        raise ValueError("submission_id does not match request directory")
+    if document.get("kind") != "workflow":
+        raise ValueError("atomic submission kind must be 'workflow'")
+    expected_digest = document.get("identity_sha256")
+    if (
+        not isinstance(expected_digest, str)
+        or expected_digest != submission_identity_digest(document)
+    ):
+        raise ValueError("submission identity digest does not match its content")
+    specs = document.get("jobs")
+    if not isinstance(specs, list) or not specs or len(specs) > 256:
+        raise ValueError("submission jobs must contain between 1 and 256 tasks")
+    if not all(isinstance(spec, dict) for spec in specs):
+        raise ValueError("submission jobs must contain JSON objects")
+    project_id = normalize_project_id(document.get("project_id"))
+    workflow_id = document.get("workflow_id")
+    if not isinstance(workflow_id, str) or not workflow_id.strip():
+        raise ValueError("submission workflow_id must be a non-empty string")
+    job_ids = [spec.get("job_id") for spec in specs]
+    if not all(isinstance(job_id, str) and job_id for job_id in job_ids):
+        raise ValueError("every submitted task must have a job_id")
+    if len(set(job_ids)) != len(job_ids):
+        raise ValueError("submission contains duplicate job IDs")
+    for spec in specs:
+        if normalize_project_id(spec.get("project_id")) != project_id:
+            raise ValueError("every task must use the submission project")
+        if spec.get("workflow_id") != workflow_id:
+            raise ValueError("every task must use the submission workflow_id")
+    return specs
+
+
+def _stage_atomic_submission(
+    controller: Controller,
+    submission_id: str,
+    document: dict[str, Any],
+    next_order: int,
+    prospective: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Stage a whole DAG or raise without changing authoritative state."""
+
+    specs = _atomic_specs(submission_id, document)
+    staged: list[dict[str, Any]] = []
+    candidate_state = dict(prospective)
+    for offset, spec in enumerate(specs, start=1):
+        job_id = str(spec["job_id"])
+        if (
+            job_id in candidate_state
+            or find_archived_job(controller.root, job_id)
+            or request_receipt_digest(controller.root, job_id) is not None
+        ):
+            raise WorkflowError(f"job ID {job_id!r} was already admitted")
+        job = _stage_job(spec, next_order + offset, candidate_state)
+        if job.get("state") == "rejected":
+            raise WorkflowError(str(job.get("error") or "invalid workflow task"))
+        staged.append(job)
+        candidate_state[job_id] = job
+
+    workflow_id = str(document["workflow_id"])
+    project_id = normalize_project_id(document.get("project_id"))
+    workflow_jobs = _resolution_workflow_jobs(
+        candidate_state.values(), project_id, workflow_id
+    )
+    validate_workflows(workflow_jobs)
+    impossible = [
+        str(job["task_id"])
+        for job in staged
+        if not request_can_ever_fit(
+            controller.inventory, ResourceRequest.from_dict(job["request"])
+        )
+    ]
+    if impossible:
+        raise ValueError(f"tasks cannot fit this allocation: {impossible!r}")
+    return staged
+
+
+def _finish_atomic_submission(
+    controller: Controller, submission_id: str, document: dict[str, Any]
+) -> None:
+    try:
+        specs = document.get("jobs")
+        if isinstance(specs, list):
+            for spec in specs:
+                if isinstance(spec, dict) and isinstance(spec.get("job_id"), str):
+                    record_request_receipt(
+                        controller.root,
+                        spec["job_id"],
+                        job_identity_digest(spec),
+                    )
+        accept_submission(
+            controller.root,
+            submission_id,
+            identity_digest=submission_identity_digest(document),
+        )
+    except (OSError, StorageError) as exc:
+        _storage_notice(controller, "finish_submission", submission_id, exc)
+
+
+def _admit_atomic_submission(
+    controller: Controller,
+    submission_id: str,
+    document: dict[str, Any],
+    next_order: int,
+    prospective: dict[str, dict[str, Any]],
+) -> int:
+    """Commit all initial task images in one record, or commit none of them."""
+
+    try:
+        jobs = _stage_atomic_submission(
+            controller, submission_id, document, next_order, prospective
+        )
+    except TransientStorageError:
+        return next_order
+    except (KeyError, StorageError, TypeError, ValueError) as exc:
+        emit(
+            controller,
+            "submission.rejected",
+            data={
+                "submission_id": submission_id,
+                "project_id": document.get("project_id"),
+                "workflow_id": document.get("workflow_id"),
+                "reason": str(exc),
+            },
+        )
+        _finish_atomic_submission(controller, submission_id, document)
+        return next_order
+
+    complete = {**prospective, **{job["id"]: job for job in jobs}}
+    events = [_initial_job_event(controller, job, complete) for job in jobs]
+    for job in jobs:
+        write_request_record(controller.root, job)
+        if job.get("state") in TERMINAL_JOB_STATES:
+            write_result_record(controller.root, job)
+    controller.state["jobs"].update({job["id"]: job for job in jobs})
+    controller.state["next_queue_order"] = next_order + len(jobs)
+    emit_submission(controller, submission_id, jobs)
+    for job, event_kind in zip(jobs, events, strict=True):
+        emit(
+            controller,
+            event_kind,
+            job_id=job["id"],
+            data={"submission_id": submission_id},
+            durable=False,
+            snapshot=False,
+        )
+    commit_snapshot(controller)
+    _finish_atomic_submission(controller, submission_id, document)
+    return next_order + len(jobs)
+
+
 def _ingest_requests(controller: Controller) -> None:
     known = controller.state["jobs"]
     next_order = max(
@@ -512,6 +736,7 @@ def _ingest_requests(controller: Controller) -> None:
     )
     # Directory timestamps are not a safe admission signal on every shared
     # filesystem. Listing names each poll is cheap; only unknown specs are read.
+    submissions = list_submissions(controller.root)
     requests = list_requests(controller.root, exclude=known.keys())
     # Keep every new request outside public state until its admission event.
     # Otherwise an earlier emit could snapshot a later task before its
@@ -539,7 +764,42 @@ def _ingest_requests(controller: Controller) -> None:
             }
         )
     prospective.update(known)
+    atomic_job_ids: set[str] = set()
+    for submission_id, document, atomic in submissions:
+        if not atomic:
+            continue
+        if document is None:
+            # Decodable corruption is a permanent verdict; transient reads do
+            # not appear in list_submissions and are retried next tick.
+            try:
+                reject_request(controller.root, submission_id)
+                emit(
+                    controller,
+                    "submission.rejected",
+                    data={"submission_id": submission_id, "reason": "invalid document"},
+                )
+            except (OSError, StorageError) as exc:
+                _storage_notice(controller, "reject_submission", submission_id, exc)
+            continue
+        specs = document.get("jobs")
+        job_ids = {
+            str(spec.get("job_id"))
+            for spec in specs
+            if isinstance(specs, list) and isinstance(spec, dict)
+        } if isinstance(specs, list) else set()
+        atomic_job_ids.update(job_ids)
+        if job_ids and job_ids <= set(known):
+            _finish_atomic_submission(controller, submission_id, document)
+            continue
+        next_order = _admit_atomic_submission(
+            controller, submission_id, document, next_order, prospective
+        )
+        prospective.update(known)
+
     for request_id, spec in requests:
+        # Atomic specs were handled as one transaction above.
+        if request_id in atomic_job_ids:
+            continue
         if request_id in prospective:
             continue
         if spec is not None and isinstance(spec.get("workflow_id"), str):
@@ -635,6 +895,7 @@ def _refresh_dependencies(controller: Controller) -> None:
             # cache dirty retries the remaining graph on the next tick.
             job = blocked_jobs[0]
             _mark_workflow_rejected(job, exc)
+            write_result_record(controller.root, job)
             emit(controller, "job.rejected", job=job)
             retry_invalid.add(workflow_key)
             continue
@@ -653,6 +914,9 @@ def _refresh_dependencies(controller: Controller) -> None:
                 job["state"] = "queued"
                 job["reason"] = None
                 job["blockers"] = []
+                job["resolved_dependencies"] = _resolved_dependency_ids(
+                    job, resolution_jobs
+                )
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
                 job["dependency_gate_passed"] = True
@@ -660,6 +924,7 @@ def _refresh_dependencies(controller: Controller) -> None:
                 job["finished_at"] = utc_now()
                 job["reason"] = "dependency_unsatisfied"
                 job["blockers"] = blockers
+                write_result_record(controller.root, job)
                 emit(controller, "job.skipped", job=job)
             elif blockers != job.get("blockers"):
                 job["blockers"] = blockers

@@ -13,9 +13,7 @@ from .models import (
     TERMINAL_JOB_STATES,
     Assignment,
     NodeInventory,
-    ResourceRequest,
     job_project,
-    normalize_project_id,
 )
 from .protocol import EVENT_KINDS
 from .runtime import Controller
@@ -26,7 +24,6 @@ from .storage import (
     append_event,
     archive_terminal_job,
     create_journal_generation,
-    job_identity_digest,
     latest_checkpoint,
     load_state,
     next_journal_generation,
@@ -152,63 +149,6 @@ def apply_workload_event(
     workload["last_recorded_at"] = recorded_at
 
 
-def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
-    """Validate a client request and create its controller-owned job image."""
-
-    request = ResourceRequest.from_dict(spec["resources"])
-    argv = spec.get("argv")
-    if not isinstance(argv, list) or not argv or not all(
-        isinstance(item, str) and item for item in argv
-    ):
-        raise ValueError("argv must be a non-empty array of strings")
-    environment = spec.get("env", {})
-    if not isinstance(environment, dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in environment.items()
-    ):
-        raise ValueError("env must map strings to strings")
-    cwd = Path(str(spec["cwd"]))
-    if not cwd.is_absolute():
-        raise ValueError("cwd must be absolute")
-    project_id = normalize_project_id(spec.get("project_id"))
-    job = {
-        "id": str(spec["job_id"]),
-        "project_id": project_id,
-        "name": str(spec["name"]),
-        "state": "queued",
-        "submitted_at": str(spec["submitted_at"]),
-        "queue_order": queue_order,
-        "request_digest": job_identity_digest(spec),
-        "argv": argv,
-        "cwd": str(cwd),
-        "env": environment,
-        "request": request.to_dict(),
-        "assignment": None,
-        "started_at": None,
-        "finished_at": None,
-        "exit_code": None,
-        "signal": None,
-        "reason": None,
-        "error": None,
-    }
-    workflow_id = spec.get("workflow_id")
-    task_id = spec.get("task_id")
-    needs = spec.get("needs", [])
-    if workflow_id is not None or task_id is not None or needs:
-        if not isinstance(needs, list):
-            raise ValueError("needs must be a JSON array")
-        job.update(
-            {
-                "workflow_id": workflow_id,
-                "task_id": task_id,
-                "needs": copy.deepcopy(needs),
-                "blockers": [],
-                "dependency_gate_passed": False,
-            }
-        )
-    return job
-
-
 def active_assignments(state: dict[str, Any]) -> tuple[Assignment, ...]:
     """Decode every assignment which must still hold resources."""
 
@@ -315,6 +255,37 @@ def emit(
         write_state(controller.root, state)
     if durable:
         _reopen_journal(controller)
+    return event
+
+
+def emit_submission(
+    controller: Controller,
+    submission_id: str,
+    jobs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Commit a complete admission set in one recoverable journal record."""
+
+    state = controller.state
+    state["last_seq"] += 1
+    recorded_at = utc_now()
+    projects = {job_project(job) for job in jobs}
+    event: dict[str, Any] = {
+        "v": 1,
+        "queue_id": state["queue_id"],
+        "seq": state["last_seq"],
+        "event_id": f"{state['queue_id']}:{state['last_seq']}",
+        "at": recorded_at,
+        "recorded_at": recorded_at,
+        "kind": "submission.admitted",
+        "allocation_id": controller.allocation_id,
+        "submission_id": submission_id,
+        "jobs": copy.deepcopy(jobs),
+    }
+    if len(projects) == 1:
+        event["project_id"] = projects.pop()
+    append_event(controller.journal, event, sync=True)
+    state["journal_offset"] = controller.journal.tell()
+    _reopen_journal(controller)
     return event
 
 
@@ -469,6 +440,11 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
             rebuilding or event.get("kind") == "allocation.started"
         ):
             state["allocation"] = {"id": str(allocation_id), "state": "recovered"}
+        admitted = event.get("jobs") if event.get("kind") == "submission.admitted" else None
+        if isinstance(admitted, list):
+            for candidate in admitted:
+                if isinstance(candidate, dict) and "id" in candidate:
+                    state.setdefault("jobs", {})[str(candidate["id"])] = candidate
         job = event.get("job")
         if isinstance(job, dict) and "id" in job:
             state.setdefault("jobs", {})[str(job["id"])] = job

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Collection
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .models import (
     ACTIVE_JOB_STATES,
     DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
+    ResourceRequest,
     job_project,
     normalize_project_id,
 )
@@ -36,16 +37,16 @@ def _parse_time(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
     """Return the bounded job projection shared by summaries and observers."""
 
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     started = _parse_time(job.get("started_at"))
     finished = _parse_time(job.get("finished_at"))
     elapsed = max(0.0, ((finished or current) - started).total_seconds()) if started else None
@@ -64,13 +65,19 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "submitted_at": job.get("submitted_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
+        "deadline_at": job.get("deadline_at"),
         "elapsed_seconds": elapsed,
+        "request_id": job.get("request_id"),
         "request": job.get("request"),
         "workflow_id": job.get("workflow_id"),
         "task_id": job.get("task_id"),
+        "attempt": job.get("attempt"),
         "needs": list(job.get("needs") or []),
         "blockers": list(job.get("blockers") or []),
         "assignment": job.get("assignment"),
+        "placement": job.get("assignment") or job.get("last_assignment"),
+        "provenance": job.get("provenance"),
+        "resolved_dependencies": list(job.get("resolved_dependencies") or []),
         "workload": workload,
         "progress_age_seconds": progress_age,
         "stdout": job.get("stdout"),
@@ -104,16 +111,38 @@ def compact_job_page(
     limit: int,
     project_id: str | None,
     include_elapsed: bool,
+    filters: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return one stable page of compact job identities."""
 
     selected_states = set(states) if states is not None else None
+    selected_filters = filters or {}
+    for field in ("submitted_after", "submitted_before"):
+        if field in selected_filters and _parse_time(selected_filters[field]) is None:
+            raise ValueError(f"{field} must be an ISO 8601 timestamp")
+
+    def matches(job: dict[str, Any]) -> bool:
+        for field in ("workflow_id", "task_id", "request_id"):
+            if field in selected_filters and job.get(field) != selected_filters[field]:
+                return False
+        prefix = selected_filters.get("name_prefix")
+        if prefix is not None and not str(job.get("name") or "").startswith(prefix):
+            return False
+        submitted = _parse_time(job.get("submitted_at"))
+        after = _parse_time(selected_filters.get("submitted_after"))
+        before = _parse_time(selected_filters.get("submitted_before"))
+        return not (
+            (after is not None and (submitted is None or submitted < after))
+            or (before is not None and (submitted is None or submitted > before))
+        )
+
     jobs = [
         job
         for job in state.get("jobs", {}).values()
         if isinstance(job, dict)
         and (selected_states is None or job.get("state") in selected_states)
         and (project_id is None or job_project(job) == project_id)
+        and matches(job)
     ]
     if selected_states == set(QUEUE_VIEW_STATES):
         usage = project_gpu_usage(state.get("jobs", {}).values())
@@ -172,6 +201,62 @@ def resource_totals(nodes: object) -> dict[str, int]:
     return result
 
 
+def scheduler_explanation(state: dict[str, Any]) -> dict[str, Any]:
+    """Explain idle capacity using deterministic admission facts, not an ETA."""
+
+    jobs = [job for job in state.get("jobs", {}).values() if isinstance(job, dict)]
+    free_nodes = [
+        node.get("free", {})
+        for node in state.get("nodes", {}).values()
+        if isinstance(node, dict)
+    ]
+
+    def fits(job: dict[str, Any]) -> bool:
+        try:
+            request = ResourceRequest.from_dict(job["request"])
+        except (KeyError, ValueError):
+            return False
+        eligible = sum(
+            len(node.get("gpu_ids", [])) >= request.gpus_per_node
+            and int(node.get("cpus", 0) or 0) >= request.cpus_per_node
+            and int(node.get("memory_gb", 0) or 0) >= request.memory_gb_per_node
+            for node in free_nodes
+        )
+        return eligible >= request.nodes
+
+    queued = [job for job in jobs if job.get("state") == "queued"]
+    eligible = sum(fits(job) for job in queued)
+    active_gpus: Counter[str] = Counter()
+    for job in jobs:
+        if job.get("state") not in ACTIVE_JOB_STATES:
+            continue
+        assignment = job.get("assignment")
+        if not isinstance(assignment, dict):
+            continue
+        active_gpus[str(job["state"])] += sum(
+            len(item.get("gpu_ids", []))
+            for item in assignment.get("reservations", [])
+            if isinstance(item, dict)
+        )
+    reason = None
+    if state.get("draining"):
+        reason = "allocation_draining"
+    elif state.get("launches_paused"):
+        reason = "launches_paused"
+    elif not queued:
+        reason = "no_queued_jobs"
+    elif not eligible:
+        reason = "no_resource_eligible_jobs"
+    return {
+        "submitted": sum(job.get("state") == "submitted" for job in jobs),
+        "queued": len(queued),
+        "resource_eligible": eligible,
+        "dependency_blocked": sum(job.get("state") == "blocked" for job in jobs),
+        "gpus_by_active_state": dict(sorted(active_gpus.items())),
+        "idle_reason": reason,
+    }
+
+
 def _node_sort_key(name: str) -> tuple[str, int, str]:
     prefix, separator, suffix = name.rpartition("-")
     if separator and suffix.isascii() and suffix.isdecimal():
@@ -216,6 +301,7 @@ def resource_view(state: dict[str, Any]) -> dict[str, Any]:
             "state": allocation.get("state"),
         },
         "totals": resource_totals(nodes),
+        "scheduler": scheduler_explanation(state),
         "nodes": rows,
     }
 
@@ -254,7 +340,7 @@ def build_summary(
 
     if limit <= 0:
         raise ValueError("summary limit must be positive")
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     selected_project = (
         normalize_project_id(project_id) if project_id is not None else None
     )
@@ -324,16 +410,23 @@ def build_summary(
         reverse=True,
     )
     identity = state.get("queue_id")
+    allocation = dict(state.get("allocation") or {})
+    allocation_deadline = _parse_time(allocation.get("deadline_at"))
+    if allocation_deadline is not None:
+        allocation["remaining_seconds"] = max(
+            0, int((allocation_deadline - current).total_seconds())
+        )
     return {
         "v": 1,
         "queue_id": identity,
         "project_id": selected_project,
         "as_of_cursor": state_cursor(state),
-        "allocation": state.get("allocation"),
+        "allocation": allocation,
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
         "launches_paused": bool(state.get("launches_paused", False)),
         "counts": dict(sorted(counts.items())),
+        "scheduler": scheduler_explanation({**state, "jobs": {job["id"]: job for job in jobs}}),
         "archived_jobs": sum(int(count) for count in archived_counts.values()),
         "nodes": state.get("nodes", {}),
         "submitted": submitted[:limit],

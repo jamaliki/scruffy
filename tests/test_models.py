@@ -52,6 +52,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual((queued.job_id, queued.request), ("job-1", request))
         self.assertEqual(Assignment.from_dict(assignment.to_dict()), assignment)
 
+    def test_cpu_only_request_and_time_limit_round_trip(self) -> None:
+        request = ResourceRequest(1, 0, 4, 16, time_limit_seconds=90)
+        assignment = Assignment(
+            "job-cpu",
+            request,
+            (NodeReservation("gpu-0", (), 4, 16),),
+        )
+
+        self.assertEqual(request, ResourceRequest.from_dict(request.to_dict()))
+        self.assertEqual(assignment, Assignment.from_dict(assignment.to_dict()))
+
     def test_inventory_round_trip_validates_unique_names(self) -> None:
         inventory = (
             NodeInventory("gpu-0", (0, 1), 28, 256),

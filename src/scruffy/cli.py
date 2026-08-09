@@ -22,7 +22,9 @@ from .client import (
     resume_queue,
     status,
     submit_job,
+    submit_workflow,
     summary,
+    validate_workflow,
     wait_for_job,
 )
 from .controller import run_controller
@@ -159,17 +161,22 @@ def _serve(arguments: argparse.Namespace) -> int:
 def _submit(arguments: argparse.Namespace) -> int:
     command = _command(arguments)
     gpus = arguments.gpus_per_node
+    if gpus is None:
+        raise ValueError("--gpus-per-node is required; use 0 for CPU-only work")
     request = ResourceRequest(
         nodes=arguments.nodes,
         gpus_per_node=gpus,
         cpus_per_node=(
-            14 * gpus if arguments.cpus_per_node is None else arguments.cpus_per_node
+            (14 * gpus if gpus else 1)
+            if arguments.cpus_per_node is None
+            else arguments.cpus_per_node
         ),
         memory_gb_per_node=(
-            128 * gpus
+            (128 * gpus if gpus else 4)
             if arguments.memory_gb_per_node is None
             else arguments.memory_gb_per_node
         ),
+        time_limit_seconds=arguments.time_limit_seconds,
     )
     result = submit_job(
         _root(arguments),
@@ -185,6 +192,54 @@ def _submit(arguments: argparse.Namespace) -> int:
         needs=_needs(arguments.needs),
     )
     _json(result)
+    return 0
+
+
+def _workflow_file(arguments: argparse.Namespace) -> tuple[str, str, list[dict[str, Any]], str]:
+    """Read the small JSON document shared by workflow validation and submit."""
+
+    try:
+        document = json.loads(Path(arguments.file).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"workflow file must contain valid JSON: {exc.msg}") from exc
+    if not isinstance(document, dict):
+        raise TypeError("workflow file must contain a JSON object")
+    request_id = document.get("request_id")
+    workflow_id = document.get("workflow_id")
+    tasks = document.get("tasks")
+    if not isinstance(request_id, str) or not isinstance(workflow_id, str):
+        raise TypeError("workflow file requires string request_id and workflow_id")
+    if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
+        raise ValueError("workflow file tasks must be an array of objects")
+    selected = _project(arguments, default=document.get("project_id") or DEFAULT_PROJECT)
+    return request_id, workflow_id, tasks, selected or DEFAULT_PROJECT
+
+
+def _validate_workflow(arguments: argparse.Namespace) -> int:
+    request_id, workflow_id, tasks, project_id = _workflow_file(arguments)
+    _json(
+        validate_workflow(
+            _root(arguments),
+            request_id=request_id,
+            workflow_id=workflow_id,
+            tasks=tasks,
+            project_id=project_id,
+        )
+    )
+    return 0
+
+
+def _submit_workflow(arguments: argparse.Namespace) -> int:
+    request_id, workflow_id, tasks, project_id = _workflow_file(arguments)
+    _json(
+        submit_workflow(
+            _root(arguments),
+            request_id=request_id,
+            workflow_id=workflow_id,
+            tasks=tasks,
+            project_id=project_id,
+        )
+    )
     return 0
 
 
@@ -450,8 +505,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--gpus-per-node",
         type=int,
-        default=1,
-        help="GPUs required on every node (default: 1)",
+        help="GPUs required on every node; use 0 explicitly for CPU-only work",
     )
     submit.add_argument(
         "--cpus-per-node", type=int, help="default: 14 times --gpus-per-node"
@@ -459,7 +513,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--memory-gb-per-node",
         type=int,
-        help="default: 128 times --gpus-per-node",
+        help="default: 128 times --gpus-per-node, or 4 for a CPU-only job",
+    )
+    submit.add_argument(
+        "--time-limit-seconds",
+        type=int,
+        help="fail the job after this many execution seconds",
     )
     submit.add_argument("--cwd", help="worker directory; defaults to current directory")
     submit.add_argument(
@@ -482,6 +541,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument("command", nargs=argparse.REMAINDER, help="argv to execute")
     submit.set_defaults(handler=_submit)
+
+    for command_name, help_text, handler in (
+        (
+            "validate-workflow",
+            "preflight a complete workflow JSON document without submitting it",
+            _validate_workflow,
+        ),
+        (
+            "submit-workflow",
+            "atomically enqueue a complete workflow JSON document",
+            _submit_workflow,
+        ),
+    ):
+        workflow_command = commands.add_parser(command_name, help=help_text)
+        workflow_command.add_argument("file", help="workflow JSON document")
+        workflow_command.add_argument(
+            "--project",
+            help="override project_id in the document (or SCRUFFY_PROJECT)",
+        )
+        workflow_command.set_defaults(handler=handler)
 
     show = commands.add_parser("status", help="show the queue or one job")
     show.add_argument("job_id", nargs="?", help="omit for the complete queue")

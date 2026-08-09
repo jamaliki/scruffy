@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -82,6 +83,8 @@ class SubmitCliTests(unittest.TestCase):
                     "submit",
                     "--workflow-id",
                     "run-7",
+                    "--gpus-per-node",
+                    "1",
                     "--task-id",
                     "infer",
                     "--needs",
@@ -119,6 +122,8 @@ class SubmitCliTests(unittest.TestCase):
                     "submit",
                     "--project",
                     "koochak",
+                    "--gpus-per-node",
+                    "1",
                     "--request-id",
                     "train-1",
                     "--",
@@ -139,6 +144,8 @@ class SubmitCliTests(unittest.TestCase):
                     "submit",
                     "--workflow-id",
                     "run-7",
+                    "--gpus-per-node",
+                    "1",
                     "--task-id",
                     "eval:terminal",
                     "--",
@@ -191,11 +198,87 @@ class SubmitCliTests(unittest.TestCase):
             mock.patch("scruffy.cli.submit_job") as submit,
             contextlib.redirect_stderr(stderr),
         ):
-            result = main(["--root", str(self.root), "submit"])
+            result = main(
+                ["--root", str(self.root), "submit", "--gpus-per-node", "1"]
+            )
 
         self.assertEqual(2, result)
         self.assertIn("submit requires a command", stderr.getvalue())
         submit.assert_not_called()
+
+    def test_submit_requires_an_explicit_gpu_count(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("scruffy.cli.submit_job") as submit,
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = main(["--root", str(self.root), "submit", "--", "true"])
+
+        self.assertEqual(2, result)
+        self.assertIn("use 0 for CPU-only work", stderr.getvalue())
+        submit.assert_not_called()
+
+    def test_submit_zero_gpus_uses_small_cpu_defaults(self) -> None:
+        with (
+            mock.patch(
+                "scruffy.cli.submit_job",
+                return_value={"job_id": "job-cpu", "state": "submitted"},
+            ) as submit,
+            mock.patch("scruffy.cli._json"),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "submit",
+                    "--gpus-per-node",
+                    "0",
+                    "--",
+                    "true",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            ResourceRequest(1, 0, 1, 4), submit.call_args.kwargs["request"]
+        )
+
+    def test_workflow_commands_share_one_json_contract(self) -> None:
+        workflow_file = self.workspace / "workflow.json"
+        workflow_file.write_text(
+            json.dumps(
+                {
+                    "request_id": "agent/campaign",
+                    "workflow_id": "campaign",
+                    "project_id": "project-a",
+                    "tasks": [
+                        {
+                            "task_id": "train",
+                            "argv": ["python", "train.py"],
+                            "cwd": "/shared/project",
+                            "resources": ResourceRequest(1, 1, 14, 128).to_dict(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        response = {"submission_id": "submission-1", "tasks": []}
+        for command, target in (
+            ("validate-workflow", "validate_workflow"),
+            ("submit-workflow", "submit_workflow"),
+        ):
+            with (
+                self.subTest(command=command),
+                mock.patch(f"scruffy.cli.{target}", return_value=response) as operation,
+                mock.patch("scruffy.cli._json") as print_json,
+            ):
+                result = main(["--root", str(self.root), command, str(workflow_file)])
+
+            self.assertEqual(0, result)
+            print_json.assert_called_once_with(response)
+            self.assertEqual("project-a", operation.call_args.kwargs["project_id"])
+            self.assertEqual("campaign", operation.call_args.kwargs["workflow_id"])
 
     def test_submit_rejects_malformed_environment_override(self) -> None:
         stderr = io.StringIO()
@@ -210,6 +293,8 @@ class SubmitCliTests(unittest.TestCase):
                     "submit",
                     "--env",
                     "MISSING_SEPARATOR",
+                    "--gpus-per-node",
+                    "1",
                     "--",
                     "true",
                 ]
@@ -228,7 +313,17 @@ class SubmitCliTests(unittest.TestCase):
                     contextlib.redirect_stderr(stderr),
                 ):
                     result = main(
-                        ["--root", str(self.root), "submit", option, "0", "--", "true"]
+                        [
+                            "--root",
+                            str(self.root),
+                            "submit",
+                            "--gpus-per-node",
+                            "1",
+                            option,
+                            "0",
+                            "--",
+                            "true",
+                        ]
                     )
 
                 self.assertEqual(2, result)

@@ -11,7 +11,9 @@ from .client import (
     resume_queue,
     status,
     submit_job,
+    submit_workflow,
     summary,
+    validate_workflow,
     wait_for_job,
 )
 from .models import ResourceRequest
@@ -34,6 +36,8 @@ __all__ = [
     "resume_queue",
     "status",
     "submit_job",
+    "submit_workflow",
     "summary",
+    "validate_workflow",
     "wait_for_job",
 ]

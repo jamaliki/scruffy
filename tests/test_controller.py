@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
 import signal
@@ -19,11 +20,19 @@ from scruffy.client import (
     publish_event,
     status,
     submit_job,
+    submit_workflow,
     wait_for_job,
 )
 from scruffy.controller import run_controller
 from scruffy.models import NodeInventory, ResourceRequest
-from scruffy.storage import read_events, submit_request, utc_now
+from scruffy.storage import (
+    read_events,
+    submission_identity_digest,
+    submit_request,
+    submit_submission,
+    utc_now,
+)
+from scruffy.submissions import workflow_submission
 
 TIMEOUT = 12.0
 REQUEST = ResourceRequest(
@@ -235,6 +244,179 @@ class ControllerIntegrationTests(unittest.TestCase):
 
         self.assertEqual("succeeded", wait_for_job(self.root, first, timeout=TIMEOUT)["state"])
         self.assertEqual("succeeded", wait_for_job(self.root, second, timeout=TIMEOUT)["state"])
+
+    def test_atomic_workflow_submission_and_immutable_provenance(self) -> None:
+        self._start_controller((0,))
+        response = submit_workflow(
+            self.root,
+            request_id="test/atomic-workflow",
+            workflow_id="atomic-workflow",
+            project_id="project-a",
+            tasks=[
+                {
+                    "task_id": "prepare",
+                    "name": "atomic-prepare",
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json, os; "
+                            "p=os.environ['SCRUFFY_PROVENANCE_PATH']; "
+                            "d=json.load(open(p)); "
+                            "assert d['job']['task_id']=='prepare'; "
+                            "assert os.environ['SCRUFFY_ATTEMPT']=='1'; "
+                            "assert os.environ['SCRUFFY_ASSIGNMENT_SHA256']=="
+                            "d['assignment_sha256']"
+                        ),
+                    ],
+                    "cwd": str(self.workspace),
+                    "resources": REQUEST.to_dict(),
+                },
+                {
+                    "task_id": "finish",
+                    "name": "atomic-finish",
+                    "argv": [sys.executable, "-c", "print('finished')"],
+                    "cwd": str(self.workspace),
+                    "resources": REQUEST.to_dict(),
+                    "needs": [{"task_id": "prepare", "condition": "succeeded"}],
+                },
+            ],
+        )
+        self.assertFalse(response["deduplicated"])
+        jobs = {item["task_id"]: item["job_id"] for item in response["tasks"]}
+
+        prepare = wait_for_job(self.root, jobs["prepare"], timeout=TIMEOUT)
+        finish = wait_for_job(self.root, jobs["finish"], timeout=TIMEOUT)
+        self.assertEqual("succeeded", prepare["state"])
+        self.assertEqual("succeeded", finish["state"])
+        self.assertEqual(jobs["prepare"], finish["resolved_dependencies"][0]["job_id"])
+        self.assertIsNone(finish["assignment"])
+        self.assertIsNotNone(finish["last_assignment"])
+        request_record = self.root / finish["provenance"]["request"]
+        launch = self.root / finish["provenance"]["launch"]
+        result = self.root / finish["provenance"]["result"]
+        self.assertEqual(0o444, request_record.stat().st_mode & 0o777)
+        self.assertEqual(0o444, launch.stat().st_mode & 0o777)
+        self.assertEqual(0o444, result.stat().st_mode & 0o777)
+        request_document = json.loads(request_record.read_text(encoding="utf-8"))
+        self.assertIn("environment_sha256", request_document)
+        self.assertNotIn("env", request_document)
+        events = read_events(self.root)
+        admitted = [event for event in events if event["kind"] == "submission.admitted"]
+        self.assertEqual(1, len(admitted))
+        self.assertEqual(set(jobs.values()), {job["id"] for job in admitted[0]["jobs"]})
+
+        duplicate = submit_workflow(
+            self.root,
+            request_id="test/atomic-workflow",
+            workflow_id="atomic-workflow",
+            project_id="project-a",
+            tasks=[
+                {
+                    "task_id": "prepare",
+                    "name": "atomic-prepare",
+                    "argv": [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json, os; "
+                            "p=os.environ['SCRUFFY_PROVENANCE_PATH']; "
+                            "d=json.load(open(p)); "
+                            "assert d['job']['task_id']=='prepare'; "
+                            "assert os.environ['SCRUFFY_ATTEMPT']=='1'; "
+                            "assert os.environ['SCRUFFY_ASSIGNMENT_SHA256']=="
+                            "d['assignment_sha256']"
+                        ),
+                    ],
+                    "cwd": str(self.workspace),
+                    "resources": REQUEST.to_dict(),
+                },
+                {
+                    "task_id": "finish",
+                    "name": "atomic-finish",
+                    "argv": [sys.executable, "-c", "print('finished')"],
+                    "cwd": str(self.workspace),
+                    "resources": REQUEST.to_dict(),
+                    "needs": [{"task_id": "prepare", "condition": "succeeded"}],
+                },
+            ],
+        )
+        self.assertTrue(duplicate["deduplicated"])
+
+    def test_cpu_only_job_and_wall_time_limit(self) -> None:
+        self._start_controller((0,))
+        cpu_request = ResourceRequest(1, 0, 1, 1)
+        cpu = submit_job(
+            self.root,
+            argv=[
+                sys.executable,
+                "-c",
+                "import os; assert os.environ['CUDA_VISIBLE_DEVICES']==''",
+            ],
+            name="cpu-only",
+            cwd=self.workspace,
+            environment={},
+            request=cpu_request,
+            request_id="test/cpu-only",
+        )["job_id"]
+        self.assertEqual("succeeded", wait_for_job(self.root, cpu, timeout=TIMEOUT)["state"])
+
+        limited = submit_job(
+            self.root,
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+            name="time-limited",
+            cwd=self.workspace,
+            environment={},
+            request=ResourceRequest(1, 0, 1, 1, time_limit_seconds=1),
+            request_id="test/time-limited",
+        )["job_id"]
+        terminal = wait_for_job(self.root, limited, timeout=TIMEOUT)
+        self.assertEqual("failed", terminal["state"])
+        self.assertEqual("timeout", terminal["reason"])
+
+    def test_invalid_atomic_workflow_creates_no_partial_dag(self) -> None:
+        self._start_controller((0,))
+        document = workflow_submission(
+            request_id="test/rejected-atomic",
+            workflow_id="rejected-atomic",
+            tasks=[
+                {
+                    "task_id": "good",
+                    "argv": [sys.executable, "-c", "print('must not run')"],
+                    "cwd": str(self.workspace),
+                    "resources": REQUEST.to_dict(),
+                },
+                {
+                    "task_id": "bad",
+                    "argv": [sys.executable, "-c", "print('must not run')"],
+                    "cwd": str(self.workspace),
+                    "resources": REQUEST.to_dict(),
+                    "needs": [{"task_id": "good", "condition": "succeeded"}],
+                },
+            ],
+        )
+        document["jobs"][1]["argv"] = []
+        document["identity_sha256"] = submission_identity_digest(document)
+        submit_submission(self.root, document)
+
+        rejection = self._wait_until(
+            lambda: next(
+                (
+                    event
+                    for event in read_events(self.root)
+                    if event.get("kind") == "submission.rejected"
+                    and event.get("data", {}).get("submission_id")
+                    == document["submission_id"]
+                ),
+                None,
+            ),
+            "atomic submission rejection",
+        )
+        self.assertIn("argv", rejection["data"]["reason"])
+        snapshot = status(self.root)
+        self.assertTrue(
+            {job["job_id"] for job in document["jobs"]}.isdisjoint(snapshot["jobs"])
+        )
 
     def test_dependencies_block_release_and_skip_without_waiting_to_submit(self) -> None:
         self._start_controller((0,))

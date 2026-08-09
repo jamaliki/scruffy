@@ -118,6 +118,32 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual("old-allocation", state["allocation"]["id"])
         self.assertEqual("succeeded", state["jobs"]["job-replayed"]["state"])
 
+    def test_atomic_submission_replays_every_job_from_one_record(self) -> None:
+        first = {**job_image("job-first", "old-node"), "state": "queued", "assignment": None}
+        second = {
+            **job_image("job-second", "old-node"),
+            "state": "blocked",
+            "assignment": None,
+        }
+        with open_journal(self.root) as journal:
+            append_event(
+                journal,
+                {
+                    "seq": 1,
+                    "kind": "submission.admitted",
+                    "allocation_id": "old-allocation",
+                    "submission_id": "submission-one",
+                    "jobs": [first, second],
+                },
+                sync=True,
+            )
+
+        recovered = load_recovered_state(self.root)
+
+        self.assertEqual({"job-first", "job-second"}, set(recovered["jobs"]))
+        self.assertEqual("queued", recovered["jobs"]["job-first"]["state"])
+        self.assertEqual("blocked", recovered["jobs"]["job-second"]["state"])
+
     def test_durable_boundaries_replace_the_journal_handle(self) -> None:
         controller = _initialize_controller(
             root=self.root,

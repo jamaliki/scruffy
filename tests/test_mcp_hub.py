@@ -215,8 +215,31 @@ class BrokerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result["reset"])
+        self.assertEqual("queue_replaced", result["reset_reason"])
         self.assertEqual("project-a", result["overview"]["project_id"])
         self.assertEqual(result["next_cursor"], result["overview"]["as_of_cursor"])
+
+    async def test_trimmed_cursor_reports_bounded_buffer_expiry(self) -> None:
+        self.broker.max_events = 1
+        for sequence in (1, 2):
+            await self.remote.responses.put(
+                _page(
+                    {
+                        "kind": "job.running",
+                        "job_id": f"job-{sequence}",
+                        "_seq": sequence,
+                    }
+                )
+            )
+            for _ in range(100):
+                if self.broker.current_cursor == _cursor(sequence):
+                    break
+                await asyncio.sleep(0.01)
+
+        result = await self.broker.wait(after=_cursor(0), timeout_seconds=0)
+
+        self.assertTrue(result["reset"])
+        self.assertEqual("hub_buffer_expired", result["reset_reason"])
 
     async def test_timeout_keeps_the_advanced_private_cursor(self) -> None:
         await self.remote.responses.put(

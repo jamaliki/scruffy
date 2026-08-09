@@ -12,6 +12,7 @@ from typing import Any
 from .models import (
     DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
+    NodeInventory,
     ResourceRequest,
     job_project,
     normalize_project_id,
@@ -30,8 +31,10 @@ from .storage import (
     submit_command,
     submit_report,
     submit_request,
+    submit_submission,
     utc_now,
 )
+from .submissions import submission_summary, workflow_submission
 from .summary import build_summary, explain_job
 from .workflows import validate_workflows
 
@@ -100,6 +103,65 @@ def submit_job(
         "project_id": project_id,
         "state": "submitted",
         "deduplicated": deduplicated,
+    }
+
+
+def _current_inventory(root: Path) -> tuple[NodeInventory, ...] | None:
+    """Decode the current controller inventory when a queue is already live."""
+
+    snapshot = load_state(root)
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else None
+    if not isinstance(nodes, dict) or not nodes:
+        return None
+    return tuple(
+        NodeInventory.from_dict(node["capacity"])
+        for node in nodes.values()
+        if isinstance(node, dict) and isinstance(node.get("capacity"), dict)
+    )
+
+
+def validate_workflow(
+    root: Path,
+    *,
+    request_id: str,
+    workflow_id: str,
+    tasks: Sequence[Mapping[str, Any]],
+    project_id: str = DEFAULT_PROJECT,
+) -> dict[str, Any]:
+    """Preflight a complete DAG with the same constructor used by submission."""
+
+    document = workflow_submission(
+        request_id=request_id,
+        workflow_id=workflow_id,
+        tasks=tasks,
+        project_id=project_id,
+        inventory=_current_inventory(root),
+    )
+    return {"valid": True, **submission_summary(document)}
+
+
+def submit_workflow(
+    root: Path,
+    *,
+    request_id: str,
+    workflow_id: str,
+    tasks: Sequence[Mapping[str, Any]],
+    project_id: str = DEFAULT_PROJECT,
+) -> dict[str, Any]:
+    """Durably enqueue an explicit DAG as one all-or-nothing submission."""
+
+    document = workflow_submission(
+        request_id=request_id,
+        workflow_id=workflow_id,
+        tasks=tasks,
+        project_id=project_id,
+        inventory=_current_inventory(root),
+    )
+    _, deduplicated = submit_submission(root, document)
+    return {
+        "state": "submitted",
+        "deduplicated": deduplicated,
+        **submission_summary(document),
     }
 
 
@@ -306,7 +368,12 @@ def _event_project(event: dict[str, Any], snapshot: dict[str, Any]) -> str | Non
 
     job_id = event.get("job_id")
     if not isinstance(job_id, str):
-        return None
+        event_project = event.get("project_id")
+        if not isinstance(event_project, str) and isinstance(
+            event.get("data"), dict
+        ):
+            event_project = event["data"].get("project_id")
+        return event_project if isinstance(event_project, str) else None
     event_project = event.get("project_id")
     if isinstance(event_project, str):
         return event_project
@@ -371,6 +438,22 @@ def parse_cursor(root: Path, cursor: str | int | None) -> tuple[int, int, int, b
     return _parse_cursor(cursor, _snapshot_cursor(root))
 
 
+def _reset_reason(
+    cursor: str | int | None, current: tuple[str, int, int, int]
+) -> str | None:
+    """Explain a valid-but-stale cursor without changing its opaque contract."""
+
+    if cursor is None:
+        return None
+    if isinstance(cursor, int) or ":" not in cursor:
+        return "journal_rotated" if current[1] else None
+    parts = cursor.split(":")
+    if parts[0] != current[0]:
+        return "queue_replaced"
+    generation = parts[1] if len(parts) == 4 else "0"
+    return "journal_rotated" if int(generation) != current[1] else None
+
+
 def observe(
     root: Path,
     *,
@@ -387,6 +470,7 @@ def observe(
     committed_cursor = _snapshot_cursor(root)
     identity = committed_cursor[0]
     generation, sequence, offset, reset = _parse_cursor(after, committed_cursor)
+    reset_reason = _reset_reason(after, committed_cursor) if reset else None
     page_limit = min(limit, 64) if include_output else limit
     deadline = time.monotonic() + max(wait_seconds, 0)
     committed = committed_cursor[1:]
@@ -409,12 +493,14 @@ def observe(
             identity = current_identity
             generation, sequence, offset = current
             page, more, reset = [], False, True
+            reset_reason = "queue_replaced"
             break
         if current == committed:
             continue
         if current[0] != generation:
             generation, sequence, offset = current
             page, more, reset = [], False, True
+            reset_reason = "journal_rotated"
             break
         committed = current
         page, offset, more = read_event_page(
@@ -459,6 +545,11 @@ def observe(
     latest_sequence = int(snapshot.get("last_seq", 0))
     latest_offset = int(snapshot.get("journal_offset", 0))
     if snapshot_identity != identity or snapshot_generation != generation:
+        reset_reason = (
+            "queue_replaced"
+            if snapshot_identity != identity
+            else "journal_rotated"
+        )
         identity = snapshot_identity
         generation = snapshot_generation
         next_sequence = latest_sequence
@@ -476,6 +567,7 @@ def observe(
         ),
         "more": more,
         "reset": reset,
+        **({"reset_reason": reset_reason} if reset_reason else {}),
     }
 
 

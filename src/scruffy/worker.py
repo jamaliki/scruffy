@@ -60,6 +60,23 @@ def execute_assignment(source: Path) -> None:
     environment["SCRUFFY_PROJECT"] = job_project(document)
     environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
+    environment["SCRUFFY_GPU_IDS"] = ",".join(
+        str(gpu_id) for gpu_id in placement["gpu_ids"]
+    )
+    if document.get("provenance_path") is not None:
+        environment["SCRUFFY_PROVENANCE_PATH"] = str(document["provenance_path"])
+    if document.get("assignment_sha256") is not None:
+        environment["SCRUFFY_ASSIGNMENT_SHA256"] = str(
+            document["assignment_sha256"]
+        )
+    for field, variable in (
+        ("workflow_id", "SCRUFFY_WORKFLOW_ID"),
+        ("task_id", "SCRUFFY_TASK_ID"),
+        ("attempt", "SCRUFFY_ATTEMPT"),
+    ):
+        value = document.get(field)
+        if value is not None:
+            environment[variable] = str(value)
     # Apply this last: jobs submitted through the API cannot choose another slot.
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(
