@@ -1,5 +1,5 @@
 import {
-  allocationIsStale, formatAge, formatDuration, formatNumber, gpuOwners,
+  allocationIsStale, dependencyLinkedTasks, formatAge, formatDuration, formatNumber, gpuOwners,
   progressLabel, projectColor, projects, projectSummaries, resourceLabel, resourceTotals,
   scalarTelemetry, stateTone, TELEMETRY_STALE_AFTER_MS, uniqueJobs, visibleJobs,
   focusedWorkflowTasks, workflowChoices, workflowLayout,
@@ -9,7 +9,7 @@ const byId = (id) => document.getElementById(id);
 const view = {
   snapshot: null, project: "all", search: "", connected: false, loading: false,
   lastSuccessAt: null,
-  workflowKey: "", workflowData: null, workflowLoading: false,
+  workflowKey: "", workflowData: null, workflowDataKey: "", workflowLoading: false,
 };
 
 function telemetryIsStale(snapshot) {
@@ -244,16 +244,20 @@ function renderWorkflowGraph() {
   const canvas = byId("workflow-canvas");
   const viewport = byId("workflow-viewport");
   const data = view.workflowData;
-  if (!data || !data.tasks?.length) {
+  const linkedTasks = dependencyLinkedTasks(data?.tasks || []);
+  if (!data || !linkedTasks.length) {
     canvas.style.width = "100%"; canvas.style.height = "190px";
-    replace(canvas, [empty(view.workflowLoading ? "Reading workflow…" : "No workflow tasks are available.")]);
+    const message = view.workflowLoading
+      ? "Reading workflow…"
+      : data ? "This workflow has no dependency-linked tasks." : "No workflow tasks are available.";
+    replace(canvas, [empty(message)]);
     viewport.scrollTo(0, 0);
     return;
   }
-  const focused = focusedWorkflowTasks(data.tasks);
+  const focused = focusedWorkflowTasks(linkedTasks);
   const layout = workflowLayout(focused.tasks);
   if (focused.omitted) {
-    byId("workflow-status").textContent = `${data.project_id} / showing ${focused.tasks.length} relevant tasks of ${data.task_count} / ${data.attempt_count} attempts`;
+    byId("workflow-status").textContent = `${data.project_id} / showing ${focused.tasks.length} relevant tasks of ${linkedTasks.length} dependency-linked / ${data.attempt_count} attempts`;
   }
   canvas.style.width = `${layout.width}px`; canvas.style.height = `${layout.height}px`;
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -286,18 +290,23 @@ function renderWorkflowGraph() {
 async function loadWorkflow() {
   const choice = workflowChoices(view.snapshot, view.project, view.search).find((item) => item.key === view.workflowKey);
   if (!choice) {
-    view.workflowData = null; renderWorkflowGraph(); return;
+    view.workflowData = null; view.workflowDataKey = ""; renderWorkflowGraph(); return;
   }
   const requestKey = choice.key;
-  view.workflowLoading = true; view.workflowData = null; renderWorkflowGraph();
-  byId("workflow-status").textContent = `${choice.project} / ${choice.workflow_id}`;
+  const replacing = view.workflowDataKey !== requestKey;
+  view.workflowLoading = true;
+  if (replacing) {
+    view.workflowData = null; view.workflowDataKey = ""; renderWorkflowGraph();
+  }
+  byId("workflow-status").textContent = `${choice.project} / ${choice.workflow_id}${replacing ? "" : " / refreshing"}`;
   try {
     const response = await fetch(`/api/workflows/${encodeURIComponent(choice.workflow_id)}?project=${encodeURIComponent(choice.project)}`, {cache: "no-store"});
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "Workflow lookup failed");
     if (view.workflowKey !== requestKey) return;
-    view.workflowData = data;
-    byId("workflow-status").textContent = `${data.project_id} / ${data.task_count} tasks / ${data.attempt_count} attempts`;
+    view.workflowData = data; view.workflowDataKey = requestKey;
+    const linked = dependencyLinkedTasks(data.tasks || []).length;
+    byId("workflow-status").textContent = `${data.project_id} / ${linked} dependency-linked tasks / ${data.attempt_count} attempts`;
   } catch (error) {
     if (view.workflowKey === requestKey) byId("workflow-status").textContent = error.message;
   } finally {
@@ -305,22 +314,36 @@ async function loadWorkflow() {
   }
 }
 
-function renderWorkflowChoices(snapshot) {
+function workflowChoiceFromKey(key) {
+  try {
+    const [project, workflowId] = JSON.parse(key);
+    return project && workflowId ? {key, project, workflow_id: workflowId, jobs: 0, retained: true} : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderWorkflowChoices(snapshot, preserveCurrent = true) {
   const select = byId("workflow-filter");
   const choices = workflowChoices(snapshot, view.project, view.search);
+  if (preserveCurrent && view.workflowKey && !choices.some((choice) => choice.key === view.workflowKey)) {
+    const retained = workflowChoiceFromKey(view.workflowKey);
+    if (retained) choices.unshift(retained);
+  }
   if (!choices.some((choice) => choice.key === view.workflowKey)) {
     view.workflowKey = choices[0]?.key || "";
-    view.workflowData = null;
+    view.workflowData = null; view.workflowDataKey = "";
   }
   const options = choices.map((choice) => {
-    const option = element("option", "", `${choice.workflow_id} · ${choice.project} · ${choice.jobs} visible`);
+    const suffix = choice.retained ? "selected" : `${choice.jobs} tasks visible`;
+    const option = element("option", "", `${choice.workflow_id} · ${choice.project} · ${suffix}`);
     option.value = choice.key; return option;
   });
   if (!options.length) { const option = element("option", "", "No workflows visible"); option.value = ""; options.push(option); }
   replace(select, options); select.value = view.workflowKey;
   if (!view.workflowKey) {
     byId("workflow-status").textContent = "No workflows match the current project and search filters.";
-    view.workflowData = null; renderWorkflowGraph();
+    view.workflowData = null; view.workflowDataKey = ""; renderWorkflowGraph();
   }
 }
 
@@ -339,13 +362,13 @@ function renderConnection(snapshot) {
   document.body.classList.toggle("data-stale", stale);
 }
 
-function render() {
+function render(preserveWorkflow = true) {
   const snapshot = view.snapshot;
   if (!snapshot) return;
   const stale = telemetryIsStale(snapshot);
   renderConnection(snapshot); renderMetrics(snapshot, stale); renderProjects(snapshot); renderNodes(snapshot);
   renderProjectLegend(snapshot); renderProjectBoard(snapshot);
-  renderWorkflowChoices(snapshot);
+  renderWorkflowChoices(snapshot, preserveWorkflow);
   renderList("active", snapshot.active, "No jobs are using resources.");
   renderList("queued", [...(snapshot.queued || []), ...(snapshot.submitted || [])], "No jobs are waiting for placement.");
   renderList("blocked", snapshot.blocked, "No workflows are dependency-blocked.");
@@ -390,7 +413,7 @@ async function openJob(jobId) {
   }
 }
 
-async function loadOverview() {
+async function loadOverview(refreshWorkflow = false) {
   if (view.loading) return;
   view.loading = true; byId("refresh").disabled = true;
   try {
@@ -398,7 +421,7 @@ async function loadOverview() {
     const snapshot = await response.json();
     if (!response.ok) throw new Error(snapshot.error || "Queue read failed");
     view.snapshot = snapshot; view.connected = true; view.lastSuccessAt = Date.now(); render();
-    if (view.workflowKey) loadWorkflow();
+    if (view.workflowKey && (refreshWorkflow || view.workflowDataKey !== view.workflowKey) && !view.workflowLoading) loadWorkflow();
   } catch (error) {
     view.connected = false;
     if (view.snapshot) {
@@ -417,21 +440,22 @@ document.addEventListener("click", (event) => {
   const projectFilter = event.target.closest("[data-project-filter]");
   if (projectFilter) {
     const requested = projectFilter.dataset.projectFilter;
+    const previousWorkflow = view.workflowKey;
     view.project = requested === "all" || view.project === requested ? "all" : requested;
-    render();
-    if (view.workflowKey) loadWorkflow();
+    render(false);
+    if (view.workflowKey && view.workflowKey !== previousWorkflow) loadWorkflow();
     return;
   }
   const target = event.target.closest("[data-job-id]");
   if (target) openJob(target.dataset.jobId);
 });
-byId("project-filter").addEventListener("change", (event) => { view.project = event.target.value; render(); if (view.workflowKey) loadWorkflow(); });
-byId("job-search").addEventListener("input", (event) => { view.search = event.target.value; render(); if (view.workflowKey) loadWorkflow(); });
+byId("project-filter").addEventListener("change", (event) => { const previous = view.workflowKey; view.project = event.target.value; render(false); if (view.workflowKey && view.workflowKey !== previous) loadWorkflow(); });
+byId("job-search").addEventListener("input", (event) => { const previous = view.workflowKey; view.search = event.target.value; render(false); if (view.workflowKey && view.workflowKey !== previous) loadWorkflow(); });
 byId("workflow-filter").addEventListener("change", (event) => { view.workflowKey = event.target.value; loadWorkflow(); });
-byId("refresh").addEventListener("click", loadOverview);
+byId("refresh").addEventListener("click", () => loadOverview(true));
 byId("dialog-close").addEventListener("click", () => byId("job-dialog").close());
 byId("job-dialog").addEventListener("click", (event) => { if (event.target === byId("job-dialog")) byId("job-dialog").close(); });
 
-loadOverview();
-setInterval(loadOverview, 5_000);
+loadOverview(false);
+setInterval(() => loadOverview(false), 5_000);
 setInterval(() => { if (view.snapshot) renderConnection(view.snapshot); }, 1_000);

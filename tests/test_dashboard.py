@@ -173,6 +173,8 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b"export function projectSummaries", model)
         self.assertIn(b"export function workflowLayout", model)
         self.assertIn(b"export function focusedWorkflowTasks", model)
+        self.assertIn(b"export function dependencyLinkedTasks", model)
+        self.assertIn(b"setInterval(() => loadOverview(false), 5_000)", app)
         self.assertIn(b"...(snapshot?.queued || []), ...(snapshot?.submitted || [])", model)
         self.assertTrue(mascot.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual("image/png", mascot_headers["Content-Type"])

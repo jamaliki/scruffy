@@ -101,17 +101,29 @@ export function workflowChoices(snapshot, project = "all", search = "") {
     if (needle && ![job.name, job.id, workflow, job.task_id]
       .filter(Boolean).some((value) => String(value).toLowerCase().includes(needle))) continue;
     const key = JSON.stringify([jobProject, workflow]);
-    const current = grouped.get(key) || {key, project: jobProject, workflow_id: workflow, jobs: 0, active: 0, attention: 0, newest: ""};
+    const current = grouped.get(key) || {key, project: jobProject, workflow_id: workflow, jobs: 0, links: 0, active: 0, attention: 0, newest: ""};
     current.jobs += 1;
+    current.links += job.needs?.length || 0;
     if (["running", "starting", "finishing", "queued", "submitted", "blocked"].includes(job.state)) current.active += 1;
     if (["failed", "lost", "rejected", "skipped"].includes(job.state)) current.attention += 1;
     current.newest = [current.newest, job.finished_at, job.started_at, job.submitted_at].filter(Boolean).sort().at(-1) || "";
     grouped.set(key, current);
   }
-  return [...grouped.values()].sort((left, right) =>
+  return [...grouped.values()].filter((workflow) => workflow.links > 0).sort((left, right) =>
     right.active - left.active || right.attention - left.attention
     || right.newest.localeCompare(left.newest) || left.workflow_id.localeCompare(right.workflow_id),
   );
+}
+
+export function dependencyLinkedTasks(tasks = []) {
+  const linked = new Set();
+  for (const task of tasks) {
+    for (const need of task.needs || []) {
+      linked.add(task.task_id);
+      if (need.task_id) linked.add(need.task_id);
+    }
+  }
+  return tasks.filter((task) => linked.has(task.task_id));
 }
 
 export function workflowLayout(tasks = []) {
