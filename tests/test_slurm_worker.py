@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -403,6 +404,63 @@ class WorkerPlacementTests(unittest.TestCase):
         self.assertEqual("gpu-5.cluster", environment["SCRUFFY_NODE"])
         self.assertEqual("PCI_BUS_ID", environment["CUDA_DEVICE_ORDER"])
         self.assertEqual("4,6", environment["CUDA_VISIBLE_DEVICES"])
+
+    def test_worker_exec_appends_directly_to_job_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stdout = directory / "stdout.log"
+            stderr = directory / "stderr.log"
+            stdout.write_text("existing stdout\n", encoding="utf-8")
+            stderr.write_text("existing stderr\n", encoding="utf-8")
+            source = directory / "assignment.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "root": str(directory),
+                        "job_id": "job-1",
+                        "project_id": "tests",
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import os; "
+                                "os.write(1, b'worker stdout\\n'); "
+                                "os.write(2, b'worker stderr\\n')"
+                            ),
+                        ],
+                        "cwd": str(directory),
+                        "env": {},
+                        "assignment": [{"node": "gpu-5", "gpu_ids": []}],
+                        "logs": {
+                            "stdout": str(stdout),
+                            "stderr": str(stderr),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["SCRUFFY_NODE"] = "gpu-5"
+
+            result = subprocess.run(
+                [sys.executable, "-m", "scruffy.worker", str(source)],
+                check=False,
+                capture_output=True,
+                env=environment,
+                timeout=10,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr.decode())
+            self.assertEqual(b"", result.stdout)
+            self.assertEqual(b"", result.stderr)
+            self.assertEqual(
+                "existing stdout\nworker stdout\n",
+                stdout.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "existing stderr\nworker stderr\n",
+                stderr.read_text(encoding="utf-8"),
+            )
 
 
 if __name__ == "__main__":

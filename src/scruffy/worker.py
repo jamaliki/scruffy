@@ -39,6 +39,27 @@ def find_node_assignment(document: dict[str, Any], node_name: str) -> dict[str, 
     raise ValueError(f"no assignment for node {node_name!r}")
 
 
+def redirect_output(logs: dict[str, Any]) -> None:
+    """Append stdout and stderr directly to controller-owned job logs.
+
+    The descriptors are inherited by the workload after ``exec``. This keeps
+    Slurm output independent of the controller-side ``srun`` client, which is
+    necessarily lost during a controller restart.
+    """
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    descriptors: list[int] = []
+    try:
+        for stream in ("stdout", "stderr"):
+            descriptors.append(os.open(os.fspath(logs[stream]), flags, 0o664))
+        targets = (sys.stdout.fileno(), sys.stderr.fileno())
+        for descriptor, target in zip(descriptors, targets):
+            os.dup2(descriptor, target)
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
 def execute_assignment(source: Path) -> None:
     with source.open(encoding="utf-8") as handle:
         document = json.load(handle)
@@ -83,6 +104,11 @@ def execute_assignment(source: Path) -> None:
         str(gpu_id) for gpu_id in placement["gpu_ids"]
     )
 
+    logs = document.get("logs")
+    if logs is not None:
+        if not isinstance(logs, dict):
+            raise ValueError("job logs must be a JSON object")
+        redirect_output(logs)
     os.chdir(document["cwd"])
     os.execvpe(command[0], command, environment)
 

@@ -730,6 +730,62 @@ class LaunchCleanupTests(unittest.TestCase):
 
 
 class SlurmLaunchTests(unittest.TestCase):
+    def test_slurm_worker_document_owns_canonical_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = mock.Mock(
+                root=root,
+                inventory=(NodeInventory("gpu-3", (0,), 112, 1024),),
+                launcher="slurm",
+                allocation_id="240292",
+                slurm_job_id="240292",
+                running={},
+            )
+            request = ResourceRequest(1, 1, 14, 128)
+            assigned = Assignment(
+                "job-1",
+                request,
+                (NodeReservation("gpu-3", (0,), 14, 128),),
+            )
+            job = {
+                "id": "job-1",
+                "project_id": "tests",
+                "name": "worker-owned-logs",
+                "state": "queued",
+                "argv": ["true"],
+                "cwd": str(root),
+                "env": {},
+            }
+
+            def write_launch(*_args, **_kwargs):
+                job["provenance"] = {"assignment_sha256": "test-sha"}
+                return root / "provenance.json"
+
+            process = mock.Mock(pid=123)
+            with (
+                mock.patch(
+                    "scruffy.lifecycle.write_launch_record",
+                    side_effect=write_launch,
+                ),
+                mock.patch("scruffy.lifecycle.emit"),
+                mock.patch("scruffy.lifecycle.atomic_write_json") as write,
+                mock.patch(
+                    "scruffy.lifecycle._launch_arguments",
+                    return_value=(["srun"], {}),
+                ),
+                mock.patch("scruffy.lifecycle.subprocess.Popen", return_value=process),
+            ):
+                start_job(controller, job, assigned)
+
+        document = write.call_args.args[1]
+        self.assertEqual(
+            {
+                "stdout": str((root / "jobs/job-1/stdout.log").resolve()),
+                "stderr": str((root / "jobs/job-1/stderr.log").resolve()),
+            },
+            document["logs"],
+        )
+
     def test_worker_gets_managed_cpu_pool_not_individual_job_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

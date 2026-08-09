@@ -128,6 +128,14 @@ def start_job(
             "cwd": job["cwd"],
             "env": job["env"],
             "assignment": [item.to_dict() for item in assignment.reservations],
+            # A Slurm worker owns its log descriptors so output survives the
+            # controller and its local srun client. Local jobs keep using the
+            # controller's pipes and reader threads.
+            "logs": (
+                {"stdout": str(stdout_file), "stderr": str(stderr_file)}
+                if controller.launcher == "slurm"
+                else None
+            ),
         }
         # The durable starting event owns the reservation before any process
         # can be launched. The immutable launch record is already available to
