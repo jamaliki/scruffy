@@ -137,6 +137,12 @@ agents; reading does not consume events for anyone else. Use
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the
   recovered snapshot, then run `scruffy resume`; do not resubmit attached jobs.
+- For a replacement allocation, reuse the same stable `SCRUFFY_ROOT` and start
+  `scruffy serve --start-paused`. Active jobs become `lost`; queued and blocked
+  jobs remain durable even when the new inventory cannot fit them. Inspect the
+  `allocation.handover` counts, then run `scruffy resume`.
+- By default, `serve` automatically drains 900 seconds before Slurm's allocation
+  deadline. Override with `--drain-before-end-seconds`; `0` disables it.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
 - CPU and memory are cooperative budgets. GPU exclusivity covers only work
   submitted through Scruffy; do not launch out-of-band work on its inventory.

@@ -7,6 +7,7 @@ import signal
 import sys
 import time
 from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,8 @@ def _initialize_controller(
     slurm_job_id: str | None,
     poll_interval: float,
     cancel_grace: float,
+    start_paused: bool = False,
+    drain_before_end_seconds: float = 900,
 ) -> Controller:
     state = load_recovered_state(root)
     active = [
@@ -116,6 +119,12 @@ def _initialize_controller(
     previous = state.get("allocation") or {}
     same_slurm_allocation = (
         launcher == "slurm" and previous.get("id") == allocation_id
+    )
+    previous_allocation_id = previous.get("id")
+    replacement = (
+        launcher == "slurm"
+        and isinstance(previous_allocation_id, str)
+        and previous_allocation_id != allocation_id
     )
     if active and launcher == "local":
         raise UnsafeRecovery(
@@ -146,6 +155,7 @@ def _initialize_controller(
         slurm_job_id=slurm_job_id,
         poll_interval=poll_interval,
         cancel_grace=cancel_grace,
+        drain_before_end_seconds=drain_before_end_seconds,
         state=state,
         journal=journal,
         messages=messages,
@@ -186,6 +196,14 @@ def _initialize_controller(
     )
     if slurm_job_id:
         metadata["slurm_job_id"] = slurm_job_id
+    if same_slurm_allocation and isinstance(previous.get("handover"), dict):
+        metadata["handover"] = previous["handover"]
+    deadline_at = metadata.get("deadline_at")
+    if drain_before_end_seconds and isinstance(deadline_at, str):
+        deadline = datetime.fromisoformat(deadline_at)
+        metadata["automatic_drain_at"] = (
+            deadline - timedelta(seconds=drain_before_end_seconds)
+        ).astimezone(UTC).isoformat(timespec="seconds")
     drain_requested = bool(
         state.get(
             "drain_requested",
@@ -200,7 +218,27 @@ def _initialize_controller(
     state["drain_requested"] = preserve_drain
     # Recovery owns existing steps but never admits additional work implicitly.
     # An operator must explicitly resume after checking the recovered snapshot.
-    state["launches_paused"] = same_slurm_allocation
+    state["launches_paused"] = same_slurm_allocation or start_paused
+    ineligible = [
+        job["id"]
+        for job in state["jobs"].values()
+        if job["state"] in {"queued", "blocked"}
+        and not request_can_ever_fit(
+            inventory, ResourceRequest.from_dict(job["request"])
+        )
+    ]
+    if replacement:
+        metadata["handover"] = {
+            "previous_allocation_id": previous_allocation_id,
+            "lost_jobs": len(active),
+            "queued_jobs": sum(
+                job["state"] == "queued" for job in state["jobs"].values()
+            ),
+            "blocked_jobs": sum(
+                job["state"] == "blocked" for job in state["jobs"].values()
+            ),
+            "ineligible_jobs": len(ineligible),
+        }
     emit(
         controller,
         "allocation.resumed" if same_slurm_allocation else "allocation.started",
@@ -209,26 +247,19 @@ def _initialize_controller(
             "reattached_jobs": (
                 [job["id"] for job in active] if same_slurm_allocation else []
             ),
+            **({"handover": metadata["handover"]} if replacement else {}),
         },
     )
-    if same_slurm_allocation:
+    if state["launches_paused"]:
         emit(
             controller,
             "allocation.launches_paused",
-            data={"reason": "controller_restart"},
+            data={
+                "reason": (
+                    "controller_restart" if same_slurm_allocation else "operator_requested"
+                )
+            },
         )
-    for job in state["jobs"].values():
-        if job["state"] not in {"queued", "blocked"}:
-            continue
-        request = ResourceRequest.from_dict(job["request"])
-        if request_can_ever_fit(inventory, request):
-            continue
-        job["state"] = "rejected"
-        job["finished_at"] = utc_now()
-        job["reason"] = "request_cannot_fit"
-        job["error"] = "request cannot fit this allocation inventory"
-        write_result_record(root, job)
-        emit(controller, "job.rejected", job=job)
     return controller
 
 
@@ -1285,6 +1316,40 @@ def _heartbeat(controller: Controller) -> None:
     commit_snapshot(controller)
 
 
+def _drain_for_deadline(controller: Controller) -> None:
+    """Stop new launches when the configured allocation shutdown window begins."""
+
+    if controller.state.get("draining"):
+        return
+    allocation = controller.state.get("allocation")
+    drain_at = (
+        allocation.get("automatic_drain_at")
+        if isinstance(allocation, dict)
+        else None
+    )
+    if not isinstance(drain_at, str):
+        return
+    try:
+        due = datetime.fromisoformat(drain_at)
+    except ValueError:
+        return
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    if datetime.now(UTC) < due:
+        return
+    controller.state["draining"] = True
+    controller.state["drain_requested"] = True
+    allocation["state"] = "draining"
+    emit(
+        controller,
+        "allocation.draining",
+        data={
+            "reason": "allocation_deadline",
+            "drain_before_end_seconds": controller.drain_before_end_seconds,
+        },
+    )
+
+
 def _serve(controller: Controller) -> None:
     def stop(_signum: int, _frame: Any) -> None:
         controller.stopping = True
@@ -1306,6 +1371,7 @@ def _serve(controller: Controller) -> None:
         while True:
             _ingest_requests(controller)
             _ingest_commands(controller)
+            _drain_for_deadline(controller)
             drain_messages(controller)
             poll_processes(controller)
             _ingest_reports(controller)
@@ -1343,14 +1409,22 @@ def run_controller(
     slurm_job_id: str | None = None,
     poll_interval: float = 0.2,
     cancel_grace: float = 30,
+    start_paused: bool = False,
+    drain_before_end_seconds: float = 900,
 ) -> None:
     """Own a queue until interrupted, retrying transient storage failures."""
 
     if launcher not in {"local", "slurm"}:
         raise ValueError(f"unknown launcher {launcher!r}")
     inventory = validate_inventory(inventory)
-    if poll_interval <= 0 or cancel_grace < 0:
-        raise ValueError("poll interval must be positive and cancel grace non-negative")
+    if (
+        poll_interval <= 0
+        or cancel_grace < 0
+        or drain_before_end_seconds < 0
+    ):
+        raise ValueError(
+            "poll interval must be positive; grace and drain window must be non-negative"
+        )
     if launcher == "local" and len(inventory) != 1:
         raise ValueError("the local launcher requires a one-node inventory")
     if launcher == "slurm" and (
@@ -1371,6 +1445,8 @@ def run_controller(
                     slurm_job_id=slurm_job_id,
                     poll_interval=poll_interval,
                     cancel_grace=cancel_grace,
+                    start_paused=start_paused,
+                    drain_before_end_seconds=drain_before_end_seconds,
                 )
                 _serve(controller)
                 return

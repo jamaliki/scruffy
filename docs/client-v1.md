@@ -282,6 +282,15 @@ recovery pause after the operator has checked the snapshot; it never overrides
 an explicit drain. Its outcome is `allocation.launches_resumed` or
 `allocation.resume_ignored`, correlated by `request_id`.
 
+`scruffy serve --start-paused` provides the same inspection barrier when a new
+Slurm allocation adopts an existing queue root. Active jobs from the old
+allocation become `lost`; queued and blocked jobs are retained even when they do
+not fit the replacement inventory. `allocation.handover` summarizes the
+transition. New submissions continue to be validated against the live
+inventory. When Slurm publishes an allocation deadline, `serve` also drains 900
+seconds before it by default; configure the interval with
+`--drain-before-end-seconds` or disable it with `0`.
+
 CLI exit conventions are:
 
 - `0` for a successful client operation and for `wait` on a succeeded job.

@@ -98,6 +98,7 @@ class Controller:
     slurm_job_id: str | None
     poll_interval: float
     cancel_grace: float
+    drain_before_end_seconds: float
     state: dict[str, Any]
     journal: TextIO
     messages: MessageQueue

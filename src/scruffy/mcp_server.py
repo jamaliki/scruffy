@@ -160,6 +160,8 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
                 "heartbeat_at",
                 "deadline_at",
                 "remaining_seconds",
+                "automatic_drain_at",
+                "handover",
             )
         },
         "updated_at": value.get("updated_at"),

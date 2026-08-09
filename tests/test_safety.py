@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import tempfile
 import time
@@ -20,6 +21,7 @@ from scruffy.client import (
 from scruffy.controller import (
     _discard_journaled_commands,
     _discard_journaled_reports,
+    _drain_for_deadline,
     _ingest_commands,
     _ingest_reports,
     _ingest_requests,
@@ -639,7 +641,7 @@ class RecoverySafetyTests(unittest.TestCase):
             recovered["jobs"][job_id]["workload"]["progress"]["step"],
         )
 
-    def test_replacement_rejects_recovered_jobs_that_no_longer_fit(self) -> None:
+    def test_replacement_preserves_jobs_that_do_not_fit_and_starts_paused(self) -> None:
         queued = job_image("job-too-large", "old-node")
         queued["state"] = "queued"
         queued["assignment"] = None
@@ -663,12 +665,121 @@ class RecoverySafetyTests(unittest.TestCase):
             slurm_job_id="new-allocation",
             poll_interval=0.1,
             cancel_grace=30,
+            start_paused=True,
         )
         self.addCleanup(lambda: controller.journal.close())
 
-        rejected = controller.state["jobs"]["job-too-large"]
-        self.assertEqual("rejected", rejected["state"])
-        self.assertEqual("request_cannot_fit", rejected["reason"])
+        preserved = controller.state["jobs"]["job-too-large"]
+        self.assertEqual("queued", preserved["state"])
+        self.assertTrue(controller.state["launches_paused"])
+        self.assertEqual(
+            {
+                "previous_allocation_id": "old-allocation",
+                "lost_jobs": 0,
+                "queued_jobs": 1,
+                "blocked_jobs": 0,
+                "ineligible_jobs": 1,
+            },
+            controller.state["allocation"]["handover"],
+        )
+        with mock.patch("scruffy.lifecycle.start_job") as start:
+            schedule(controller)
+        start.assert_not_called()
+
+        resume_queue(self.root)
+        _ingest_commands(controller)
+        self.assertFalse(controller.state["launches_paused"])
+        with mock.patch("scruffy.lifecycle.start_job") as start:
+            schedule(controller)
+        start.assert_not_called()
+
+    def test_deadline_window_drains_before_scheduling(self) -> None:
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("local", (0,), 2, 2),),
+            launcher="local",
+            allocation_id="local-allocation",
+            slurm_job_id=None,
+            poll_interval=0.1,
+            cancel_grace=0,
+            drain_before_end_seconds=600,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+        controller.state["allocation"]["automatic_drain_at"] = (
+            "2000-01-01T00:00:00+00:00"
+        )
+
+        _drain_for_deadline(controller)
+        _drain_for_deadline(controller)
+
+        self.assertTrue(controller.state["draining"])
+        self.assertTrue(controller.state["drain_requested"])
+        events = [
+            event
+            for event in read_events(self.root)
+            if event["kind"] == "allocation.draining"
+        ]
+        self.assertEqual(1, len(events))
+        event = events[0]
+        self.assertEqual("allocation_deadline", event["data"]["reason"])
+        self.assertEqual(600, event["data"]["drain_before_end_seconds"])
+
+    def test_deadline_window_is_derived_from_the_slurm_deadline(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"SLURM_JOB_END_TIME": "1893456000"},
+            clear=False,
+        ):
+            controller = _initialize_controller(
+                root=self.root,
+                inventory=(NodeInventory("gpu-0", (0,), 2, 2),),
+                launcher="slurm",
+                allocation_id="new-allocation",
+                slurm_job_id="new-allocation",
+                poll_interval=0.1,
+                cancel_grace=30,
+                drain_before_end_seconds=900,
+            )
+        self.addCleanup(lambda: controller.journal.close())
+
+        self.assertEqual(
+            "2029-12-31T23:45:00+00:00",
+            controller.state["allocation"]["automatic_drain_at"],
+        )
+        self.assertFalse(controller.state["draining"])
+
+    def test_same_allocation_restart_preserves_handover_summary(self) -> None:
+        handover = {
+            "previous_allocation_id": "old-allocation",
+            "lost_jobs": 2,
+            "queued_jobs": 3,
+            "blocked_jobs": 4,
+            "ineligible_jobs": 1,
+        }
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "new-allocation", "handover": handover},
+                "nodes": {},
+                "jobs": {},
+            },
+        )
+
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-0", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="new-allocation",
+            slurm_job_id="new-allocation",
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        self.assertEqual(handover, controller.state["allocation"]["handover"])
 
 
 class LaunchCleanupTests(unittest.TestCase):
@@ -1588,6 +1699,7 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
             slurm_job_id="240292",
             poll_interval=0.1,
             cancel_grace=30,
+            drain_before_end_seconds=900,
             state={"queue_id": queue_id(root), "last_seq": 0, "jobs": {}, "nodes": {}},
             journal=journal,
             messages=messages,

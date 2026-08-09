@@ -210,6 +210,14 @@ class ProjectionTests(unittest.TestCase):
                 "state": "running",
                 "heartbeat_at": "2026-08-06T12:00:00+00:00",
                 "launcher": "slurm",
+                "automatic_drain_at": "2026-08-07T11:45:00+00:00",
+                "handover": {
+                    "previous_allocation_id": "allocation-0",
+                    "lost_jobs": 0,
+                    "queued_jobs": 2,
+                    "blocked_jobs": 1,
+                    "ineligible_jobs": 1,
+                },
             },
             "counts": {"running": 1},
             "nodes": {
@@ -247,6 +255,14 @@ class ProjectionTests(unittest.TestCase):
                 "heartbeat_at": "2026-08-06T12:00:00+00:00",
                 "deadline_at": None,
                 "remaining_seconds": None,
+                "automatic_drain_at": "2026-08-07T11:45:00+00:00",
+                "handover": {
+                    "previous_allocation_id": "allocation-0",
+                    "lost_jobs": 0,
+                    "queued_jobs": 2,
+                    "blocked_jobs": 1,
+                    "ineligible_jobs": 1,
+                },
             },
             compact["allocation"],
         )

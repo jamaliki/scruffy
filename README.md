@@ -78,6 +78,11 @@ inventory for selected, non-contiguous, or heterogeneous resources:
 scruffy --root "$SCRUFFY_ROOT" serve --inventory inventory.json
 ```
 
+When Slurm exposes the allocation deadline, the controller stops launching new
+jobs 15 minutes before it. Change the window with
+`--drain-before-end-seconds SECONDS`, or set it to `0` to disable automatic
+draining. Running jobs are not killed by the drain.
+
 Any process with access to the shared root can now submit without waiting for
 the controller, dependencies, or free GPUs:
 
@@ -475,8 +480,8 @@ Cancellation, drain, and resume requests are asynchronous and return a
 `request_id` that appears on their journal outcome. `drain` disables new
 launches for the current allocation; running jobs continue and queued jobs
 remain durable. The drain survives controller restarts and clears when a
-replacement allocation starts. `resume` clears only the automatic launch pause
-created by a same-allocation controller restart; it cannot override `drain`.
+replacement allocation starts. `resume` clears a recovery or `--start-paused`
+launch pause; it cannot override `drain`.
 Cancelling an archived terminal job produces `job.cancel_ignored`, just like
 cancelling a terminal job still in hot state.
 
@@ -496,18 +501,42 @@ placement, queued jobs are ordered by their project's currently assigned GPU
 count and then by controller-owned queue order. This balances concurrent GPU use
 without storing historical usage or blocking smaller jobs that fit. It does not
 reserve a fixed share or prevent a large request from waiting for enough GPUs.
-Queued and dependency-blocked jobs can survive a replacement allocation. Active
-jobs from a replaced allocation
-become `lost` and are never retried automatically. Resource assignments remain
-reserved whenever Slurm reconciliation is uncertain. On a controller restart
-inside the same Slurm allocation, persisted launch tokens are matched back to
-live steps and their assignments remain owned. Completed reattached steps are
-resolved through Slurm accounting; only a step that Slurm proves absent can
+Queued and dependency-blocked jobs survive a replacement allocation, including
+requests that do not fit the replacement inventory; such jobs remain queued
+until a later compatible allocation is attached. Active jobs from a replaced
+allocation become `lost` and are never retried automatically. Resource
+assignments remain reserved whenever Slurm reconciliation is uncertain. On a
+controller restart inside the same Slurm allocation, persisted launch tokens
+are matched back to live steps and their assignments remain owned. Completed
+reattached steps are resolved through Slurm accounting; only a step that Slurm proves absent can
 release its resources. Slurm writes job logs directly to the shared queue root,
 so output does not depend on the lifetime of the original controller process.
 Every same-allocation restart begins with launches paused: queued jobs remain
 durable and dependencies may resolve, but nothing new starts until an operator
 checks the recovered state and runs `scruffy --root "$SCRUFFY_ROOT" resume`.
+
+### Moving to a replacement allocation
+
+Keep `SCRUFFY_ROOT` at a stable home-backed location rather than naming it after
+the Slurm allocation. The queue state does not need to be copied. Before the old
+allocation ends, drain it and let checkpointing workloads finish when possible:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" drain
+```
+
+Start the successor allocation against the same root with launches paused:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" serve --start-paused
+scruffy --root "$SCRUFFY_ROOT" summary
+scruffy --root "$SCRUFFY_ROOT" resume
+```
+
+The summary and MCP overview include a bounded `handover` count of lost,
+queued, blocked, and currently inventory-ineligible jobs. Inspect it before
+resuming. New submissions are still rejected when they cannot fit the current
+inventory; only durable work inherited from an older allocation is retained.
 
 The controller deliberately runs one submitted argv per job. It numbers
 immutable attempts but is not an automatic retry engine, dynamic workflow

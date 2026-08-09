@@ -118,6 +118,8 @@ def _json_object(value: str, label: str) -> dict[str, Any]:
 
 def _serve(arguments: argparse.Namespace) -> int:
     root = _root(arguments)
+    if arguments.drain_before_end_seconds < 0:
+        raise ValueError("--drain-before-end-seconds must be non-negative")
     slurm_job_id = arguments.slurm_job_id or os.environ.get("SLURM_JOB_ID")
     launcher = arguments.launcher
     if launcher == "auto":
@@ -154,6 +156,8 @@ def _serve(arguments: argparse.Namespace) -> int:
         slurm_job_id=slurm_job_id,
         poll_interval=arguments.poll_interval,
         cancel_grace=arguments.cancel_grace,
+        start_paused=arguments.start_paused,
+        drain_before_end_seconds=arguments.drain_before_end_seconds,
     )
     return 0
 
@@ -485,6 +489,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30,
         help="local seconds before SIGKILL; Slurm uses scancel (default: 30)",
+    )
+    serve.add_argument(
+        "--start-paused",
+        action="store_true",
+        help="recover state but require an explicit resume before launching jobs",
+    )
+    serve.add_argument(
+        "--drain-before-end-seconds",
+        type=float,
+        default=900,
+        help=(
+            "stop new launches this many seconds before the allocation ends "
+            "(default: 900; 0 disables)"
+        ),
     )
     serve.set_defaults(handler=_serve)
 

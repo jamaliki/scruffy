@@ -18,6 +18,8 @@ umask 077
 : "${SCRUFFY_ROOT:?set SCRUFFY_ROOT to a shared filesystem directory}"
 
 # SCRUFFY_ROOT and this Python environment must be visible at the same absolute
-# paths on every node. Keeping the controller in the foreground lets Slurm tear
-# down every child step if it exits; the early TERM gives it time to reconcile.
-exec scruffy --root "$SCRUFFY_ROOT" serve
+# paths on every node. Reuse that root for a successor allocation. Add
+# --start-paused during a handover so the recovered queue can be inspected
+# before it launches. The default controller drain begins 15 minutes before the
+# allocation deadline.
+exec scruffy --root "$SCRUFFY_ROOT" serve --drain-before-end-seconds 900

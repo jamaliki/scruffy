@@ -418,6 +418,9 @@ class ServeCliTests(unittest.TestCase):
                     "0.1",
                     "--cancel-grace",
                     "2.5",
+                    "--start-paused",
+                    "--drain-before-end-seconds",
+                    "120",
                 ]
             )
 
@@ -430,6 +433,8 @@ class ServeCliTests(unittest.TestCase):
             slurm_job_id=None,
             poll_interval=0.1,
             cancel_grace=2.5,
+            start_paused=True,
+            drain_before_end_seconds=120,
         )
 
     def test_missing_inventory_is_reported_without_a_traceback(self) -> None:
@@ -450,6 +455,30 @@ class ServeCliTests(unittest.TestCase):
 
         self.assertEqual(2, result)
         self.assertEqual("scruffy: gone\n", stderr.getvalue())
+
+    def test_negative_automatic_drain_window_is_rejected_early(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("scruffy.cli.load_inventory") as load_inventory,
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "serve",
+                    "--inventory",
+                    str(self.workspace / "inventory.json"),
+                    "--drain-before-end-seconds",
+                    "-1",
+                ]
+            )
+
+        self.assertEqual(2, result)
+        self.assertIn("must be non-negative", stderr.getvalue())
+        load_inventory.assert_not_called()
+        run_controller.assert_not_called()
 
     def test_automatic_inventory_requires_a_slurm_allocation(self) -> None:
         stderr = io.StringIO()
@@ -489,6 +518,8 @@ class ServeCliTests(unittest.TestCase):
             slurm_job_id="263105",
             poll_interval=0.2,
             cancel_grace=30,
+            start_paused=False,
+            drain_before_end_seconds=900,
         )
 
     def test_slurm_launcher_requires_a_job_id_before_starting(self) -> None:
