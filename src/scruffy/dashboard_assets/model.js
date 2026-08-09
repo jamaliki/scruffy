@@ -91,6 +91,99 @@ export function visibleJobs(jobs, project, search) {
   });
 }
 
+export function workflowChoices(snapshot, project = "all", search = "") {
+  const needle = search.trim().toLowerCase();
+  const grouped = new Map();
+  for (const job of uniqueJobs(snapshot).values()) {
+    const workflow = job.workflow_id;
+    const jobProject = job.project_id || "default";
+    if (!workflow || (project !== "all" && jobProject !== project)) continue;
+    if (needle && ![job.name, job.id, workflow, job.task_id]
+      .filter(Boolean).some((value) => String(value).toLowerCase().includes(needle))) continue;
+    const key = JSON.stringify([jobProject, workflow]);
+    const current = grouped.get(key) || {key, project: jobProject, workflow_id: workflow, jobs: 0, active: 0, attention: 0, newest: ""};
+    current.jobs += 1;
+    if (["running", "starting", "finishing", "queued", "submitted", "blocked"].includes(job.state)) current.active += 1;
+    if (["failed", "lost", "rejected", "skipped"].includes(job.state)) current.attention += 1;
+    current.newest = [current.newest, job.finished_at, job.started_at, job.submitted_at].filter(Boolean).sort().at(-1) || "";
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].sort((left, right) =>
+    right.active - left.active || right.attention - left.attention
+    || right.newest.localeCompare(left.newest) || left.workflow_id.localeCompare(right.workflow_id),
+  );
+}
+
+export function workflowLayout(tasks = []) {
+  const nodes = new Map(tasks.map((task) => [task.task_id, {...task, missing: false}]));
+  for (const task of tasks) {
+    for (const need of task.needs || []) {
+      if (need.task_id && !nodes.has(need.task_id)) {
+        nodes.set(need.task_id, {task_id: need.task_id, name: "Missing dependency", state: "missing", needs: [], missing: true});
+      }
+    }
+  }
+  const visiting = new Set();
+  const depths = new Map();
+  const depthOf = (taskId) => {
+    if (depths.has(taskId)) return depths.get(taskId);
+    if (visiting.has(taskId)) return 0;
+    visiting.add(taskId);
+    const task = nodes.get(taskId);
+    const parents = (task?.needs || []).map((need) => need.task_id).filter((taskId) => nodes.has(taskId));
+    const depth = parents.length ? Math.max(...parents.map(depthOf)) + 1 : 0;
+    visiting.delete(taskId); depths.set(taskId, depth); return depth;
+  };
+  for (const taskId of nodes.keys()) depthOf(taskId);
+  const columns = new Map();
+  for (const task of nodes.values()) {
+    const depth = depths.get(task.task_id) || 0;
+    if (!columns.has(depth)) columns.set(depth, []);
+    columns.get(depth).push(task);
+  }
+  const nodeWidth = 210, nodeHeight = 82, columnGap = 92, rowGap = 18;
+  const positioned = [];
+  for (const [depth, column] of [...columns.entries()].sort(([left], [right]) => left - right)) {
+    column.sort((left, right) => String(left.task_id).localeCompare(String(right.task_id), undefined, {numeric: true}));
+    column.forEach((task, row) => positioned.push({...task, x: 24 + depth * (nodeWidth + columnGap), y: 24 + row * (nodeHeight + rowGap)}));
+  }
+  const positionedById = new Map(positioned.map((task) => [task.task_id, task]));
+  const edges = [];
+  for (const task of positioned) {
+    for (const need of task.needs || []) {
+      const source = positionedById.get(need.task_id);
+      if (source) edges.push({source, target: task, condition: need.condition || "succeeded"});
+    }
+  }
+  return {
+    nodes: positioned, edges, nodeWidth, nodeHeight,
+    width: Math.max(520, ...positioned.map((task) => task.x + nodeWidth + 24)),
+    height: Math.max(190, ...positioned.map((task) => task.y + nodeHeight + 24)),
+  };
+}
+
+export function focusedWorkflowTasks(tasks = [], maximum = 120) {
+  if (tasks.length <= maximum) return {tasks, omitted: 0};
+  const byId = new Map(tasks.map((task) => [task.task_id, task]));
+  let seeds = tasks.filter((task) =>
+    ["submitted", "blocked", "queued", "starting", "running", "finishing", "failed", "lost", "rejected", "skipped"].includes(task.state),
+  );
+  if (!seeds.length) {
+    seeds = [...tasks].sort((left, right) => String(right.submitted_at || "").localeCompare(String(left.submitted_at || ""))).slice(0, 8);
+  }
+  seeds.sort((left, right) => String(right.submitted_at || "").localeCompare(String(left.submitted_at || "")));
+  const included = new Set();
+  const pending = seeds.map((task) => task.task_id);
+  while (pending.length && included.size < maximum) {
+    const taskId = pending.shift();
+    if (included.has(taskId) || !byId.has(taskId)) continue;
+    included.add(taskId);
+    for (const need of byId.get(taskId).needs || []) pending.push(need.task_id);
+  }
+  const selected = tasks.filter((task) => included.has(task.task_id));
+  return {tasks: selected, omitted: tasks.length - selected.length};
+}
+
 export function formatNumber(value) {
   return new Intl.NumberFormat("en-GB", {maximumFractionDigits: 1}).format(Number(value || 0));
 }

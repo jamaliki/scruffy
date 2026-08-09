@@ -36,7 +36,7 @@ from .storage import (
 )
 from .submissions import submission_summary, workflow_submission
 from .summary import build_summary, explain_job
-from .workflows import validate_workflows
+from .workflows import select_task_attempts, validate_workflows
 
 
 def _workflow_fields(
@@ -624,3 +624,100 @@ def explain(
         ):
             state["jobs"].setdefault(archived["id"], archived)
     return explain_job(state, job_id)
+
+
+def inspect_workflow(
+    root: Path, workflow_id: str, *, project_id: str
+) -> dict[str, Any]:
+    """Return the compact task graph and attempts for one project workflow."""
+
+    if not isinstance(workflow_id, str) or not workflow_id.strip():
+        raise ValueError("workflow_id must be a non-empty string")
+    if workflow_id != workflow_id.strip():
+        raise ValueError("workflow_id must not have surrounding whitespace")
+    selected_project = normalize_project_id(project_id)
+    state = status(root)
+    jobs = {
+        job["id"]: job
+        for job in state.get("jobs", {}).values()
+        if isinstance(job, dict)
+        and job_project(job) == selected_project
+        and job.get("workflow_id") == workflow_id
+    }
+    for archived in list_archived_workflow(
+        root, workflow_id, project_id=selected_project
+    ):
+        jobs.setdefault(archived["id"], archived)
+    if not jobs:
+        raise KeyError(f"unknown workflow {workflow_id}")
+
+    attempts: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs.values():
+        task_id = job.get("task_id")
+        if isinstance(task_id, str):
+            attempts.setdefault(task_id, []).append(job)
+    # Pending retries do not have a controller queue order yet. Treat them as
+    # newest for this read-only view without mutating the committed state.
+    next_order = int(state.get("next_queue_order", 0))
+    candidates = []
+    for index, job in enumerate(jobs.values()):
+        if type(job.get("queue_order")) is int:
+            candidates.append(job)
+        else:
+            candidates.append({**job, "queue_order": next_order + index})
+    selected = select_task_attempts(candidates)
+    tasks = []
+    for (candidate_project, candidate_workflow, task_id), job in selected.items():
+        if (
+            candidate_project != selected_project
+            or candidate_workflow != workflow_id
+        ):
+            continue
+        task_attempts = sorted(
+            attempts.get(task_id, []),
+            key=lambda item: (
+                item.get("queue_order")
+                if type(item.get("queue_order")) is int
+                else -1,
+                str(item.get("id") or ""),
+            ),
+        )
+        tasks.append(
+            {
+                "task_id": task_id,
+                "job_id": job["id"],
+                "name": job.get("name"),
+                "state": job.get("state"),
+                "reason": job.get("reason"),
+                "attempt": job.get("attempt"),
+                "needs": copy.deepcopy(job.get("needs") or []),
+                "blockers": copy.deepcopy(job.get("blockers") or []),
+                "submitted_at": job.get("submitted_at"),
+                "attempts": [
+                    {
+                        "job_id": candidate["id"],
+                        "state": candidate.get("state"),
+                        "reason": candidate.get("reason"),
+                        "attempt": candidate.get("attempt"),
+                    }
+                    for candidate in task_attempts
+                ],
+                "queue_order": (
+                    job.get("queue_order")
+                    if type(job.get("queue_order")) is int
+                    else -1
+                ),
+            }
+        )
+    tasks.sort(key=lambda task: (task["queue_order"], task["task_id"]))
+    for task in tasks:
+        task.pop("queue_order")
+    return {
+        "v": 1,
+        "queue_id": state.get("queue_id"),
+        "project_id": selected_project,
+        "workflow_id": workflow_id,
+        "task_count": len(tasks),
+        "attempt_count": len(jobs),
+        "tasks": tasks,
+    }

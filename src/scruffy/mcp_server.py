@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 from typing import Any
 
-from .client import explain, observe, status, summary
+from .client import explain, inspect_workflow, observe, status, summary
 from .client import submit_job as enqueue_job
 from .client import submit_workflow as enqueue_workflow
 from .client import validate_workflow as preflight_workflow
@@ -628,6 +628,12 @@ async def dispatch_tool(
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("job_id must not be empty")
         return compact_explanation(explain(root, job_id, project_id=project_id))
+    if tool == "inspect_workflow":
+        _only(params, {"workflow_id"})
+        workflow_id = params.get("workflow_id")
+        if project_id is None:
+            raise ValueError("inspect_workflow requires a project scope")
+        return inspect_workflow(root, workflow_id, project_id=project_id)
     if tool == "tail_job_output":
         return _tail_job_output(root, params, project_id)
     if tool == "submit_job":

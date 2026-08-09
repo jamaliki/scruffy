@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .mcp_gateway import remote_caller
 from .mcp_server import dispatch_tool
@@ -102,6 +102,21 @@ def _handler(reader: QueueReader) -> type[BaseHTTPRequestHandler]:
                         self._error(HTTPStatus.BAD_REQUEST, "invalid job id")
                         return
                     self._json(reader("inspect_job", {"job_id": job_id}))
+                    return
+                workflow_prefix = "/api/workflows/"
+                if request.path.startswith(workflow_prefix):
+                    workflow_id = unquote(request.path[len(workflow_prefix) :])
+                    query = parse_qs(request.query)
+                    project = query.get("project", [None])[-1]
+                    if not workflow_id or "/" in workflow_id or not project:
+                        self._error(HTTPStatus.BAD_REQUEST, "workflow and project are required")
+                        return
+                    self._json(
+                        reader(
+                            "inspect_workflow",
+                            {"workflow_id": workflow_id, "_project_id": project},
+                        )
+                    )
                     return
                 asset = ASSETS.get(request.path)
                 if asset is None:

@@ -21,6 +21,7 @@
       <a href="#topology">Resources</a>
       <a href="#signals">Signals</a>
       <a href="#jobs">Scheduler</a>
+      <a href="#workflows">Workflows</a>
       <a href="#projects">Projects</a>
     </nav>
     <div class="allocation-identity">
@@ -93,6 +94,25 @@
         <section><h3>Queued <span id="queued-count">0</span></h3><div id="queued" class="job-list"></div></section>
         <section><h3>Blocked <span id="blocked-count">0</span></h3><div id="blocked" class="job-list"></div></section>
       </div>
+    </section>
+
+    <section id="workflows" class="panel workflow-panel">
+      <header class="panel-header workflow-header">
+        <h2>Workflows</h2>
+        <div class="workflow-controls">
+          <label for="workflow-filter">Dependency map</label>
+          <select id="workflow-filter"><option value="">No workflows visible</option></select>
+        </div>
+      </header>
+      <div id="workflow-status" class="workflow-status">Select a workflow to map its tasks.</div>
+      <div id="workflow-viewport" class="workflow-viewport">
+        <div id="workflow-canvas" class="workflow-canvas"></div>
+      </div>
+      <footer class="workflow-legend" aria-label="Workflow dependency legend">
+        <span><i class="workflow-line success"></i> requires success</span>
+        <span><i class="workflow-line terminal"></i> requires terminal state</span>
+        <span>Select a task for job details</span>
+      </footer>
     </section>
 
     <section id="projects" class="panel projects-panel">

@@ -118,6 +118,21 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("secret", encoded)
         self.assertEqual("training", overview["active"][0]["workload"]["phase"])
 
+    def test_workflow_reader_returns_only_compact_dependency_data(self) -> None:
+        reader = local_reader(self.root)
+
+        workflow = reader(
+            "inspect_workflow",
+            {"workflow_id": "workflow-1", "_project_id": "koochak"},
+        )
+        encoded = json.dumps(workflow)
+
+        self.assertEqual("workflow-1", workflow["workflow_id"])
+        self.assertEqual("train", workflow["tasks"][0]["task_id"])
+        self.assertNotIn("argv", encoded)
+        self.assertNotIn("environment", encoded)
+        self.assertNotIn("secret", encoded)
+
     def test_assets_and_read_only_api_are_served_on_loopback(self) -> None:
         html, headers = self.get("/")
         css, _ = self.get("/assets/app.css")
@@ -126,12 +141,14 @@ class DashboardTests(unittest.TestCase):
         mascot, mascot_headers = self.get("/assets/scruffy-pixel.png")
         overview, _ = self.get("/api/overview")
         job, _ = self.get("/api/jobs/job-1")
+        workflow, _ = self.get("/api/workflows/workflow-1?project=koochak")
 
         self.assertIn(b"SCRUFFY", html)
         self.assertIn(b"<h1>Resources</h1>", html)
         self.assertIn(b"<h2>Signals</h2>", html)
         self.assertIn(b"<h2>History</h2>", html)
         self.assertIn(b"<h2>Scheduler</h2>", html)
+        self.assertIn(b"<h2>Workflows</h2>", html)
         self.assertIn(b"<h2>Projects</h2>", html)
         self.assertNotIn(b"GPU topology", html)
         self.assertNotIn(b"Project queues", html)
@@ -154,12 +171,15 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b'view.project === requested ? "all" : requested', app)
         self.assertIn(b'item.setAttribute("aria-pressed"', app)
         self.assertIn(b"export function projectSummaries", model)
+        self.assertIn(b"export function workflowLayout", model)
+        self.assertIn(b"export function focusedWorkflowTasks", model)
         self.assertIn(b"...(snapshot?.queued || []), ...(snapshot?.submitted || [])", model)
         self.assertTrue(mascot.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual("image/png", mascot_headers["Content-Type"])
         self.assertEqual("DENY", headers["X-Frame-Options"])
         self.assertEqual("allocation-1", json.loads(overview)["allocation"]["id"])
         self.assertEqual("job-1", json.loads(job)["job"]["id"])
+        self.assertEqual("workflow-1", json.loads(workflow)["workflow_id"])
 
     def test_unknown_hosts_and_mutations_are_rejected(self) -> None:
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
