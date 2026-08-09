@@ -225,7 +225,14 @@ export function formatAge(timestamp) {
 
 export function resourceLabel(job) {
   const request = job?.request || {};
-  return `${request.nodes || 0}n · ${request.gpus_per_node || 0} GPU/n · ${request.cpus_per_node || 0} CPU/n`;
+  const nodes = Number(request.nodes || 0);
+  const gpus = Number(request.gpus_per_node || 0);
+  const cpus = Number(request.cpus_per_node || 0);
+  const nodeLabel = `${nodes} ${nodes === 1 ? "node" : "nodes"}`;
+  const gpuLabel = `${gpus} ${gpus === 1 ? "GPU" : "GPUs"}`;
+  const cpuLabel = `${cpus} ${cpus === 1 ? "CPU" : "CPUs"}`;
+  const perNode = nodes > 1 ? " each" : "";
+  return `${nodeLabel} · ${gpuLabel}${perNode} · ${cpuLabel}${perNode}`;
 }
 
 export function progressLabel(job) {
