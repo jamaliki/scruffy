@@ -204,34 +204,38 @@ def build_srun_argv(
     stdout_file: Path,
     stderr_file: Path,
     node_names: list[str],
+    gpus_per_node: int,
     cpus_per_node: int,
     memory_gb_per_node: int,
     wait_seconds: int = 0,
 ) -> list[str]:
     """Build one argv-only Slurm step for a rectangular multi-node job.
 
-    Scruffy deliberately uses ``--overlap`` because the outer allocation owns
-    the full GPU pool. Its own per-node ledger selects disjoint GPU IDs, and the
-    worker narrows ``CUDA_VISIBLE_DEVICES`` before executing the user command.
-    ``cpus_per_node`` is therefore the managed node capacity, not an individual
-    job's admission budget. Giving every overlapping step the managed CPU pool
-    prevents Slurm from pinning all workers to the same first CPU slice; Scruffy
-    still limits their aggregate requested CPU budget in its scheduler.
+    Slurm owns the physical resources for every step. Scruffy chooses nodes and
+    admission slots, while the explicit step request makes Slurm allocate
+    disjoint GPUs, CPUs, and memory and set the worker's GPU visibility.
     """
 
     if not slurm_job_id:
         raise ValueError("a Slurm job ID is required for the Slurm launcher")
+    if type(gpus_per_node) is not int or gpus_per_node < 0:
+        raise ValueError("gpus_per_node must be a non-negative integer")
     nodes = len(node_names)
+    gpu_options = (
+        [f"--gpus-per-node={gpus_per_node}", "--gpu-bind=none"]
+        if gpus_per_node
+        else ["--gres=none"]
+    )
     return [
         "srun",
         f"--jobid={slurm_job_id}",
         f"--job-name={name}",
-        "--overlap",
         "--exact",
         f"--nodes={nodes}",
         f"--nodelist={','.join(node_names)}",
         f"--ntasks={nodes}",
         "--ntasks-per-node=1",
+        *gpu_options,
         f"--cpus-per-task={cpus_per_node}",
         "--cpu-bind=none",
         f"--mem={memory_gb_per_node}G",
@@ -249,12 +253,23 @@ def build_srun_argv(
 
 
 def build_srun_environment() -> dict[str, str]:
-    """Return the controller environment without controller-only placement."""
+    """Return an environment without inherited step resource directives."""
 
     environment = os.environ.copy()
     environment.pop("SCRUFFY_NODE", None)
+    environment.pop("CUDA_VISIBLE_DEVICES", None)
+    resource_options = {
+        "SLURM_GPU_BIND",
+        "SLURM_GPUS",
+        "SLURM_GPUS_PER_NODE",
+        "SLURM_GPUS_PER_TASK",
+        "SLURM_GRES",
+        "SLURM_STEP_GRES",
+        "SLURM_TRES_BIND",
+        "SLURM_TRES_PER_TASK",
+    }
     for name in tuple(environment):
-        if name.startswith("SLURM_CPU_BIND"):
+        if name.startswith("SLURM_CPU_BIND") or name in resource_options:
             environment.pop(name)
     return environment
 

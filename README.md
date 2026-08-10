@@ -8,7 +8,8 @@ journal.
 It is named after the quiet caretaker from *Futurama*. This project is not
 affiliated with the show or its owners.
 
-> No two nonterminal jobs submitted through Scruffy own the same `(node, GPU)`.
+> In Slurm mode, every job receives an explicit step-level GPU allocation; Slurm
+> prevents two live steps from owning the same GPU.
 
 This guarantee covers only work launched through Scruffy. Do not run out-of-band
 GPU processes against its configured inventory.
@@ -30,13 +31,13 @@ releasing its singleton lock or GPU ledger. A blocked filesystem syscall must
 still return before Python can retry, so controller diagnostics should be
 written to a filesystem independent of `SCRUFFY_ROOT`.
 
-GPU IDs are node-local values passed through `CUDA_VISIBLE_DEVICES`. CPU and
-memory values are cooperative admission budgets, not physical isolation. The
-Slurm worker step sees Scruffy's managed node CPU pool so overlapping jobs are
-not all pinned to the same first CPU slice. The workload should still size its
-own workers and thread pools to the CPU budget it requested. Scruffy trusts
-every process able to write `SCRUFFY_ROOT`; it is not a multi-user security
-boundary.
+In Slurm mode, Scruffy requests each job's GPU, CPU, and memory budget on its
+worker step without `--overlap`. Slurm chooses the physical GPUs and sets
+`CUDA_VISIBLE_DEVICES`; Scruffy preserves that value instead of replacing it.
+The controller's per-node GPU IDs remain deterministic admission slots, while
+`SCRUFFY_GPU_IDS` contains the authoritative tokens visible to the workload.
+Local mode remains cooperative. Scruffy trusts every process able to write
+`SCRUFFY_ROOT`; it is not a multi-user security boundary.
 
 ## Quick start
 
@@ -68,6 +69,11 @@ complete template.
 export SCRUFFY_ROOT=/shared/runs/scruffy
 scruffy --root "$SCRUFFY_ROOT" serve
 ```
+
+Prefer running the controller as the outer batch script's foreground process.
+If it must be a nested management step, launch that controller step with
+`--overlap --gres=none` and a small CPU/memory request so it does not consume a
+worker GPU or permanently remove one worker CPU from the managed pool.
 
 Automatic inventory discovery reads the resources granted to the outer Slurm
 allocation. Per-node resource flags can cap that managed capacity. Discovery
@@ -419,12 +425,14 @@ Active duplicate task IDs, self-dependencies, and cycles are rejected. Use
 
 Workers receive controller-owned `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`,
 `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, `SCRUFFY_NODE`, `SCRUFFY_GPU_IDS`, and
-workflow/task/attempt identity. `SCRUFFY_PROVENANCE_PATH` names a mode-0444
+workflow/task/attempt identity. In Slurm mode, `SCRUFFY_GPU_IDS` is copied from
+the step's `CUDA_VISIBLE_DEVICES`; `SCRUFFY_SLURM_GPU_IDS` also exposes Slurm's
+global step IDs when available. `SCRUFFY_PROVENANCE_PATH` names a mode-0444
 launch record containing exact argv, cwd, resources, resolved dependency
-attempts, allocation, and placement. Its sibling request and result records
-survive log and hot-state compaction; environment values are represented by a
-digest rather than copied into provenance. `SCRUFFY_ASSIGNMENT_SHA256` is a
-stable digest of the concrete node/GPU reservation.
+attempts, allocation, and scheduler reservation. Its sibling request and result
+records survive log and hot-state compaction; environment values are represented
+by a digest rather than copied into provenance. `SCRUFFY_ASSIGNMENT_SHA256` is a
+stable digest of that reservation.
 
 A workload can publish a bounded semantic annotation without contacting the
 controller process:

@@ -143,15 +143,20 @@ agents; reading does not consume events for anyone else. Use
   `allocation.handover` counts, then run `scruffy resume`.
 - By default, `serve` automatically drains 900 seconds before Slurm's allocation
   deadline. Override with `--drain-before-end-seconds`; `0` disables it.
+- Run the controller as the outer batch foreground process when possible. A
+  nested controller `srun` must use `--overlap --gres=none` with a small CPU and
+  memory request so its management footprint does not block worker steps.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
-- CPU and memory are cooperative budgets. GPU exclusivity covers only work
-  submitted through Scruffy; do not launch out-of-band work on its inventory.
+- In Slurm mode each worker step requests its exact GPU, CPU, and memory budget;
+  Slurm owns physical GPU selection and exclusivity. Local mode is cooperative.
+  Do not launch out-of-band work on Scruffy's inventory.
 - `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
   every node. Lustre `localflock` is not sufficient for a multi-node queue.
 - `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and
   `SCRUFFY_NODE` are controller-owned inside a worker. New jobs also receive
   `SCRUFFY_PROVENANCE_PATH`, `SCRUFFY_ASSIGNMENT_SHA256`, `SCRUFFY_GPU_IDS`, and
-  workflow/task/attempt identity.
+  workflow/task/attempt identity. In Slurm mode `SCRUFFY_GPU_IDS` comes from the
+  step's `CUDA_VISIBLE_DEVICES`; never replace it with scheduler reservation IDs.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.

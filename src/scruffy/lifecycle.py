@@ -75,8 +75,6 @@ def _launch_arguments(
     stderr_file: Path,
 ) -> tuple[list[str], dict[str, str] | None]:
     if controller.launcher == "slurm":
-        capacity = {node.name: node.cpus for node in controller.inventory}
-        worker_cpus = min(capacity[item.node] for item in assignment.reservations)
         return (
             build_srun_argv(
                 slurm_job_id=controller.slurm_job_id or "",
@@ -85,7 +83,8 @@ def _launch_arguments(
                 stdout_file=stdout_file,
                 stderr_file=stderr_file,
                 node_names=[item.node for item in assignment.reservations],
-                cpus_per_node=worker_cpus,
+                gpus_per_node=assignment.request.gpus_per_node,
+                cpus_per_node=assignment.request.cpus_per_node,
                 memory_gb_per_node=assignment.request.memory_gb_per_node,
             ),
             build_srun_environment(),
@@ -128,6 +127,8 @@ def start_job(
             "cwd": job["cwd"],
             "env": job["env"],
             "assignment": [item.to_dict() for item in assignment.reservations],
+            "slurm_managed_gpus": controller.launcher == "slurm",
+            "gpus_per_node": assignment.request.gpus_per_node,
             # A Slurm worker owns its log descriptors so output survives the
             # controller and its local srun client. Local jobs keep using the
             # controller's pipes and reader threads.

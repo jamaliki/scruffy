@@ -897,7 +897,7 @@ class SlurmLaunchTests(unittest.TestCase):
             document["logs"],
         )
 
-    def test_worker_gets_managed_cpu_pool_not_individual_job_budget(self) -> None:
+    def test_slurm_step_requests_the_individual_job_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = mock.Mock(
@@ -921,7 +921,9 @@ class SlurmLaunchTests(unittest.TestCase):
                 root / "stderr.log",
             )
 
-        self.assertIn("--cpus-per-task=112", argv)
+        self.assertIn("--gpus-per-node=1", argv)
+        self.assertIn("--cpus-per-task=14", argv)
+        self.assertNotIn("--overlap", argv)
         self.assertEqual(14, assigned.request.cpus_per_node)
 
 

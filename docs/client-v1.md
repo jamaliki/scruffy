@@ -319,10 +319,11 @@ detect a filesystem that silently treats these locks as node-local.
 
 For each accepted job, Scruffy writes immutable mode-0444 request, launch, and
 result records under `provenance/JOB_ID/`. The launch record is injected as
-`SCRUFFY_PROVENANCE_PATH`; it contains exact argv, placement, resource request,
-and concrete dependency attempts. `SCRUFFY_ASSIGNMENT_SHA256` identifies the
-exact reservation. Provenance stores an environment digest, not raw environment
-values.
+`SCRUFFY_PROVENANCE_PATH`; it contains exact argv, scheduler reservation,
+resource request, and concrete dependency attempts. `SCRUFFY_ASSIGNMENT_SHA256`
+identifies that reservation. In Slurm mode, `SCRUFFY_GPU_IDS` is the
+authoritative step-selected GPU visibility. Provenance stores an environment
+digest, not raw environment values.
 
 The controller numbers immutable task attempts but does not invent retries,
 dynamically fan out workflow tasks, or store artifact bytes. Clients submit

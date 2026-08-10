@@ -18,7 +18,12 @@ from scruffy.slurm import (
     live_steps,
     load_inventory,
 )
-from scruffy.worker import current_node, execute_assignment, find_node_assignment
+from scruffy.worker import (
+    assigned_gpu_ids,
+    current_node,
+    execute_assignment,
+    find_node_assignment,
+)
 
 
 class SlurmArgumentTests(unittest.TestCase):
@@ -32,6 +37,7 @@ class SlurmArgumentTests(unittest.TestCase):
             stdout_file=Path("/shared/scruffy/jobs/job-1/stdout.log"),
             stderr_file=Path("/shared/scruffy/jobs/job-1/stderr.log"),
             node_names=["gpu-3", "gpu-5"],
+            gpus_per_node=2,
             cpus_per_node=28,
             memory_gb_per_node=256,
             wait_seconds=45,
@@ -42,12 +48,13 @@ class SlurmArgumentTests(unittest.TestCase):
                 "srun",
                 "--jobid=240292",
                 "--job-name=scruffy-launch-token",
-                "--overlap",
                 "--exact",
                 "--nodes=2",
                 "--nodelist=gpu-3,gpu-5",
                 "--ntasks=2",
                 "--ntasks-per-node=1",
+                "--gpus-per-node=2",
+                "--gpu-bind=none",
                 "--cpus-per-task=28",
                 "--cpu-bind=none",
                 "--mem=256G",
@@ -74,6 +81,7 @@ class SlurmArgumentTests(unittest.TestCase):
                 stdout_file=Path("stdout.log"),
                 stderr_file=Path("stderr.log"),
                 node_names=["gpu-3"],
+                gpus_per_node=1,
                 cpus_per_node=1,
                 memory_gb_per_node=1,
             )
@@ -86,12 +94,30 @@ class SlurmArgumentTests(unittest.TestCase):
             stdout_file=Path("stdout.log"),
             stderr_file=Path("stderr.log"),
             node_names=["gpu-3"],
+            gpus_per_node=1,
             cpus_per_node=1,
             memory_gb_per_node=1,
         )
 
         self.assertIn("--wait=0", argv)
         self.assertIn("--wait-for-children", argv)
+
+    def test_cpu_only_step_explicitly_requests_no_gres(self) -> None:
+        argv = build_srun_argv(
+            slurm_job_id="240292",
+            name="scruffy-token",
+            assignment_file=Path("assignment.json"),
+            stdout_file=Path("stdout.log"),
+            stderr_file=Path("stderr.log"),
+            node_names=["gpu-3"],
+            gpus_per_node=0,
+            cpus_per_node=1,
+            memory_gb_per_node=1,
+        )
+
+        self.assertIn("--gres=none", argv)
+        self.assertFalse(any(item.startswith("--gpus-per-node=") for item in argv))
+        self.assertNotIn("--gpu-bind=none", argv)
 
     def test_srun_does_not_inherit_controller_placement(self) -> None:
         with mock.patch.dict(
@@ -102,6 +128,11 @@ class SlurmArgumentTests(unittest.TestCase):
                 "SLURM_CPU_BIND_LIST": "0x1",
                 "SLURM_CPU_BIND_TYPE": "mask_cpu",
                 "SLURM_CPU_BIND_VERBOSE": "verbose",
+                "SLURM_GPU_BIND": "closest",
+                "SLURM_GPUS_PER_NODE": "8",
+                "SLURM_GRES": "gpu:8",
+                "SLURM_TRES_BIND": "gres/gpu:closest",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
                 "KEPT": "yes",
             },
             clear=True,
@@ -112,6 +143,11 @@ class SlurmArgumentTests(unittest.TestCase):
         self.assertFalse(
             any(name.startswith("SLURM_CPU_BIND") for name in environment)
         )
+        self.assertNotIn("SLURM_GPU_BIND", environment)
+        self.assertNotIn("SLURM_GPUS_PER_NODE", environment)
+        self.assertNotIn("SLURM_GRES", environment)
+        self.assertNotIn("SLURM_TRES_BIND", environment)
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", environment)
         self.assertEqual("yes", environment["KEPT"])
 
 
@@ -315,6 +351,16 @@ class SlurmReconciliationTests(unittest.TestCase):
 
 
 class WorkerPlacementTests(unittest.TestCase):
+    def test_cpu_only_slurm_worker_has_no_visible_gpus(self) -> None:
+        self.assertEqual(
+            (),
+            assigned_gpu_ids(
+                {"slurm_managed_gpus": True, "gpus_per_node": 0},
+                {"gpu_ids": []},
+                {},
+            ),
+        )
+
     def test_controller_node_identity_wins_inside_an_existing_slurm_step(self) -> None:
         with mock.patch.dict(
             os.environ,
@@ -359,7 +405,7 @@ class WorkerPlacementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ambiguous"):
             find_node_assignment(document, "gpu-3")
 
-    def test_worker_overrides_submitted_gpu_visibility(self) -> None:
+    def test_local_worker_overrides_submitted_gpu_visibility(self) -> None:
         document = {
             "root": "/shared/scruffy",
             "job_id": "job-1",
@@ -404,6 +450,62 @@ class WorkerPlacementTests(unittest.TestCase):
         self.assertEqual("gpu-5.cluster", environment["SCRUFFY_NODE"])
         self.assertEqual("PCI_BUS_ID", environment["CUDA_DEVICE_ORDER"])
         self.assertEqual("4,6", environment["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual("4,6", environment["SCRUFFY_GPU_IDS"])
+
+    def test_slurm_worker_preserves_the_step_gpu_selection(self) -> None:
+        document = {
+            "root": "/shared/scruffy",
+            "job_id": "job-1",
+            "argv": ["python", "train.py"],
+            "cwd": "/work/job-1",
+            "env": {"CUDA_VISIBLE_DEVICES": "99"},
+            "assignment": [{"node": "gpu-5", "gpu_ids": [0, 1]}],
+            "slurm_managed_gpus": True,
+            "gpus_per_node": 2,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "assignment.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CUDA_VISIBLE_DEVICES": "4,6",
+                        "SLURM_STEP_GPUS": "4,6",
+                    },
+                    clear=True,
+                ),
+                mock.patch("scruffy.worker.current_node", return_value="gpu-5"),
+                mock.patch("scruffy.worker.os.chdir"),
+                mock.patch("scruffy.worker.os.execvpe") as execvpe,
+            ):
+                execute_assignment(source)
+
+        environment = execvpe.call_args.args[2]
+        self.assertEqual("4,6", environment["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual("4,6", environment["SCRUFFY_GPU_IDS"])
+        self.assertEqual("4,6", environment["SCRUFFY_SLURM_GPU_IDS"])
+
+    def test_slurm_worker_rejects_an_incomplete_gpu_allocation(self) -> None:
+        document = {
+            "root": "/shared/scruffy",
+            "job_id": "job-1",
+            "argv": ["true"],
+            "cwd": "/work/job-1",
+            "env": {},
+            "assignment": [{"node": "gpu-5", "gpu_ids": [0, 1]}],
+            "slurm_managed_gpus": True,
+            "gpus_per_node": 2,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "assignment.json"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4"}, clear=True),
+                mock.patch("scruffy.worker.current_node", return_value="gpu-5"),
+                self.assertRaisesRegex(ValueError, "requested 2"),
+            ):
+                execute_assignment(source)
 
     def test_worker_exec_appends_directly_to_job_logs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

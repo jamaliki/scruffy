@@ -60,6 +60,31 @@ def redirect_output(logs: dict[str, Any]) -> None:
             os.close(descriptor)
 
 
+def assigned_gpu_ids(
+    document: dict[str, Any], placement: dict[str, Any], base_environment: dict[str, str]
+) -> tuple[str, ...]:
+    """Return the GPU tokens the workload is allowed to use.
+
+    Local mode uses Scruffy's reservation directly. In Slurm mode the step's
+    ``CUDA_VISIBLE_DEVICES`` is authoritative: Slurm may choose different
+    physical devices or express them as UUIDs rather than integer ordinals.
+    """
+
+    if not document.get("slurm_managed_gpus"):
+        return tuple(str(gpu_id) for gpu_id in placement["gpu_ids"])
+
+    requested = document.get("gpus_per_node")
+    if type(requested) is not int or requested < 0:
+        raise ValueError("invalid Slurm GPU request")
+    visible = base_environment.get("CUDA_VISIBLE_DEVICES", "")
+    gpu_ids = tuple(item.strip() for item in visible.split(",") if item.strip())
+    if len(gpu_ids) != requested or len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError(
+            f"Slurm exposed {len(gpu_ids)} GPUs but the job requested {requested}"
+        )
+    return gpu_ids
+
+
 def execute_assignment(source: Path) -> None:
     with source.open(encoding="utf-8") as handle:
         document = json.load(handle)
@@ -70,7 +95,9 @@ def execute_assignment(source: Path) -> None:
     if not command:
         raise ValueError("job command is empty")
 
-    environment = os.environ.copy()
+    base_environment = os.environ.copy()
+    gpu_ids = assigned_gpu_ids(document, placement, base_environment)
+    environment = base_environment.copy()
     environment.update({str(key): str(value) for key, value in document["env"].items()})
     root = str(Path(document["root"]).expanduser().resolve())
     job_id = str(document["job_id"])
@@ -81,9 +108,11 @@ def execute_assignment(source: Path) -> None:
     environment["SCRUFFY_PROJECT"] = job_project(document)
     environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
-    environment["SCRUFFY_GPU_IDS"] = ",".join(
-        str(gpu_id) for gpu_id in placement["gpu_ids"]
-    )
+    environment["SCRUFFY_GPU_IDS"] = ",".join(gpu_ids)
+    if document.get("slurm_managed_gpus") and base_environment.get(
+        "SLURM_STEP_GPUS"
+    ):
+        environment["SCRUFFY_SLURM_GPU_IDS"] = base_environment["SLURM_STEP_GPUS"]
     if document.get("provenance_path") is not None:
         environment["SCRUFFY_PROVENANCE_PATH"] = str(document["provenance_path"])
     if document.get("assignment_sha256") is not None:
@@ -99,10 +128,9 @@ def execute_assignment(source: Path) -> None:
         if value is not None:
             environment[variable] = str(value)
     # Apply this last: jobs submitted through the API cannot choose another slot.
+    # In Slurm mode these are the tokens selected by the step GRES allocation.
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    environment["CUDA_VISIBLE_DEVICES"] = ",".join(
-        str(gpu_id) for gpu_id in placement["gpu_ids"]
-    )
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
 
     logs = document.get("logs")
     if logs is not None:

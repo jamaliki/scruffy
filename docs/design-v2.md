@@ -35,15 +35,17 @@ An accepted job has three immutable records under `provenance/JOB_ID/`:
 
 - `request.json`: accepted command, cwd, resource contract, logical task
   identity, dependency declarations, and an environment digest.
-- `launch.json`: concrete dependency attempts, allocation, node/GPU placement,
-  start/deadline, and a digest of the request record.
-- `result.json`: terminal state, structured reason, exit status, final placement,
-  and output byte counts.
+- `launch.json`: concrete dependency attempts, allocation, node/resource
+  reservation, start/deadline, and a digest of the request record.
+- `result.json`: terminal state, structured reason, exit status, final scheduler
+  reservation, and output byte counts.
 
 The workload receives the absolute launch-record path as
 `SCRUFFY_PROVENANCE_PATH` and its concrete reservation digest as
 `SCRUFFY_ASSIGNMENT_SHA256`. It also receives controller-owned job, project,
-workflow, task, attempt, node, and GPU identity variables.
+workflow, task, attempt, node, and GPU identity variables. In Slurm mode the
+workload GPU tokens come from the step allocation rather than the scheduler's
+admission-slot IDs.
 
 Raw environment values remain in the protected live queue state only; immutable
 provenance stores their canonical digest. Provenance stays outside the removable
@@ -57,6 +59,12 @@ It is cleared only after process and launcher reconciliation prove release safe.
 
 This distinction permits terminal inspection and provenance without risking a
 false live reservation or weakening the no-overlap invariant.
+
+In Slurm mode the controller requests each reservation as a non-overlapping job
+step with explicit GPU, CPU, and memory counts. Slurm selects the physical GPUs
+and sets `CUDA_VISIBLE_DEVICES`; the worker validates its count and preserves
+it. Scruffy's per-node GPU IDs are deterministic admission slots used to decide
+whether a request fits, not a second physical-device allocator.
 
 CPU-only work uses the same ledger with an empty GPU tuple. CPU and memory remain
 positive reservations, so CPU jobs can never consume node resources invisibly.
