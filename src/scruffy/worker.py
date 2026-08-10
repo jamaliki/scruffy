@@ -54,7 +54,7 @@ def _runtime_placement_record(
     visible: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
-        "schema": 1,
+        "schema": document["runtime_placement_contract"],
         "job_id": str(document["job_id"]),
         "node": str(placement["node"]),
         "requested_gpus": expected,
@@ -71,6 +71,9 @@ def _slurm_gpu_environment(
     document: dict[str, Any], placement: dict[str, Any]
 ) -> tuple[dict[str, str], dict[str, Any]]:
     expected = document.get("gpus_per_node")
+    contract = document.get("runtime_placement_contract")
+    if type(contract) is not int or contract != 1:
+        raise ValueError("unsupported runtime placement contract")
     if type(expected) is not int or expected <= 0:
         raise ValueError("gpus_per_node must be a positive integer")
     if len(placement["gpu_ids"]) != expected:

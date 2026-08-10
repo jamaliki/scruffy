@@ -113,6 +113,9 @@ agents; reading does not consume events for anyone else. Use
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the
   recovered snapshot, then run `scruffy resume`; do not resubmit attached jobs.
+  A reattached pre-contract step may retain a successful process result, but
+  `runtime_placement_status: legacy_unavailable` means it is not authenticated
+  placement evidence. Deploy placement-contract changes in a fresh allocation.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
 - Slurm worker steps request their exact admitted GPU, CPU, and memory shape and
   do not use `--overlap`. GPU exclusivity covers only work submitted through

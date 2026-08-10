@@ -821,6 +821,8 @@ class SlurmLaunchTests(unittest.TestCase):
         )
         self.assertEqual("slurm", assignment_document["launcher"])
         self.assertEqual("240292", assignment_document["slurm_job_id"])
+        self.assertEqual(1, assignment_document["runtime_placement_contract"])
+        self.assertEqual(1, job["runtime_placement_contract"])
         self.assertEqual(1, assignment_document["gpus_per_node"])
         self.assertEqual(
             "jobs/job-1/runtime-placement-0.json",
@@ -847,6 +849,7 @@ class RuntimePlacementAuthorityTests(unittest.TestCase):
     def _job(self) -> dict[str, object]:
         job = job_image("job-1", "gpu-3")
         job["slurm_step_id"] = "240292.7"
+        job["runtime_placement_contract"] = 1
         job["runtime_placement_files"] = [
             "jobs/job-1/runtime-placement-0.json"
         ]
@@ -877,6 +880,7 @@ class RuntimePlacementAuthorityTests(unittest.TestCase):
         _finish_job(self.controller, "job-1", RunningProcess(mock.Mock(), None), 0)
 
         self.assertEqual("succeeded", job["state"])
+        self.assertEqual("authenticated", job["runtime_placement_status"])
         self.assertEqual(
             [
                 {
@@ -915,10 +919,43 @@ class RuntimePlacementAuthorityTests(unittest.TestCase):
 
                 self.assertEqual("failed", job["state"])
                 self.assertEqual("runtime_placement_invalid", job["reason"])
+                self.assertEqual("invalid", job["runtime_placement_status"])
                 self.assertIn("runtime_placement_error", job)
                 if source.exists():
                     source.chmod(0o644)
                     source.unlink()
+
+    def test_new_contract_success_fails_closed_when_authority_is_missing(self) -> None:
+        job = self._job()
+
+        _finish_job(self.controller, "job-1", RunningProcess(mock.Mock(), None), 0)
+
+        self.assertEqual("failed", job["state"])
+        self.assertEqual("runtime_placement_invalid", job["reason"])
+        self.assertEqual("invalid", job["runtime_placement_status"])
+        self.assertIn("runtime-placement-0.json", job["runtime_placement_error"])
+
+    def test_legacy_reattached_results_are_preserved_but_not_authenticated(self) -> None:
+        for returncode, expected_state in ((0, "succeeded"), (1, "failed")):
+            with self.subTest(returncode=returncode):
+                job = job_image("job-1", "gpu-3")
+                job["slurm_step_id"] = "240292.7"
+                self.controller.state["jobs"]["job-1"] = job
+
+                _finish_job(
+                    self.controller,
+                    "job-1",
+                    RunningProcess(mock.Mock(), None),
+                    returncode,
+                )
+
+                self.assertEqual(expected_state, job["state"])
+                self.assertEqual("process_exit", job["reason"])
+                self.assertEqual(
+                    "legacy_unavailable", job["runtime_placement_status"]
+                )
+                self.assertNotIn("runtime_placements", job)
+                self.assertNotIn("runtime_placement_error", job)
 
 
 class AsyncCommandRaceTests(unittest.TestCase):
@@ -1867,6 +1904,7 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
             {
                 "launch_token": "scruffy-token",
                 "slurm_step_id": "240292.7",
+                "runtime_placement_contract": 1,
                 "runtime_placement_files": [
                     "jobs/job-a/runtime-placement-0.json"
                 ],
@@ -1912,6 +1950,41 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
 
         self.assertEqual("succeeded", job["state"])
         self.assertNotIn("job-a", self.controller.running)
+
+    def test_legacy_reattached_rc0_and_rc1_keep_process_results(self) -> None:
+        for returncode, expected_state in ((0, "succeeded"), (1, "failed")):
+            with self.subTest(returncode=returncode):
+                job = job_image("job-legacy", "gpu-3")
+                job.update(
+                    {
+                        "launch_token": "legacy-token",
+                        "slurm_step_id": "240292.8",
+                        "stdout": "jobs/job-legacy/stdout.log",
+                        "stderr": "jobs/job-legacy/stderr.log",
+                    }
+                )
+                self.controller.state["jobs"] = {"job-legacy": job}
+                running = RunningProcess(None, "legacy-token")
+                running.closed_streams.update({"stdout", "stderr"})
+                self.controller.running = {"job-legacy": running}
+                self.controller.slurm_snapshot_at += 1
+                self.controller.slurm_steps = ()
+
+                with (
+                    mock.patch("scruffy.lifecycle.refresh_slurm_snapshot"),
+                    mock.patch(
+                        "scruffy.lifecycle.completed_step",
+                        return_value=SlurmStepResult("COMPLETED", returncode),
+                    ),
+                ):
+                    poll_processes(self.controller)
+
+                self.assertEqual(expected_state, job["state"])
+                self.assertEqual(
+                    "legacy_unavailable", job["runtime_placement_status"]
+                )
+                self.assertNotIn("runtime_placements", job)
+                self.assertNotIn("job-legacy", self.controller.running)
 
 
 class OutputCoalescingTests(unittest.TestCase):

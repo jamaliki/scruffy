@@ -37,6 +37,7 @@ from .storage import (
 )
 
 MAX_MESSAGES_PER_TICK = 256
+RUNTIME_PLACEMENT_CONTRACT = 1
 
 _RUNTIME_PLACEMENT_KEYS = {
     "schema",
@@ -212,6 +213,7 @@ def start_job(
     job["started_at"] = utc_now()
     if controller.launcher == "slurm":
         job["launch_token"] = new_step_name()
+        job["runtime_placement_contract"] = RUNTIME_PLACEMENT_CONTRACT
         job["runtime_placement_files"] = [
             f"jobs/{job['id']}/runtime-placement-{index}.json"
             for index, _ in enumerate(assignment.reservations)
@@ -228,6 +230,7 @@ def start_job(
         "project_id": job_project(job),
         "launcher": controller.launcher,
         "slurm_job_id": controller.slurm_job_id,
+        "runtime_placement_contract": job.get("runtime_placement_contract"),
         "gpus_per_node": assignment.request.gpus_per_node,
         "argv": job["argv"],
         "cwd": job["cwd"],
@@ -405,13 +408,25 @@ def _finish_job(
         state, reason = "failed", "process_exit"
     runtime_placements = None
     placement_error = None
+    placement_status = None
     if controller.launcher == "slurm":
-        try:
-            runtime_placements = _runtime_placement_authority(controller, job)
-        except (KeyError, OSError, StorageError, TypeError, ValueError) as exc:
-            placement_error = str(exc)
+        contract = job.get("runtime_placement_contract")
+        if contract is None:
+            placement_status = "legacy_unavailable"
+        elif type(contract) is not int or contract != RUNTIME_PLACEMENT_CONTRACT:
+            placement_status = "invalid"
+            placement_error = "unsupported runtime placement contract"
             if state == "succeeded":
                 state, reason = "failed", "runtime_placement_invalid"
+        else:
+            try:
+                runtime_placements = _runtime_placement_authority(controller, job)
+                placement_status = "authenticated"
+            except (KeyError, OSError, StorageError, TypeError, ValueError) as exc:
+                placement_status = "invalid"
+                placement_error = str(exc)
+                if state == "succeeded":
+                    state, reason = "failed", "runtime_placement_invalid"
     job.update(
         {
             "state": state,
@@ -428,6 +443,8 @@ def _finish_job(
         job.pop("runtime_placement_error", None)
     elif placement_error is not None:
         job["runtime_placement_error"] = placement_error
+    if placement_status is not None:
+        job["runtime_placement_status"] = placement_status
     job.pop("pid", None)
     job.pop("pending_returncode", None)
     for stream_name in ("stdout", "stderr"):

@@ -42,6 +42,13 @@ ledger identity. Local development mode still maps the reservation directly.
 Scruffy trusts every process able to write `SCRUFFY_ROOT`; it is not a multi-user
 security boundary.
 
+Placement-aware launches carry `runtime_placement_contract: 1` and cannot
+succeed without authenticated placement records. A same-allocation controller
+upgrade may reattach older steps; those retain their process result but are
+explicitly marked `runtime_placement_status: legacy_unavailable` and must not be
+treated as placement-authenticated scientific evidence. Prefer deploying this
+change in a fresh allocation after every older step has terminated.
+
 ## Quick start
 
 From a checkout, `uv` needs no separate installation step:
