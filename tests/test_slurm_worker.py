@@ -11,10 +11,12 @@ from pathlib import Path
 from unittest import mock
 
 from scruffy.slurm import (
+    AllocationIncarnation,
     build_srun_argv,
     build_srun_environment,
     cancel_step,
     completed_step,
+    discover_slurm_allocation,
     discover_slurm_inventory,
     live_steps,
     load_inventory,
@@ -309,6 +311,8 @@ class InventoryTests(unittest.TestCase):
                     "errors": [],
                     "jobs": [
                         {
+                            "job_id": 263105,
+                            "restart_cnt": 0,
                             "nodes": "gpu-[0,5,8,13]",
                             "tres_alloc_str": (
                                 "cpu=448,mem=8160440M,node=4,gres/gpu=32"
@@ -328,6 +332,49 @@ class InventoryTests(unittest.TestCase):
             self.assertEqual(112, node.cpus)
             self.assertEqual(1992, node.memory_gb)
 
+    def test_discovery_binds_restart_count_and_full_uncapped_inventory(self) -> None:
+        allocation = mock.Mock(
+            stdout=json.dumps(
+                {
+                    "errors": [],
+                    "jobs": [
+                        {
+                            "job_id": 263105,
+                            "restart_cnt": 3,
+                            "nodes": "gpu-[5,3]",
+                            "tres_alloc_str": "cpu=224,mem=4080220M,gres/gpu=16",
+                        }
+                    ],
+                }
+            )
+        )
+        hostnames = mock.Mock(stdout="gpu-5\ngpu-3\n")
+        with mock.patch(
+            "scruffy.slurm.subprocess.run", side_effect=[allocation, hostnames]
+        ):
+            managed, incarnation = discover_slurm_allocation(
+                slurm_job_id="263105",
+                gpus_per_node=4,
+                cpus_per_node=56,
+                memory_gb_per_node=512,
+            )
+
+        self.assertEqual(3, incarnation.restart_count)
+        self.assertEqual(
+            ["gpu-3", "gpu-5"], [item.name for item in incarnation.inventory]
+        )
+        self.assertTrue(all(len(item.gpu_ids) == 8 for item in incarnation.inventory))
+        self.assertTrue(all(len(item.gpu_ids) == 4 for item in managed.values()))
+        self.assertEqual(
+            incarnation,
+            AllocationIncarnation.from_dict(incarnation.to_dict()),
+        )
+
+        forged = incarnation.to_dict()
+        forged["restart_count"] = 4
+        with self.assertRaisesRegex(ValueError, "digest differs"):
+            AllocationIncarnation.from_dict(forged)
+
     def test_explicit_resource_values_are_caps_on_discovered_capacity(self) -> None:
         allocation = mock.Mock(
             stdout=json.dumps(
@@ -335,6 +382,8 @@ class InventoryTests(unittest.TestCase):
                     "errors": [],
                     "jobs": [
                         {
+                            "job_id": 263105,
+                            "restart_cnt": 0,
                             "nodes": "gpu-0",
                             "tres_alloc_str": "cpu=112,mem=2040110M,gres/gpu:h100=8",
                         }
@@ -363,6 +412,8 @@ class InventoryTests(unittest.TestCase):
                     "errors": [],
                     "jobs": [
                         {
+                            "job_id": 263105,
+                            "restart_cnt": 0,
                             "nodes": "gpu-0",
                             "tres_alloc_str": "cpu=112,mem=2040110M,gres/gpu=8",
                         }
@@ -568,6 +619,7 @@ class WorkerPlacementTests(unittest.TestCase):
                 "job_id": "job-1",
                 "project_id": "science",
                 "launcher": "slurm",
+                "allocation_incarnation_sha256": "a" * 64,
                 "runtime_placement_contract": 1,
                 "slurm_job_id": "263105",
                 "gpus_per_node": 2,
@@ -580,6 +632,7 @@ class WorkerPlacementTests(unittest.TestCase):
                     "SLURM_STEP_ID": "spoofed",
                     "SLURM_JOB_GPUS": "99",
                     "SCRUFFY_GPU_IDS": "99",
+                    "SCRUFFY_ALLOCATION_INCARNATION_SHA256": "f" * 64,
                     "SCRUFFY_PHYSICAL_GPU_IDS": "99",
                     "SCRUFFY_STEP_GPU_IDS": "99",
                     "SCRUFFY_RESERVED_GPU_IDS": "99",
@@ -620,6 +673,9 @@ class WorkerPlacementTests(unittest.TestCase):
             self.assertEqual("4,6", environment["SCRUFFY_RESERVED_GPU_IDS"])
             self.assertEqual("263105", environment["SCRUFFY_SLURM_JOB_ID"])
             self.assertEqual("42", environment["SCRUFFY_SLURM_STEP_ID"])
+            self.assertEqual(
+                "a" * 64, environment["SCRUFFY_ALLOCATION_INCARNATION_SHA256"]
+            )
             placement_file = root.resolve() / "jobs/job-1/runtime-placement-0.json"
             self.assertEqual(str(placement_file), environment["SCRUFFY_RUNTIME_PLACEMENT"])
             metadata = placement_file.stat()
@@ -655,11 +711,59 @@ class WorkerPlacementTests(unittest.TestCase):
                 second_exec.assert_not_called()
             self.assertEqual(original, placement_file.read_bytes())
 
+    def test_slurm_worker_requires_a_canonical_incarnation_binding(self) -> None:
+        document = {
+            "root": "/shared/scruffy",
+            "job_id": "job-1",
+            "launcher": "slurm",
+            "runtime_placement_contract": 1,
+            "slurm_job_id": "263105",
+            "gpus_per_node": 1,
+            "argv": ["true"],
+            "cwd": "/tmp",
+            "env": {},
+            "assignment": [
+                {
+                    "node": "gpu-5",
+                    "gpu_ids": [4],
+                    "runtime_placement": "jobs/job-1/runtime-placement-0.json",
+                }
+            ],
+        }
+        for binding in (None, "A" * 64, "a" * 63, True):
+            with self.subTest(binding=binding):
+                candidate = dict(document)
+                if binding is not None:
+                    candidate["allocation_incarnation_sha256"] = binding
+                with tempfile.TemporaryDirectory() as temporary:
+                    source = Path(temporary) / "assignment.json"
+                    source.write_text(json.dumps(candidate), encoding="utf-8")
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {
+                                "SLURM_JOB_ID": "263105",
+                                "SLURM_STEP_ID": "42",
+                                "SLURM_STEP_GPUS": "2",
+                                "CUDA_VISIBLE_DEVICES": "0",
+                            },
+                            clear=True,
+                        ),
+                        mock.patch(
+                            "scruffy.worker.current_node", return_value="gpu-5"
+                        ),
+                        mock.patch("scruffy.worker.os.execvpe") as execvpe,
+                        self.assertRaisesRegex(ValueError, "incarnation"),
+                    ):
+                        execute_assignment(source)
+                    execvpe.assert_not_called()
+
     def test_slurm_worker_rejects_missing_or_wrong_gpu_mapping(self) -> None:
         document = {
             "root": "/shared/scruffy",
             "job_id": "job-1",
             "launcher": "slurm",
+            "allocation_incarnation_sha256": "a" * 64,
             "runtime_placement_contract": 1,
             "slurm_job_id": "263105",
             "gpus_per_node": 2,
@@ -707,6 +811,7 @@ class WorkerPlacementTests(unittest.TestCase):
             "root": "/shared/scruffy",
             "job_id": "job-1",
             "launcher": "slurm",
+            "allocation_incarnation_sha256": "a" * 64,
             "runtime_placement_contract": 1,
             "slurm_job_id": "263105",
             "gpus_per_node": 1,

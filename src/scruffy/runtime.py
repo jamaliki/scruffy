@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
 from .models import NodeInventory
-from .slurm import SlurmStep
+from .slurm import AllocationIncarnation, SlurmStep
 
 MessageQueue = queue.SimpleQueue[dict[str, Any]]
 MAX_OUTPUT_EVENT_BYTES = 65536
@@ -101,6 +101,7 @@ class Controller:
     journal: TextIO
     messages: MessageQueue
     output: OutputNotifier
+    allocation_incarnation: AllocationIncarnation | None = None
     running: dict[str, RunningProcess] = field(default_factory=dict)
     stopping: bool = False
     stop_announced: bool = False

@@ -212,7 +212,12 @@ def start_job(
     job["state"] = "starting"
     job["started_at"] = utc_now()
     if controller.launcher == "slurm":
+        if controller.allocation_incarnation is None:
+            raise RuntimeError("Slurm controller has no allocation incarnation")
         job["launch_token"] = new_step_name()
+        job["allocation_incarnation_sha256"] = (
+            controller.allocation_incarnation.fingerprint_sha256
+        )
         job["runtime_placement_contract"] = RUNTIME_PLACEMENT_CONTRACT
         job["runtime_placement_files"] = [
             f"jobs/{job['id']}/runtime-placement-{index}.json"
@@ -230,6 +235,9 @@ def start_job(
         "project_id": job_project(job),
         "launcher": controller.launcher,
         "slurm_job_id": controller.slurm_job_id,
+        "allocation_incarnation_sha256": job.get(
+            "allocation_incarnation_sha256"
+        ),
         "runtime_placement_contract": job.get("runtime_placement_contract"),
         "gpus_per_node": assignment.request.gpus_per_node,
         "argv": job["argv"],

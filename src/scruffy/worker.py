@@ -23,6 +23,7 @@ _SLURM_GPU_ENVIRONMENT = (
     "SLURM_STEPID",
 )
 _SCRUFFY_GPU_ENVIRONMENT = (
+    "SCRUFFY_ALLOCATION_INCARNATION_SHA256",
     "SCRUFFY_GPU_IDS",
     "SCRUFFY_PHYSICAL_GPU_IDS",
     "SCRUFFY_RESERVED_GPU_IDS",
@@ -184,6 +185,16 @@ def execute_assignment(source: Path) -> None:
     for name in _SCRUFFY_GPU_ENVIRONMENT:
         environment.pop(name, None)
     if document.get("launcher") == "slurm":
+        incarnation_sha256 = document.get("allocation_incarnation_sha256")
+        if (
+            not isinstance(incarnation_sha256, str)
+            or len(incarnation_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in incarnation_sha256
+            )
+        ):
+            raise ValueError("Slurm assignment has no allocation incarnation")
         protected_gpu_environment, record = _slurm_gpu_environment(document, placement)
         for name in _SLURM_GPU_ENVIRONMENT:
             if name in os.environ:
@@ -191,6 +202,7 @@ def execute_assignment(source: Path) -> None:
             else:
                 environment.pop(name, None)
         environment.update(protected_gpu_environment)
+        environment["SCRUFFY_ALLOCATION_INCARNATION_SHA256"] = incarnation_sha256
         runtime_placement, placement_sha256 = _publish_runtime_placement(
             root, placement, record
         )

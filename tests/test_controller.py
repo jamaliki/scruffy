@@ -23,6 +23,7 @@ from scruffy.client import (
 )
 from scruffy.controller import run_controller
 from scruffy.models import NodeInventory, ResourceRequest
+from scruffy.slurm import AllocationIncarnation
 from scruffy.storage import read_events, submit_request, utc_now
 
 TIMEOUT = 12.0
@@ -31,6 +32,11 @@ REQUEST = ResourceRequest(
     gpus_per_node=1,
     cpus_per_node=1,
     memory_gb_per_node=1,
+)
+SLURM_INCARNATION = AllocationIncarnation(
+    slurm_job_id="123",
+    restart_count=0,
+    inventory=(NodeInventory("gpu-0", (0,), 1, 1),),
 )
 
 
@@ -53,6 +59,7 @@ class ControllerRetryTests(unittest.TestCase):
                     launcher="slurm",
                     allocation_id="123",
                     slurm_job_id="123",
+                    allocation_incarnation=SLURM_INCARNATION,
                 )
 
         self.assertEqual(2, initialize.call_count)
@@ -83,6 +90,7 @@ class ControllerRetryTests(unittest.TestCase):
                     launcher="slurm",
                     allocation_id="123",
                     slurm_job_id="123",
+                    allocation_incarnation=SLURM_INCARNATION,
                 )
 
         self.assertEqual(2, initialize.call_count)

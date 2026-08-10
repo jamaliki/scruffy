@@ -46,7 +46,7 @@ from scruffy.models import (
     ResourceRequest,
 )
 from scruffy.runtime import Controller, OutputNotifier, RunningProcess
-from scruffy.slurm import SlurmStep, SlurmStepResult
+from scruffy.slurm import AllocationIncarnation, SlurmStep, SlurmStepResult
 from scruffy.slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
 from scruffy.state import compact_journal, emit, load_recovered_state
 from scruffy.storage import (
@@ -69,6 +69,19 @@ from scruffy.storage import (
 from scruffy.workflows import resolve_blocked_jobs
 
 REQUEST = ResourceRequest(1, 1, 1, 1)
+
+
+def slurm_incarnation(
+    job_id: str = "240292",
+    *,
+    restart_count: int = 0,
+    node: str = "gpu-3",
+) -> AllocationIncarnation:
+    return AllocationIncarnation(
+        slurm_job_id=job_id,
+        restart_count=restart_count,
+        inventory=(NodeInventory(node, (0,), 2, 2),),
+    )
 
 
 def assignment(job_id: str, node: str, gpu_id: int = 0) -> Assignment:
@@ -157,18 +170,25 @@ class RecoverySafetyTests(unittest.TestCase):
         job = job_image("job-active", "gpu-3")
         job["launch_token"] = "scruffy-token"
         job["slurm_step_id"] = "240292.7"
-        with open_journal(self.root) as journal:
-            append_event(
-                journal,
-                {
-                    "seq": 1,
-                    "kind": "job.running",
-                    "allocation_id": "240292",
-                    "job_id": job["id"],
-                    "job": job,
+        current_incarnation = slurm_incarnation()
+        job["allocation_incarnation_sha256"] = (
+            current_incarnation.fingerprint_sha256
+        )
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {
+                    "id": "240292",
+                    "incarnation": current_incarnation.to_dict(),
                 },
-                sync=True,
-            )
+                "nodes": {},
+                "jobs": {"job-active": job},
+                "draining": False,
+            },
+        )
 
         controller = _initialize_controller(
             root=self.root,
@@ -176,6 +196,7 @@ class RecoverySafetyTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="240292",
             slurm_job_id="240292",
+            allocation_incarnation=current_incarnation,
             poll_interval=0.1,
             cancel_grace=30,
         )
@@ -187,6 +208,191 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual("running", controller.state["jobs"]["job-active"]["state"])
         self.assertIsNotNone(controller.state["jobs"]["job-active"]["assignment"])
         self.assertTrue(controller.state["launches_paused"])
+
+    def test_journal_rebuild_retains_incarnation_for_strict_reattach(self) -> None:
+        incarnation = slurm_incarnation()
+        first = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=incarnation,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        job = job_image("job-journal", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-journal",
+                "allocation_incarnation_sha256": incarnation.fingerprint_sha256,
+            }
+        )
+        first.state["jobs"][job["id"]] = job
+        emit(first, "job.running", job=job)
+        first.journal.close()
+        (self.root / "state.json").unlink()
+
+        recovered = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=incarnation,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: recovered.journal.close())
+
+        self.assertIn("job-journal", recovered.running)
+        self.assertEqual(
+            incarnation.to_dict(), recovered.state["allocation"]["incarnation"]
+        )
+
+    def test_same_job_id_with_new_restart_count_loses_old_steps(self) -> None:
+        previous = slurm_incarnation(restart_count=0)
+        current = slurm_incarnation(restart_count=1)
+        job = job_image("job-stale", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-stale",
+                "allocation_incarnation_sha256": previous.fingerprint_sha256,
+            }
+        )
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "240292", "incarnation": previous.to_dict()},
+                "nodes": {},
+                "jobs": {job["id"]: job},
+                "draining": False,
+            },
+        )
+
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=current,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        recovered = controller.state["jobs"]["job-stale"]
+        self.assertEqual("lost", recovered["state"])
+        self.assertEqual("allocation_incarnation_changed", recovered["reason"])
+        self.assertIsNone(recovered["assignment"])
+        self.assertIsNotNone(recovered["last_assignment"])
+        self.assertNotIn("job-stale", controller.running)
+        self.assertEqual(
+            current.fingerprint_sha256,
+            controller.state["allocation"]["incarnation"]["fingerprint_sha256"],
+        )
+
+    def test_same_restart_count_with_new_startup_inventory_loses_old_steps(self) -> None:
+        previous = slurm_incarnation(node="gpu-2")
+        current = slurm_incarnation(node="gpu-3")
+        job = job_image("job-old-node", "gpu-2")
+        job.update(
+            {
+                "launch_token": "scruffy-old-node",
+                "allocation_incarnation_sha256": previous.fingerprint_sha256,
+            }
+        )
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "240292", "incarnation": previous.to_dict()},
+                "nodes": {},
+                "jobs": {job["id"]: job},
+                "draining": False,
+            },
+        )
+
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=current,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        recovered = controller.state["jobs"]["job-old-node"]
+        self.assertEqual("lost", recovered["state"])
+        self.assertEqual("allocation_incarnation_changed", recovered["reason"])
+        self.assertNotIn("job-old-node", controller.running)
+
+    def test_legacy_active_job_is_not_upgraded_and_recovery_requires_resume(
+        self,
+    ) -> None:
+        legacy = job_image("job-legacy-active", "gpu-3")
+        legacy["launch_token"] = "scruffy-legacy"
+        replacement = job_image("job-replacement", "gpu-3")
+        replacement.update({"state": "queued", "assignment": None, "queue_order": 2})
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "240292"},
+                "nodes": {},
+                "jobs": {legacy["id"]: legacy, replacement["id"]: replacement},
+                "draining": False,
+            },
+        )
+
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=slurm_incarnation(restart_count=1),
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        recovered = controller.state["jobs"]["job-legacy-active"]
+        self.assertEqual("lost", recovered["state"])
+        self.assertEqual("allocation_incarnation_unavailable", recovered["reason"])
+        self.assertNotIn("allocation_incarnation_sha256", recovered)
+        self.assertTrue(controller.state["launches_paused"])
+        with mock.patch("scruffy.lifecycle.start_job") as start:
+            schedule(controller)
+        start.assert_not_called()
+
+        resume_queue(self.root)
+        _ingest_commands(controller)
+
+        def mark_started(
+            _controller: Controller,
+            queued: dict[str, object],
+            _assignment: Assignment,
+        ) -> None:
+            queued["state"] = "starting"
+
+        with mock.patch(
+            "scruffy.lifecycle.start_job", side_effect=mark_started
+        ) as start:
+            schedule(controller)
+        start.assert_called_once()
+        self.assertEqual("job-replacement", start.call_args.args[1]["id"])
 
     def test_same_allocation_restart_requires_explicit_resume_to_launch(self) -> None:
         queued = job_image("job-queued", "gpu-3")
@@ -234,6 +440,7 @@ class RecoverySafetyTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="240292",
             slurm_job_id="240292",
+            allocation_incarnation=slurm_incarnation(),
             poll_interval=0.1,
             cancel_grace=30,
         )
@@ -265,11 +472,12 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual(2, start.call_count)
 
     def test_same_slurm_allocation_refuses_job_without_launch_token(self) -> None:
+        incarnation = slurm_incarnation()
         state = {
             "v": 1,
             "queue_id": queue_id(self.root),
             "last_seq": 0,
-            "allocation": {"id": "240292"},
+            "allocation": {"id": "240292", "incarnation": incarnation.to_dict()},
             "nodes": {},
             "jobs": {"job-active": job_image("job-active", "gpu-3")},
             "draining": False,
@@ -283,9 +491,130 @@ class RecoverySafetyTests(unittest.TestCase):
                 launcher="slurm",
                 allocation_id="240292",
                 slurm_job_id="240292",
+                allocation_incarnation=incarnation,
                 poll_interval=0.1,
                 cancel_grace=30,
             )
+
+    def test_same_incarnation_refuses_active_job_without_exact_binding(self) -> None:
+        incarnation = slurm_incarnation()
+        job = job_image("job-active", "gpu-3")
+        job["launch_token"] = "scruffy-token"
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {
+                    "id": "240292",
+                    "incarnation": incarnation.to_dict(),
+                },
+                "nodes": {},
+                "jobs": {job["id"]: job},
+                "draining": False,
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "incarnation differs"):
+            _initialize_controller(
+                root=self.root,
+                inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+                launcher="slurm",
+                allocation_id="240292",
+                slurm_job_id="240292",
+                allocation_incarnation=incarnation,
+                poll_interval=0.1,
+                cancel_grace=30,
+            )
+
+    def test_malformed_persisted_incarnation_fails_closed(self) -> None:
+        incarnation = slurm_incarnation().to_dict()
+        incarnation["restart_count"] = 1
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "240292", "incarnation": incarnation},
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "invalid persisted"):
+            _initialize_controller(
+                root=self.root,
+                inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+                launcher="slurm",
+                allocation_id="240292",
+                slurm_job_id="240292",
+                allocation_incarnation=slurm_incarnation(),
+                poll_interval=0.1,
+                cancel_grace=30,
+            )
+
+    def test_persisted_incarnation_must_match_persisted_allocation_id(self) -> None:
+        incarnation = slurm_incarnation().to_dict()
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "other-job", "incarnation": incarnation},
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ID differs"):
+            _initialize_controller(
+                root=self.root,
+                inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+                launcher="slurm",
+                allocation_id="240292",
+                slurm_job_id="240292",
+                allocation_incarnation=slurm_incarnation(),
+                poll_interval=0.1,
+                cancel_grace=30,
+            )
+
+    def test_legacy_active_job_without_allocation_id_remains_paused(self) -> None:
+        legacy = job_image("job-legacy-active", "gpu-3")
+        legacy["launch_token"] = "scruffy-legacy"
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {legacy["id"]: legacy},
+                "draining": False,
+            },
+        )
+
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=slurm_incarnation(restart_count=1),
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        recovered = controller.state["jobs"][legacy["id"]]
+        self.assertEqual("lost", recovered["state"])
+        self.assertEqual("allocation_incarnation_unavailable", recovered["reason"])
+        self.assertTrue(controller.state["launches_paused"])
 
     def test_local_restart_with_active_jobs_always_fails_closed(self) -> None:
         state = {
@@ -332,6 +661,9 @@ class RecoverySafetyTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="new-allocation",
             slurm_job_id="new-allocation",
+            allocation_incarnation=slurm_incarnation(
+                "new-allocation", node="new-node"
+            ),
             poll_interval=0.01,
             cancel_grace=0,
         )
@@ -640,6 +972,9 @@ class RecoverySafetyTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="new-allocation",
             slurm_job_id="new-allocation",
+            allocation_incarnation=slurm_incarnation(
+                "new-allocation", node="new-node"
+            ),
             poll_interval=0.1,
             cancel_grace=30,
         )
@@ -748,6 +1083,7 @@ class SlurmLaunchTests(unittest.TestCase):
                 launcher="slurm",
                 allocation_id="240292",
                 slurm_job_id="240292",
+                allocation_incarnation=slurm_incarnation(),
                 poll_interval=0.1,
                 cancel_grace=30,
             )
@@ -821,6 +1157,14 @@ class SlurmLaunchTests(unittest.TestCase):
         )
         self.assertEqual("slurm", assignment_document["launcher"])
         self.assertEqual("240292", assignment_document["slurm_job_id"])
+        self.assertEqual(
+            slurm_incarnation().fingerprint_sha256,
+            assignment_document["allocation_incarnation_sha256"],
+        )
+        self.assertEqual(
+            slurm_incarnation().fingerprint_sha256,
+            job["allocation_incarnation_sha256"],
+        )
         self.assertEqual(1, assignment_document["runtime_placement_contract"])
         self.assertEqual(1, job["runtime_placement_contract"])
         self.assertEqual(1, assignment_document["gpus_per_node"])
@@ -841,6 +1185,7 @@ class RuntimePlacementAuthorityTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="240292",
             slurm_job_id="240292",
+            allocation_incarnation=slurm_incarnation(),
             poll_interval=0.1,
             cancel_grace=30,
         )
@@ -1730,6 +2075,7 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="240292",
             slurm_job_id="240292",
+            allocation_incarnation=slurm_incarnation(),
             poll_interval=0.1,
             cancel_grace=30,
             state={"queue_id": queue_id(root), "last_seq": 0, "jobs": {}, "nodes": {}},

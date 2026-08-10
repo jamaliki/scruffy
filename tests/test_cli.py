@@ -10,6 +10,7 @@ from unittest import mock
 
 from scruffy.cli import main
 from scruffy.models import NodeInventory, ResourceRequest
+from scruffy.slurm import AllocationIncarnation
 from scruffy.storage import UnsafeRecovery
 
 
@@ -243,6 +244,11 @@ class ServeCliTests(unittest.TestCase):
         self.workspace = Path(temporary.name)
         self.root = self.workspace / "queue"
         self.inventory = {"gpu-3": NodeInventory("gpu-3", (0, 1), 16, 128)}
+        self.incarnation = AllocationIncarnation(
+            slurm_job_id="263105",
+            restart_count=0,
+            inventory=tuple(self.inventory.values()),
+        )
 
     def test_auto_launcher_uses_local_outside_slurm(self) -> None:
         inventory_file = self.workspace / "inventory.json"
@@ -274,6 +280,7 @@ class ServeCliTests(unittest.TestCase):
             launcher="local",
             allocation_id="local-test",
             slurm_job_id=None,
+            allocation_incarnation=None,
             poll_interval=0.1,
             cancel_grace=2.5,
         )
@@ -314,7 +321,8 @@ class ServeCliTests(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"SLURM_JOB_ID": "263105"}, clear=True),
             mock.patch(
-                "scruffy.cli.discover_slurm_inventory", return_value=self.inventory
+                "scruffy.cli.discover_slurm_allocation",
+                return_value=(self.inventory, self.incarnation),
             ) as discover,
             mock.patch("scruffy.cli.run_controller") as run_controller,
         ):
@@ -333,6 +341,7 @@ class ServeCliTests(unittest.TestCase):
             launcher="slurm",
             allocation_id="263105",
             slurm_job_id="263105",
+            allocation_incarnation=self.incarnation,
             poll_interval=0.2,
             cancel_grace=30,
         )
@@ -363,6 +372,36 @@ class ServeCliTests(unittest.TestCase):
         self.assertEqual(2, result)
         self.assertIn("Slurm job ID", stderr.getvalue())
         run_controller.assert_not_called()
+
+    def test_explicit_slurm_inventory_still_binds_authoritative_incarnation(
+        self,
+    ) -> None:
+        inventory_file = self.workspace / "inventory.json"
+        with (
+            mock.patch.dict(os.environ, {"SLURM_JOB_ID": "263105"}, clear=True),
+            mock.patch("scruffy.cli.load_inventory", return_value=self.inventory),
+            mock.patch(
+                "scruffy.cli.discover_slurm_incarnation",
+                return_value=self.incarnation,
+            ) as discover,
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "serve",
+                    "--inventory",
+                    str(inventory_file),
+                ]
+            )
+
+        self.assertEqual(0, result)
+        discover.assert_called_once_with("263105")
+        self.assertEqual(
+            self.incarnation,
+            run_controller.call_args.kwargs["allocation_incarnation"],
+        )
 
     def test_expected_recovery_refusal_is_reported_without_a_traceback(self) -> None:
         stderr = io.StringIO()

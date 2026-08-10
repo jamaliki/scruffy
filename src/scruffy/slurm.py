@@ -10,6 +10,7 @@ import sys
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,92 @@ class SlurmStep:
 class SlurmStepResult:
     state: str
     returncode: int
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationIncarnation:
+    """Immutable identity of one execution of a Slurm allocation job."""
+
+    slurm_job_id: str
+    restart_count: int
+    inventory: tuple[NodeInventory, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.slurm_job_id, str) or not self.slurm_job_id:
+            raise ValueError("allocation incarnation has no Slurm job ID")
+        if type(self.restart_count) is not int or self.restart_count < 0:
+            raise ValueError("allocation restart count must be a non-negative integer")
+        validated = validate_inventory(self.inventory)
+        object.__setattr__(
+            self, "inventory", tuple(sorted(validated, key=lambda item: item.name))
+        )
+
+    @property
+    def inventory_sha256(self) -> str:
+        return _canonical_sha256([item.to_dict() for item in self.inventory])
+
+    @property
+    def fingerprint_sha256(self) -> str:
+        return _canonical_sha256(
+            {
+                "schema": 1,
+                "slurm_job_id": self.slurm_job_id,
+                "restart_count": self.restart_count,
+                "inventory_sha256": self.inventory_sha256,
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": 1,
+            "slurm_job_id": self.slurm_job_id,
+            "restart_count": self.restart_count,
+            "inventory": [item.to_dict() for item in self.inventory],
+            "inventory_sha256": self.inventory_sha256,
+            "fingerprint_sha256": self.fingerprint_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> AllocationIncarnation:
+        if not isinstance(value, Mapping):
+            raise TypeError("allocation incarnation is not an object")
+        expected = {
+            "schema",
+            "slurm_job_id",
+            "restart_count",
+            "inventory",
+            "inventory_sha256",
+            "fingerprint_sha256",
+        }
+        if (
+            set(value) != expected
+            or type(value.get("schema")) is not int
+            or value.get("schema") != 1
+        ):
+            raise ValueError("allocation incarnation has invalid keys or schema")
+        raw_inventory = value["inventory"]
+        if isinstance(raw_inventory, (str, bytes)) or not isinstance(
+            raw_inventory, list
+        ):
+            raise TypeError("allocation incarnation inventory is not a list")
+        result = cls(
+            slurm_job_id=value["slurm_job_id"],  # type: ignore[arg-type]
+            restart_count=value["restart_count"],  # type: ignore[arg-type]
+            inventory=tuple(NodeInventory.from_dict(item) for item in raw_inventory),
+        )
+        if (
+            value["inventory_sha256"] != result.inventory_sha256
+            or value["fingerprint_sha256"] != result.fingerprint_sha256
+        ):
+            raise ValueError("allocation incarnation digest differs")
+        return result
+
+
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return sha256(payload).hexdigest()
 
 
 def new_step_name() -> str:
@@ -196,29 +283,41 @@ def _allocation_capacity(job: Mapping[str, Any], nodes: int) -> tuple[int, int, 
     return gpus, cpus, memory_gb
 
 
-def discover_slurm_inventory(
-    *,
-    slurm_job_id: str | None = None,
-    gpus_per_node: int | None = None,
-    cpus_per_node: int | None = None,
-    memory_gb_per_node: int | None = None,
-) -> dict[str, NodeInventory]:
-    """Build a homogeneous inventory from resources granted by Slurm."""
+def _restart_count(job: Mapping[str, Any]) -> int:
+    value = job.get("restart_cnt")
+    if type(value) is not int or value < 0:
+        raise ValueError("Slurm allocation has no valid restart count")
+    return value
 
-    job_id = slurm_job_id or os.environ.get("SLURM_JOB_ID")
-    if not job_id:
-        raise ValueError("--inventory is required outside a Slurm allocation")
-    job = _allocation_job(job_id)
+
+def _inventories_from_job(
+    job: Mapping[str, Any],
+    *,
+    gpus_per_node: int | None,
+    cpus_per_node: int | None,
+    memory_gb_per_node: int | None,
+) -> tuple[tuple[NodeInventory, ...], tuple[NodeInventory, ...]]:
     names = _allocation_hostnames(job)
     discovered_gpus, discovered_cpus, discovered_memory = _allocation_capacity(
         job, len(names)
+    )
+    authoritative = validate_inventory(
+        tuple(
+            NodeInventory(
+                name=name,
+                gpu_ids=tuple(range(discovered_gpus)),
+                cpus=discovered_cpus,
+                memory_gb=discovered_memory,
+            )
+            for name in names
+        )
     )
     gpus = _managed_capacity(discovered_gpus, gpus_per_node, "--gpus-per-node")
     cpus = _managed_capacity(discovered_cpus, cpus_per_node, "--cpus-per-node")
     memory = _managed_capacity(
         discovered_memory, memory_gb_per_node, "--memory-gb-per-node"
     )
-    nodes = validate_inventory(
+    managed = validate_inventory(
         tuple(
             NodeInventory(
                 name=name,
@@ -229,7 +328,62 @@ def discover_slurm_inventory(
             for name in names
         )
     )
-    return {node.name: node for node in nodes}
+    return authoritative, managed
+
+
+def discover_slurm_allocation(
+    *,
+    slurm_job_id: str | None = None,
+    gpus_per_node: int | None = None,
+    cpus_per_node: int | None = None,
+    memory_gb_per_node: int | None = None,
+) -> tuple[dict[str, NodeInventory], AllocationIncarnation]:
+    """Discover managed capacity and its authoritative Slurm incarnation."""
+
+    job_id = slurm_job_id or os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        raise ValueError("--inventory is required outside a Slurm allocation")
+    job = _allocation_job(job_id)
+    returned_job_id = job.get("job_id")
+    if type(returned_job_id) not in {int, str} or str(returned_job_id) != job_id:
+        raise ValueError("Slurm returned a different allocation job")
+    authoritative, managed = _inventories_from_job(
+        job,
+        gpus_per_node=gpus_per_node,
+        cpus_per_node=cpus_per_node,
+        memory_gb_per_node=memory_gb_per_node,
+    )
+    incarnation = AllocationIncarnation(
+        slurm_job_id=job_id,
+        restart_count=_restart_count(job),
+        inventory=authoritative,
+    )
+    return {node.name: node for node in managed}, incarnation
+
+
+def discover_slurm_incarnation(slurm_job_id: str) -> AllocationIncarnation:
+    """Read an allocation identity even when managed inventory is explicit."""
+
+    _managed, incarnation = discover_slurm_allocation(slurm_job_id=slurm_job_id)
+    return incarnation
+
+
+def discover_slurm_inventory(
+    *,
+    slurm_job_id: str | None = None,
+    gpus_per_node: int | None = None,
+    cpus_per_node: int | None = None,
+    memory_gb_per_node: int | None = None,
+) -> dict[str, NodeInventory]:
+    """Build a homogeneous inventory from resources granted by Slurm."""
+
+    inventory, _incarnation = discover_slurm_allocation(
+        slurm_job_id=slurm_job_id,
+        gpus_per_node=gpus_per_node,
+        cpus_per_node=cpus_per_node,
+        memory_gb_per_node=memory_gb_per_node,
+    )
+    return inventory
 
 
 def build_srun_argv(
