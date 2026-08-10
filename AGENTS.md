@@ -105,17 +105,23 @@ agents; reading does not consume events for anyone else. Use
 - Match asynchronous cancel and drain outcomes using the returned `request_id`.
   `drain` survives controller restarts and disables launches until the outer
   allocation is replaced.
-- GPU identity is `(node, gpu_id)`, never a bare global ordinal.
+- GPU admission identity is `(node, gpu_id)`, never a bare global ordinal. In
+  Slurm mode, authenticate the actual step placement from
+  `SCRUFFY_RUNTIME_PLACEMENT`/`SCRUFFY_GPU_IDS`; Slurm may select different
+  physical IDs than the cooperative reservation ledger.
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the
   recovered snapshot, then run `scruffy resume`; do not resubmit attached jobs.
 - `starting`, `running`, `finishing`, and `cancelling` jobs hold their resources.
-- CPU and memory are cooperative budgets. GPU exclusivity covers only work
-  submitted through Scruffy; do not launch out-of-band work on its inventory.
+- Slurm worker steps request their exact admitted GPU, CPU, and memory shape and
+  do not use `--overlap`. GPU exclusivity covers only work submitted through
+  Scruffy; do not launch out-of-band work on its inventory.
 - `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
   every node. Lustre `localflock` is not sufficient for a multi-node queue.
 - `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and
-  `SCRUFFY_NODE` are controller-owned inside a worker.
+  `SCRUFFY_NODE`, `SCRUFFY_GPU_IDS`, `SCRUFFY_RESERVED_GPU_IDS`,
+  `SCRUFFY_SLURM_JOB_ID`, `SCRUFFY_SLURM_STEP_ID`, and
+  `SCRUFFY_RUNTIME_PLACEMENT` are controller-owned inside a worker.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.

@@ -240,19 +240,17 @@ def build_srun_argv(
     stdout_file: Path,
     stderr_file: Path,
     node_names: list[str],
+    gpus_per_node: int,
     cpus_per_node: int,
     memory_gb_per_node: int,
     wait_seconds: int = 0,
 ) -> list[str]:
     """Build one argv-only Slurm step for a rectangular multi-node job.
 
-    Scruffy deliberately uses ``--overlap`` because the outer allocation owns
-    the full GPU pool. Its own per-node ledger selects disjoint GPU IDs, and the
-    worker narrows ``CUDA_VISIBLE_DEVICES`` before executing the user command.
-    ``cpus_per_node`` is therefore the managed node capacity, not an individual
-    job's admission budget. Giving every overlapping step the managed CPU pool
-    prevents Slurm from pinning all workers to the same first CPU slice; Scruffy
-    still limits their aggregate requested CPU budget in its scheduler.
+    The step requests the admitted GPU, CPU, and memory shape from Slurm. Slurm
+    therefore owns physical GPU isolation and the worker preserves its selected
+    ``CUDA_VISIBLE_DEVICES`` mapping. ``--exact`` prevents a partial step from
+    inheriting the remaining resources in the outer allocation.
     """
 
     if not slurm_job_id:
@@ -262,12 +260,12 @@ def build_srun_argv(
         "srun",
         f"--jobid={slurm_job_id}",
         f"--job-name={name}",
-        "--overlap",
         "--exact",
         f"--nodes={nodes}",
         f"--nodelist={','.join(node_names)}",
         f"--ntasks={nodes}",
         "--ntasks-per-node=1",
+        f"--gpus-per-node={gpus_per_node}",
         f"--cpus-per-task={cpus_per_node}",
         "--cpu-bind=none",
         f"--mem={memory_gb_per_node}G",

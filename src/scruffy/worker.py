@@ -10,6 +10,113 @@ from pathlib import Path
 from typing import Any
 
 from .models import job_project
+from .storage import atomic_write_json
+
+_SLURM_GPU_ENVIRONMENT = (
+    "CUDA_DEVICE_ORDER",
+    "CUDA_VISIBLE_DEVICES",
+    "SLURM_JOB_GPUS",
+    "SLURM_STEP_GPUS",
+    "SLURM_JOB_ID",
+    "SLURM_JOBID",
+    "SLURM_STEP_ID",
+    "SLURM_STEPID",
+)
+
+
+def _comma_values(value: str, label: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in value.split(","))
+    if not values or any(not item for item in values):
+        raise ValueError(f"{label} must be a non-empty comma-separated list")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{label} must not contain duplicate GPU identities")
+    return values
+
+
+def _runtime_placement_record(
+    document: dict[str, Any],
+    placement: dict[str, Any],
+    *,
+    expected: int,
+    job_id: str,
+    step_id: str,
+    step_gpus: tuple[str, ...],
+    visible: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "job_id": str(document["job_id"]),
+        "node": str(placement["node"]),
+        "requested_gpus": expected,
+        "ledger_gpu_ids": list(placement["gpu_ids"]),
+        "slurm_job_id": job_id,
+        "slurm_step_id": step_id,
+        "slurm_step_gpus": list(step_gpus),
+        "cuda_visible_devices": list(visible),
+        "cuda_device_order": os.environ.get("CUDA_DEVICE_ORDER"),
+    }
+
+
+def _slurm_gpu_environment(
+    document: dict[str, Any], placement: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, Any]]:
+    expected = document.get("gpus_per_node")
+    if type(expected) is not int or expected <= 0:
+        raise ValueError("gpus_per_node must be a positive integer")
+    if len(placement["gpu_ids"]) != expected:
+        raise ValueError("ledger GPU count differs from the requested Slurm step")
+
+    inherited = os.environ
+    visible_raw = inherited.get("CUDA_VISIBLE_DEVICES", "")
+    step_raw = inherited.get("SLURM_STEP_GPUS", "")
+    visible = _comma_values(visible_raw, "CUDA_VISIBLE_DEVICES")
+    step_gpus = _comma_values(step_raw, "SLURM_STEP_GPUS")
+    if len(visible) != expected or len(step_gpus) != expected:
+        raise ValueError("Slurm GPU mapping count differs from gpus_per_node")
+
+    step_id = inherited.get("SLURM_STEP_ID") or inherited.get("SLURM_STEPID")
+    job_id = inherited.get("SLURM_JOB_ID") or inherited.get("SLURM_JOBID")
+    if not step_id or not job_id:
+        raise ValueError("Slurm worker is missing job or step identity")
+    if document.get("slurm_job_id") != job_id:
+        raise ValueError("Slurm worker allocation differs from its assignment")
+
+    protected = {
+        "CUDA_VISIBLE_DEVICES": visible_raw,
+        "SCRUFFY_GPU_IDS": step_raw,
+        "SCRUFFY_RESERVED_GPU_IDS": ",".join(
+            str(gpu_id) for gpu_id in placement["gpu_ids"]
+        ),
+        "SCRUFFY_SLURM_JOB_ID": job_id,
+        "SCRUFFY_SLURM_STEP_ID": step_id,
+    }
+    device_order = inherited.get("CUDA_DEVICE_ORDER")
+    if device_order is not None:
+        protected["CUDA_DEVICE_ORDER"] = device_order
+    record = _runtime_placement_record(
+        document,
+        placement,
+        expected=expected,
+        job_id=job_id,
+        step_id=step_id,
+        step_gpus=step_gpus,
+        visible=visible,
+    )
+    return protected, record
+
+
+def _publish_runtime_placement(
+    root: str, placement: dict[str, Any], record: dict[str, Any]
+) -> Path:
+    relative = placement.get("runtime_placement")
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("Slurm assignment is missing runtime placement provenance")
+    root_path = Path(root)
+    target = root_path / relative
+    if target.parent != root_path / "jobs" / record["job_id"]:
+        raise ValueError("runtime placement provenance path is outside its job directory")
+    atomic_write_json(target, record)
+    return target
 
 
 def current_node() -> str:
@@ -60,11 +167,23 @@ def execute_assignment(source: Path) -> None:
     environment["SCRUFFY_PROJECT"] = job_project(document)
     environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
-    # Apply this last: jobs submitted through the API cannot choose another slot.
-    environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    environment["CUDA_VISIBLE_DEVICES"] = ",".join(
-        str(gpu_id) for gpu_id in placement["gpu_ids"]
-    )
+    if document.get("launcher") == "slurm":
+        protected_gpu_environment, record = _slurm_gpu_environment(document, placement)
+        for name in _SLURM_GPU_ENVIRONMENT:
+            if name in os.environ:
+                environment[name] = os.environ[name]
+            else:
+                environment.pop(name, None)
+        environment.update(protected_gpu_environment)
+        runtime_placement = _publish_runtime_placement(root, placement, record)
+        environment["SCRUFFY_RUNTIME_PLACEMENT"] = str(runtime_placement)
+    else:
+        # Local development has no Slurm step to allocate devices. Keep using
+        # the scheduler reservation, applied after submitted environment values.
+        environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        environment["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(gpu_id) for gpu_id in placement["gpu_ids"]
+        )
 
     os.chdir(document["cwd"])
     os.execvpe(command[0], command, environment)

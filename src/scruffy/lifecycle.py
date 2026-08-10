@@ -51,8 +51,6 @@ def _launch_arguments(
     stderr_file: Path,
 ) -> tuple[list[str], dict[str, str] | None]:
     if controller.launcher == "slurm":
-        capacity = {node.name: node.cpus for node in controller.inventory}
-        worker_cpus = min(capacity[item.node] for item in assignment.reservations)
         return (
             build_srun_argv(
                 slurm_job_id=controller.slurm_job_id or "",
@@ -61,7 +59,8 @@ def _launch_arguments(
                 stdout_file=stdout_file,
                 stderr_file=stderr_file,
                 node_names=[item.node for item in assignment.reservations],
-                cpus_per_node=worker_cpus,
+                gpus_per_node=assignment.request.gpus_per_node,
+                cpus_per_node=assignment.request.cpus_per_node,
                 memory_gb_per_node=assignment.request.memory_gb_per_node,
             ),
             build_srun_environment(),
@@ -79,6 +78,10 @@ def start_job(
     job["started_at"] = utc_now()
     if controller.launcher == "slurm":
         job["launch_token"] = new_step_name()
+        job["runtime_placements"] = [
+            f"jobs/{job['id']}/runtime-placement-{index}.json"
+            for index, _ in enumerate(assignment.reservations)
+        ]
     emit(controller, "job.starting", job=job)
 
     directory = job_directory(controller.root, job["id"])
@@ -89,10 +92,23 @@ def start_job(
         "root": str(controller.root),
         "job_id": job["id"],
         "project_id": job_project(job),
+        "launcher": controller.launcher,
+        "slurm_job_id": controller.slurm_job_id,
+        "gpus_per_node": assignment.request.gpus_per_node,
         "argv": job["argv"],
         "cwd": job["cwd"],
         "env": job["env"],
-        "assignment": [item.to_dict() for item in assignment.reservations],
+        "assignment": [
+            {
+                **item.to_dict(),
+                "runtime_placement": (
+                    job["runtime_placements"][index]
+                    if controller.launcher == "slurm"
+                    else None
+                ),
+            }
+            for index, item in enumerate(assignment.reservations)
+        ],
     }
     try:
         atomic_write_json(assignment_file, worker_document)

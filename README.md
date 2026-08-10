@@ -30,13 +30,14 @@ releasing its singleton lock or GPU ledger. A blocked filesystem syscall must
 still return before Python can retry, so controller diagnostics should be
 written to a filesystem independent of `SCRUFFY_ROOT`.
 
-GPU IDs are node-local values passed through `CUDA_VISIBLE_DEVICES`. CPU and
-memory values are cooperative admission budgets, not physical isolation. The
-Slurm worker step sees Scruffy's managed node CPU pool so overlapping jobs are
-not all pinned to the same first CPU slice. The workload should still size its
-own workers and thread pools to the CPU budget it requested. Scruffy trusts
-every process able to write `SCRUFFY_ROOT`; it is not a multi-user security
-boundary.
+In Slurm mode every worker step requests the admitted GPU, CPU, and memory shape
+from Slurm without `--overlap`. Scruffy preserves Slurm's
+`CUDA_VISIBLE_DEVICES`; the scheduler's node-local GPU IDs remain the admission
+reservation and may not equal Slurm's selected physical IDs. The actual step
+IDs are available in `SCRUFFY_GPU_IDS` and in the per-node runtime-placement
+record referenced by the job. Local development mode still maps the reservation
+directly. Scruffy trusts every process able to write `SCRUFFY_ROOT`; it is not a
+multi-user security boundary.
 
 ## Quick start
 

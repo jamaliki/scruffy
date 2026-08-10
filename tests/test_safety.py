@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import tempfile
@@ -705,7 +706,7 @@ class LaunchCleanupTests(unittest.TestCase):
 
 
 class SlurmLaunchTests(unittest.TestCase):
-    def test_worker_gets_managed_cpu_pool_not_individual_job_budget(self) -> None:
+    def test_worker_step_gets_exact_admitted_resource_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = mock.Mock(
@@ -729,7 +730,10 @@ class SlurmLaunchTests(unittest.TestCase):
                 root / "stderr.log",
             )
 
-        self.assertIn("--cpus-per-task=112", argv)
+        self.assertIn("--gpus-per-node=1", argv)
+        self.assertIn("--cpus-per-task=14", argv)
+        self.assertIn("--mem=128G", argv)
+        self.assertNotIn("--overlap", argv)
         self.assertEqual(14, assigned.request.cpus_per_node)
 
     def test_start_job_passes_only_sanitized_environment_to_srun(self) -> None:
@@ -792,6 +796,9 @@ class SlurmLaunchTests(unittest.TestCase):
                 ) as popen,
             ):
                 start_job(controller, job, assigned)
+            assignment_document = json.loads(
+                (root / "jobs/job-1/assignment.json").read_text(encoding="utf-8")
+            )
 
         argv = popen.call_args.args[0]
         environment = popen.call_args.kwargs["env"]
@@ -806,6 +813,14 @@ class SlurmLaunchTests(unittest.TestCase):
         )
         self.assertEqual("starting", job["state"])
         self.assertIn(job["id"], controller.running)
+        self.assertEqual(["jobs/job-1/runtime-placement-0.json"], job["runtime_placements"])
+        self.assertEqual("slurm", assignment_document["launcher"])
+        self.assertEqual("240292", assignment_document["slurm_job_id"])
+        self.assertEqual(1, assignment_document["gpus_per_node"])
+        self.assertEqual(
+            "jobs/job-1/runtime-placement-0.json",
+            assignment_document["assignment"][0]["runtime_placement"],
+        )
 
 
 class AsyncCommandRaceTests(unittest.TestCase):
