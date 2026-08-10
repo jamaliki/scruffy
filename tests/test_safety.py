@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -30,6 +31,7 @@ from scruffy.controller import (
     _report_batch,
 )
 from scruffy.lifecycle import (
+    _finish_job,
     _launch_arguments,
     begin_shutdown,
     drain_messages,
@@ -51,6 +53,7 @@ from scruffy.storage import (
     TransientStorageError,
     append_event,
     archive_terminal_job,
+    create_immutable_json,
     create_journal_generation,
     job_directory,
     list_commands,
@@ -813,7 +816,9 @@ class SlurmLaunchTests(unittest.TestCase):
         )
         self.assertEqual("starting", job["state"])
         self.assertIn(job["id"], controller.running)
-        self.assertEqual(["jobs/job-1/runtime-placement-0.json"], job["runtime_placements"])
+        self.assertEqual(
+            ["jobs/job-1/runtime-placement-0.json"], job["runtime_placement_files"]
+        )
         self.assertEqual("slurm", assignment_document["launcher"])
         self.assertEqual("240292", assignment_document["slurm_job_id"])
         self.assertEqual(1, assignment_document["gpus_per_node"])
@@ -821,6 +826,99 @@ class SlurmLaunchTests(unittest.TestCase):
             "jobs/job-1/runtime-placement-0.json",
             assignment_document["assignment"][0]["runtime_placement"],
         )
+
+
+class RuntimePlacementAuthorityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "queue"
+        self.controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: self.controller.journal.close())
+
+    def _job(self) -> dict[str, object]:
+        job = job_image("job-1", "gpu-3")
+        job["slurm_step_id"] = "240292.7"
+        job["runtime_placement_files"] = [
+            "jobs/job-1/runtime-placement-0.json"
+        ]
+        self.controller.state["jobs"]["job-1"] = job
+        return job
+
+    def _placement(self, **updates: object) -> dict[str, object]:
+        record = {
+            "schema": 1,
+            "job_id": "job-1",
+            "node": "gpu-3",
+            "requested_gpus": 1,
+            "ledger_gpu_ids": [0],
+            "slurm_job_id": "240292",
+            "slurm_step_id": "7",
+            "slurm_step_gpus": ["5"],
+            "cuda_visible_devices": ["0"],
+            "cuda_device_order": "PCI_BUS_ID",
+        }
+        record.update(updates)
+        return record
+
+    def test_terminal_result_binds_exact_runtime_placement_sha(self) -> None:
+        job = self._job()
+        source = self.root / "jobs/job-1/runtime-placement-0.json"
+        digest = create_immutable_json(source, self._placement())
+
+        _finish_job(self.controller, "job-1", RunningProcess(mock.Mock(), None), 0)
+
+        self.assertEqual("succeeded", job["state"])
+        self.assertEqual(
+            [
+                {
+                    "path": "jobs/job-1/runtime-placement-0.json",
+                    "sha256": digest,
+                    "node": "gpu-3",
+                    "slurm_step_id": "240292.7",
+                    "physical_gpu_ids": ["5"],
+                    "visible_gpu_ids": ["0"],
+                    "reserved_gpu_ids": [0],
+                }
+            ],
+            job["runtime_placements"],
+        )
+        terminal = [
+            event for event in read_events(self.root) if event["kind"] == "job.succeeded"
+        ][-1]
+        self.assertEqual(digest, terminal["job"]["runtime_placements"][0]["sha256"])
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), digest)
+
+    def test_success_fails_closed_on_mutable_or_substituted_placement(self) -> None:
+        for record, mutate_mode in (
+            (self._placement(), True),
+            (self._placement(ledger_gpu_ids=[7]), False),
+        ):
+            with self.subTest(record=record, mutate_mode=mutate_mode):
+                job = self._job()
+                source = self.root / "jobs/job-1/runtime-placement-0.json"
+                create_immutable_json(source, record)
+                if mutate_mode:
+                    source.chmod(0o644)
+
+                _finish_job(
+                    self.controller, "job-1", RunningProcess(mock.Mock(), None), 0
+                )
+
+                self.assertEqual("failed", job["state"])
+                self.assertEqual("runtime_placement_invalid", job["reason"])
+                self.assertIn("runtime_placement_error", job)
+                if source.exists():
+                    source.chmod(0o644)
+                    source.unlink()
 
 
 class AsyncCommandRaceTests(unittest.TestCase):
@@ -1769,6 +1867,9 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
             {
                 "launch_token": "scruffy-token",
                 "slurm_step_id": "240292.7",
+                "runtime_placement_files": [
+                    "jobs/job-a/runtime-placement-0.json"
+                ],
                 "stdout": "jobs/job-a/stdout.log",
                 "stderr": "jobs/job-a/stderr.log",
             }
@@ -1784,6 +1885,21 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
         self.controller.running["job-a"] = running
         self.controller.slurm_snapshot_at = 10
         self.controller.slurm_steps = ()
+        create_immutable_json(
+            self.controller.root / "jobs/job-a/runtime-placement-0.json",
+            {
+                "schema": 1,
+                "job_id": "job-a",
+                "node": "gpu-3",
+                "requested_gpus": 1,
+                "ledger_gpu_ids": [0],
+                "slurm_job_id": "240292",
+                "slurm_step_id": "7",
+                "slurm_step_gpus": ["5"],
+                "cuda_visible_devices": ["0"],
+                "cuda_device_order": None,
+            },
+        )
 
         with (
             mock.patch("scruffy.lifecycle.refresh_slurm_snapshot"),

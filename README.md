@@ -34,10 +34,13 @@ In Slurm mode every worker step requests the admitted GPU, CPU, and memory shape
 from Slurm without `--overlap`. Scruffy preserves Slurm's
 `CUDA_VISIBLE_DEVICES`; the scheduler's node-local GPU IDs remain the admission
 reservation and may not equal Slurm's selected physical IDs. The actual step
-IDs are available in `SCRUFFY_GPU_IDS` and in the per-node runtime-placement
-record referenced by the job. Local development mode still maps the reservation
-directly. Scruffy trusts every process able to write `SCRUFFY_ROOT`; it is not a
-multi-user security boundary.
+IDs are available in `SCRUFFY_PHYSICAL_GPU_IDS`/`SCRUFFY_STEP_GPU_IDS` and in the
+immutable per-node runtime-placement record referenced by the job.
+`SCRUFFY_GPU_IDS` deliberately follows the workload-visible
+`CUDA_VISIBLE_DEVICES` mapping; `SCRUFFY_RESERVED_GPU_IDS` retains the admission
+ledger identity. Local development mode still maps the reservation directly.
+Scruffy trusts every process able to write `SCRUFFY_ROOT`; it is not a multi-user
+security boundary.
 
 ## Quick start
 

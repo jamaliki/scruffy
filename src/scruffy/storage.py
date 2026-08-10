@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -125,6 +126,75 @@ def atomic_write_json(target: Path, value: Any) -> None:
         _fsync_directory(target.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def read_immutable_json(
+    source: Path, *, max_bytes: int = 64 * 1024
+) -> tuple[Any, str]:
+    """Read one exact immutable JSON authority and return its SHA-256."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > max_bytes
+        ):
+            raise StorageError(f"invalid immutable JSON authority {source}")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                raise StorageError(f"short immutable JSON authority {source}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StorageError(f"invalid immutable JSON authority {source}") from exc
+    canonical = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode()
+    if payload != canonical:
+        raise StorageError(f"non-canonical immutable JSON authority {source}")
+    return value, hashlib.sha256(payload).hexdigest()
+
+
+def create_immutable_json(target: Path, value: Any) -> str:
+    """Create one durable, no-replace, mode-0444 JSON authority."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags, 0o444)
+    try:
+        os.fchmod(descriptor, 0o444)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise StorageError(f"short immutable JSON write {target}")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(target.parent)
+    stored, digest = read_immutable_json(target)
+    if stored != value:
+        raise StorageError(f"immutable JSON authority changed while publishing {target}")
+    return digest
 
 
 def read_json(source: Path) -> Any:

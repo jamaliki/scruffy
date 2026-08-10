@@ -107,8 +107,9 @@ agents; reading does not consume events for anyone else. Use
   allocation is replaced.
 - GPU admission identity is `(node, gpu_id)`, never a bare global ordinal. In
   Slurm mode, authenticate the actual step placement from
-  `SCRUFFY_RUNTIME_PLACEMENT`/`SCRUFFY_GPU_IDS`; Slurm may select different
-  physical IDs than the cooperative reservation ledger.
+  `SCRUFFY_RUNTIME_PLACEMENT`/`SCRUFFY_PHYSICAL_GPU_IDS`; `SCRUFFY_GPU_IDS`
+  follows `CUDA_VISIBLE_DEVICES`, and Slurm may select different physical IDs
+  than the cooperative reservation ledger.
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the
   recovered snapshot, then run `scruffy resume`; do not resubmit attached jobs.
@@ -120,8 +121,9 @@ agents; reading does not consume events for anyone else. Use
   every node. Lustre `localflock` is not sufficient for a multi-node queue.
 - `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and
   `SCRUFFY_NODE`, `SCRUFFY_GPU_IDS`, `SCRUFFY_RESERVED_GPU_IDS`,
-  `SCRUFFY_SLURM_JOB_ID`, `SCRUFFY_SLURM_STEP_ID`, and
-  `SCRUFFY_RUNTIME_PLACEMENT` are controller-owned inside a worker.
+  `SCRUFFY_PHYSICAL_GPU_IDS`, `SCRUFFY_STEP_GPU_IDS`, `SCRUFFY_SLURM_JOB_ID`,
+  `SCRUFFY_SLURM_STEP_ID`, `SCRUFFY_RUNTIME_PLACEMENT`, and
+  `SCRUFFY_RUNTIME_PLACEMENT_SHA256` are controller-owned inside a worker.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.

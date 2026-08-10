@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import job_project
-from .storage import atomic_write_json
+from .storage import create_immutable_json
 
 _SLURM_GPU_ENVIRONMENT = (
     "CUDA_DEVICE_ORDER",
@@ -21,6 +21,16 @@ _SLURM_GPU_ENVIRONMENT = (
     "SLURM_JOBID",
     "SLURM_STEP_ID",
     "SLURM_STEPID",
+)
+_SCRUFFY_GPU_ENVIRONMENT = (
+    "SCRUFFY_GPU_IDS",
+    "SCRUFFY_PHYSICAL_GPU_IDS",
+    "SCRUFFY_RESERVED_GPU_IDS",
+    "SCRUFFY_RUNTIME_PLACEMENT",
+    "SCRUFFY_RUNTIME_PLACEMENT_SHA256",
+    "SCRUFFY_SLURM_JOB_ID",
+    "SCRUFFY_SLURM_STEP_ID",
+    "SCRUFFY_STEP_GPU_IDS",
 )
 
 
@@ -83,7 +93,9 @@ def _slurm_gpu_environment(
 
     protected = {
         "CUDA_VISIBLE_DEVICES": visible_raw,
-        "SCRUFFY_GPU_IDS": step_raw,
+        "SCRUFFY_GPU_IDS": visible_raw,
+        "SCRUFFY_PHYSICAL_GPU_IDS": step_raw,
+        "SCRUFFY_STEP_GPU_IDS": step_raw,
         "SCRUFFY_RESERVED_GPU_IDS": ",".join(
             str(gpu_id) for gpu_id in placement["gpu_ids"]
         ),
@@ -107,7 +119,7 @@ def _slurm_gpu_environment(
 
 def _publish_runtime_placement(
     root: str, placement: dict[str, Any], record: dict[str, Any]
-) -> Path:
+) -> tuple[Path, str]:
     relative = placement.get("runtime_placement")
     if not isinstance(relative, str) or not relative:
         raise ValueError("Slurm assignment is missing runtime placement provenance")
@@ -115,8 +127,7 @@ def _publish_runtime_placement(
     target = root_path / relative
     if target.parent != root_path / "jobs" / record["job_id"]:
         raise ValueError("runtime placement provenance path is outside its job directory")
-    atomic_write_json(target, record)
-    return target
+    return target, create_immutable_json(target, record)
 
 
 def current_node() -> str:
@@ -167,6 +178,8 @@ def execute_assignment(source: Path) -> None:
     environment["SCRUFFY_PROJECT"] = job_project(document)
     environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
+    for name in _SCRUFFY_GPU_ENVIRONMENT:
+        environment.pop(name, None)
     if document.get("launcher") == "slurm":
         protected_gpu_environment, record = _slurm_gpu_environment(document, placement)
         for name in _SLURM_GPU_ENVIRONMENT:
@@ -175,15 +188,21 @@ def execute_assignment(source: Path) -> None:
             else:
                 environment.pop(name, None)
         environment.update(protected_gpu_environment)
-        runtime_placement = _publish_runtime_placement(root, placement, record)
+        runtime_placement, placement_sha256 = _publish_runtime_placement(
+            root, placement, record
+        )
         environment["SCRUFFY_RUNTIME_PLACEMENT"] = str(runtime_placement)
+        environment["SCRUFFY_RUNTIME_PLACEMENT_SHA256"] = placement_sha256
     else:
         # Local development has no Slurm step to allocate devices. Keep using
         # the scheduler reservation, applied after submitted environment values.
         environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        environment["CUDA_VISIBLE_DEVICES"] = ",".join(
+        visible_devices = ",".join(
             str(gpu_id) for gpu_id in placement["gpu_ids"]
         )
+        environment["CUDA_VISIBLE_DEVICES"] = visible_devices
+        environment["SCRUFFY_GPU_IDS"] = visible_devices
+        environment["SCRUFFY_RESERVED_GPU_IDS"] = visible_devices
 
     os.chdir(document["cwd"])
     os.execvpe(command[0], command, environment)

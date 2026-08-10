@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -516,6 +518,9 @@ class WorkerPlacementTests(unittest.TestCase):
                 "SCRUFFY_ROOT": "/spoofed/root",
                 "SCRUFFY_EVENT_DIR": "/spoofed/events",
                 "SCRUFFY_NODE": "spoofed-node",
+                "SCRUFFY_PHYSICAL_GPU_IDS": "99",
+                "SCRUFFY_RUNTIME_PLACEMENT": "/spoofed/placement.json",
+                "SCRUFFY_RUNTIME_PLACEMENT_SHA256": "f" * 64,
                 "USER_SETTING": "kept",
             },
             "assignment": [
@@ -548,6 +553,11 @@ class WorkerPlacementTests(unittest.TestCase):
         self.assertEqual("gpu-5.cluster", environment["SCRUFFY_NODE"])
         self.assertEqual("PCI_BUS_ID", environment["CUDA_DEVICE_ORDER"])
         self.assertEqual("4,6", environment["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual("4,6", environment["SCRUFFY_GPU_IDS"])
+        self.assertEqual("4,6", environment["SCRUFFY_RESERVED_GPU_IDS"])
+        self.assertNotIn("SCRUFFY_PHYSICAL_GPU_IDS", environment)
+        self.assertNotIn("SCRUFFY_RUNTIME_PLACEMENT", environment)
+        self.assertNotIn("SCRUFFY_RUNTIME_PLACEMENT_SHA256", environment)
 
     def test_slurm_worker_preserves_selected_gpu_mapping_and_records_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -569,6 +579,10 @@ class WorkerPlacementTests(unittest.TestCase):
                     "SLURM_STEP_ID": "spoofed",
                     "SLURM_JOB_GPUS": "99",
                     "SCRUFFY_GPU_IDS": "99",
+                    "SCRUFFY_PHYSICAL_GPU_IDS": "99",
+                    "SCRUFFY_STEP_GPU_IDS": "99",
+                    "SCRUFFY_RESERVED_GPU_IDS": "99",
+                    "SCRUFFY_RUNTIME_PLACEMENT_SHA256": "f" * 64,
                 },
                 "assignment": [
                     {
@@ -599,12 +613,21 @@ class WorkerPlacementTests(unittest.TestCase):
             self.assertEqual("0,1", environment["CUDA_VISIBLE_DEVICES"])
             self.assertEqual("2,7", environment["SLURM_STEP_GPUS"])
             self.assertEqual("0,1,2,3,4,5,6,7", environment["SLURM_JOB_GPUS"])
-            self.assertEqual("2,7", environment["SCRUFFY_GPU_IDS"])
+            self.assertEqual("0,1", environment["SCRUFFY_GPU_IDS"])
+            self.assertEqual("2,7", environment["SCRUFFY_PHYSICAL_GPU_IDS"])
+            self.assertEqual("2,7", environment["SCRUFFY_STEP_GPU_IDS"])
             self.assertEqual("4,6", environment["SCRUFFY_RESERVED_GPU_IDS"])
             self.assertEqual("263105", environment["SCRUFFY_SLURM_JOB_ID"])
             self.assertEqual("42", environment["SCRUFFY_SLURM_STEP_ID"])
             placement_file = root.resolve() / "jobs/job-1/runtime-placement-0.json"
             self.assertEqual(str(placement_file), environment["SCRUFFY_RUNTIME_PLACEMENT"])
+            metadata = placement_file.stat()
+            self.assertEqual(0o444, stat.S_IMODE(metadata.st_mode))
+            self.assertEqual(1, metadata.st_nlink)
+            self.assertEqual(
+                environment["SCRUFFY_RUNTIME_PLACEMENT_SHA256"],
+                hashlib.sha256(placement_file.read_bytes()).hexdigest(),
+            )
             self.assertEqual(
                 {
                     "schema": 1,
@@ -620,6 +643,16 @@ class WorkerPlacementTests(unittest.TestCase):
                 },
                 json.loads(placement_file.read_text(encoding="utf-8")),
             )
+            original = placement_file.read_bytes()
+            with (
+                mock.patch.dict(os.environ, slurm_environment, clear=True),
+                mock.patch("scruffy.worker.current_node", return_value="gpu-5.cluster"),
+                mock.patch("scruffy.worker.os.execvpe") as second_exec,
+            ):
+                with self.assertRaises(FileExistsError):
+                    execute_assignment(source)
+                second_exec.assert_not_called()
+            self.assertEqual(original, placement_file.read_bytes())
 
     def test_slurm_worker_rejects_missing_or_wrong_gpu_mapping(self) -> None:
         document = {
