@@ -78,6 +78,14 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "placement": job.get("assignment") or job.get("last_assignment"),
         "provenance": job.get("provenance"),
         "resolved_dependencies": list(job.get("resolved_dependencies") or []),
+        "allocation_incarnation_sha256": job.get(
+            "allocation_incarnation_sha256"
+        ),
+        "runtime_placement_contract": job.get("runtime_placement_contract"),
+        "runtime_placement_files": list(job.get("runtime_placement_files") or []),
+        "runtime_placements": list(job.get("runtime_placements") or []),
+        "runtime_placement_error": job.get("runtime_placement_error"),
+        "runtime_placement_status": job.get("runtime_placement_status"),
         "workload": workload,
         "progress_age_seconds": progress_age,
         "stdout": job.get("stdout"),

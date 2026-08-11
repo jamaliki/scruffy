@@ -36,7 +36,11 @@ from .models import (
     normalize_project_id,
 )
 from .protocol import EVENT_KINDS
-from .slurm import discover_slurm_inventory, load_inventory
+from .slurm import (
+    discover_slurm_allocation,
+    discover_slurm_incarnation,
+    load_inventory,
+)
 from .storage import StorageError, tail_window
 from .summary import (
     BLOCKED_VIEW_STATES,
@@ -126,19 +130,21 @@ def _serve(arguments: argparse.Namespace) -> int:
         launcher = "slurm" if slurm_job_id else "local"
     if launcher == "slurm" and not slurm_job_id:
         raise ValueError("a Slurm job ID is required for the Slurm launcher")
+    allocation_incarnation = None
     if arguments.inventory:
         inventory = tuple(load_inventory(Path(arguments.inventory)).values())
+        if launcher == "slurm":
+            allocation_incarnation = discover_slurm_incarnation(slurm_job_id or "")
     else:
         if launcher != "slurm":
             raise ValueError("--inventory is required outside a Slurm allocation")
-        inventory = tuple(
-            discover_slurm_inventory(
-                slurm_job_id=slurm_job_id,
-                gpus_per_node=arguments.gpus_per_node,
-                cpus_per_node=arguments.cpus_per_node,
-                memory_gb_per_node=arguments.memory_gb_per_node,
-            ).values()
+        discovered, allocation_incarnation = discover_slurm_allocation(
+            slurm_job_id=slurm_job_id,
+            gpus_per_node=arguments.gpus_per_node,
+            cpus_per_node=arguments.cpus_per_node,
+            memory_gb_per_node=arguments.memory_gb_per_node,
         )
+        inventory = tuple(discovered.values())
     if launcher == "local" and len(inventory) != 1:
         raise ValueError("the local launcher requires a one-node inventory")
     allocation_id = (
@@ -154,6 +160,7 @@ def _serve(arguments: argparse.Namespace) -> int:
         launcher=launcher,
         allocation_id=allocation_id,
         slurm_job_id=slurm_job_id,
+        allocation_incarnation=allocation_incarnation,
         poll_interval=arguments.poll_interval,
         cancel_grace=arguments.cancel_grace,
         start_paused=arguments.start_paused,

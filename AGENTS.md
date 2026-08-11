@@ -138,10 +138,11 @@ agents; reading does not consume events for anyone else. Use
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the
   recovered snapshot, then run `scruffy resume`; do not resubmit attached jobs.
-- For a replacement allocation, reuse the same stable `SCRUFFY_ROOT` and start
-  `scruffy serve --start-paused`. Active jobs become `lost`; queued and blocked
-  jobs remain durable even when the new inventory cannot fit them. Inspect the
-  `allocation.handover` counts, then run `scruffy resume`.
+- For a replacement allocation, including a Slurm requeue that reuses its job
+  ID, reuse the stable `SCRUFFY_ROOT` and start `scruffy serve --start-paused`.
+  Active jobs become `lost`; queued and blocked jobs remain durable even when
+  the new inventory cannot fit them. Inspect `allocation.handover`, then run
+  `scruffy resume`.
 - By default, `serve` automatically drains 900 seconds before Slurm's allocation
   deadline. Override with `--drain-before-end-seconds`; `0` disables it.
 - Run the controller as the outer batch foreground process when possible. A
@@ -157,7 +158,8 @@ agents; reading does not consume events for anyone else. Use
   `SCRUFFY_NODE` are controller-owned inside a worker. New jobs also receive
   `SCRUFFY_PROVENANCE_PATH`, `SCRUFFY_ASSIGNMENT_SHA256`, `SCRUFFY_GPU_IDS`, and
   workflow/task/attempt identity. In Slurm mode `SCRUFFY_GPU_IDS` comes from the
-  step's `CUDA_VISIBLE_DEVICES`; never replace it with scheduler reservation IDs.
+  step's `CUDA_VISIBLE_DEVICES`; authenticated placement and its digest are in
+  `SCRUFFY_RUNTIME_PLACEMENT` and `SCRUFFY_RUNTIME_PLACEMENT_SHA256`.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.

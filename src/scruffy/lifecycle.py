@@ -6,11 +6,18 @@ import queue
 import signal
 import subprocess
 import time
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .models import Assignment, QueuedJob, ResourceRequest, job_project
+from .models import (
+    Assignment,
+    NodeReservation,
+    QueuedJob,
+    ResourceRequest,
+    job_project,
+)
 from .provenance import write_launch_record, write_result_record
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_first_fitting_job, project_gpu_usage, queue_priority_key
@@ -23,9 +30,137 @@ from .slurm import (
 )
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
 from .state import active_assignments, emit
-from .storage import atomic_write_json, job_directory, utc_now
+from .storage import (
+    StorageError,
+    atomic_write_json,
+    job_directory,
+    read_immutable_json,
+    utc_now,
+)
 
 MAX_MESSAGES_PER_TICK = 256
+RUNTIME_PLACEMENT_CONTRACT = 1
+
+_RUNTIME_PLACEMENT_KEYS = {
+    "schema",
+    "job_id",
+    "node",
+    "requested_gpus",
+    "ledger_gpu_ids",
+    "slurm_job_id",
+    "slurm_step_id",
+    "slurm_step_gpus",
+    "cuda_visible_devices",
+    "cuda_device_order",
+}
+
+
+def _string_list(value: object, label: str, expected: int) -> list[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{label} is not a list")
+    result = list(value)
+    if (
+        len(result) != expected
+        or any(
+            not isinstance(item, str) or not item or item.strip() != item
+            for item in result
+        )
+        or len(set(result)) != len(result)
+    ):
+        raise ValueError(f"{label} does not match the requested GPU count")
+    return result
+
+
+def _placement_entry(
+    document: Mapping[str, Any],
+    *,
+    digest: str,
+    relative: str,
+    job_id: str,
+    reservation: NodeReservation,
+    requested: int,
+    outer_job_id: str,
+    live_step_id: str,
+) -> dict[str, Any]:
+    if set(document) != _RUNTIME_PLACEMENT_KEYS:
+        raise ValueError("runtime placement record has invalid keys")
+    step_gpus = _string_list(document["slurm_step_gpus"], "step GPUs", requested)
+    visible = _string_list(document["cuda_visible_devices"], "visible GPUs", requested)
+    record_step = document["slurm_step_id"]
+    full_step_id = (
+        record_step
+        if isinstance(record_step, str) and record_step.startswith(f"{outer_job_id}.")
+        else f"{outer_job_id}.{record_step}"
+    )
+    device_order = document["cuda_device_order"]
+    ledger_ids = document["ledger_gpu_ids"]
+    if (
+        type(document["schema"]) is not int
+        or document["schema"] != 1
+        or type(document["requested_gpus"]) is not int
+        or document["job_id"] != job_id
+        or document["node"] != reservation.node
+        or document["requested_gpus"] != requested
+        or not isinstance(ledger_ids, list)
+        or any(type(gpu_id) is not int for gpu_id in ledger_ids)
+        or ledger_ids != list(reservation.gpu_ids)
+        or document["slurm_job_id"] != outer_job_id
+        or not isinstance(record_step, str)
+        or not record_step
+        or full_step_id != live_step_id
+        or (
+            device_order is not None
+            and (not isinstance(device_order, str) or not device_order)
+        )
+    ):
+        raise ValueError("runtime placement record differs from the launch")
+    return {
+        "path": relative,
+        "sha256": digest,
+        "node": reservation.node,
+        "slurm_step_id": full_step_id,
+        "physical_gpu_ids": step_gpus,
+        "visible_gpu_ids": visible,
+        "reserved_gpu_ids": list(reservation.gpu_ids),
+    }
+
+
+def _runtime_placement_authority(
+    controller: Controller, job: dict[str, Any]
+) -> list[dict[str, Any]]:
+    assignment = Assignment.from_dict(job["assignment"])
+    relative_files = job.get("runtime_placement_files")
+    if isinstance(relative_files, (str, bytes)) or not isinstance(
+        relative_files, Sequence
+    ):
+        raise ValueError("runtime placement file registry is missing")
+    if len(relative_files) != len(assignment.reservations):
+        raise ValueError("runtime placement file registry has the wrong size")
+    outer_job_id = controller.slurm_job_id or ""
+    live_step_id = job.get("slurm_step_id")
+    if not outer_job_id or not isinstance(live_step_id, str):
+        raise ValueError("runtime placement has no reconciled Slurm step")
+    result = []
+    for index, reservation in enumerate(assignment.reservations):
+        relative = f"jobs/{job['id']}/runtime-placement-{index}.json"
+        if relative_files[index] != relative:
+            raise ValueError("runtime placement file registry path differs")
+        document, digest = read_immutable_json(controller.root / relative)
+        if not isinstance(document, Mapping):
+            raise ValueError("runtime placement record is not an object")
+        result.append(
+            _placement_entry(
+                document,
+                digest=digest,
+                relative=relative,
+                job_id=job["id"],
+                reservation=reservation,
+                requested=assignment.request.gpus_per_node,
+                outer_job_id=outer_job_id,
+                live_step_id=live_step_id,
+            )
+        )
+    return result
 
 
 def _fail_unlaunched(
@@ -104,7 +239,17 @@ def start_job(
         job["started_at"], assignment.request.time_limit_seconds
     )
     if controller.launcher == "slurm":
+        if controller.allocation_incarnation is None:
+            raise RuntimeError("Slurm controller has no allocation incarnation")
         job["launch_token"] = new_step_name()
+        job["allocation_incarnation_sha256"] = (
+            controller.allocation_incarnation.fingerprint_sha256
+        )
+        job["runtime_placement_contract"] = RUNTIME_PLACEMENT_CONTRACT
+        job["runtime_placement_files"] = [
+            f"jobs/{job['id']}/runtime-placement-{index}.json"
+            for index, _ in enumerate(assignment.reservations)
+        ]
 
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
@@ -121,12 +266,28 @@ def start_job(
             "workflow_id": job.get("workflow_id"),
             "task_id": job.get("task_id"),
             "attempt": job.get("attempt"),
+            "launcher": controller.launcher,
+            "slurm_job_id": controller.slurm_job_id,
+            "allocation_incarnation_sha256": job.get(
+                "allocation_incarnation_sha256"
+            ),
+            "runtime_placement_contract": job.get("runtime_placement_contract"),
             "provenance_path": str(launch_file),
             "assignment_sha256": job["provenance"]["assignment_sha256"],
             "argv": job["argv"],
             "cwd": job["cwd"],
             "env": job["env"],
-            "assignment": [item.to_dict() for item in assignment.reservations],
+            "assignment": [
+                {
+                    **item.to_dict(),
+                    "runtime_placement": (
+                        job["runtime_placement_files"][index]
+                        if controller.launcher == "slurm"
+                        else None
+                    ),
+                }
+                for index, item in enumerate(assignment.reservations)
+            ],
             "slurm_managed_gpus": controller.launcher == "slurm",
             "gpus_per_node": assignment.request.gpus_per_node,
             # A Slurm worker owns its log descriptors so output survives the
@@ -318,6 +479,27 @@ def _finish_job(
             reason = "signal"
         else:
             reason = "application_exit"
+    runtime_placements = None
+    placement_error = None
+    placement_status = None
+    if controller.launcher == "slurm":
+        contract = job.get("runtime_placement_contract")
+        if contract is None:
+            placement_status = "legacy_unavailable"
+        elif type(contract) is not int or contract != RUNTIME_PLACEMENT_CONTRACT:
+            placement_status = "invalid"
+            placement_error = "unsupported runtime placement contract"
+            if state == "succeeded":
+                state, reason = "failed", "runtime_placement_invalid"
+        else:
+            try:
+                runtime_placements = _runtime_placement_authority(controller, job)
+                placement_status = "authenticated"
+            except (KeyError, OSError, StorageError, TypeError, ValueError) as exc:
+                placement_status = "invalid"
+                placement_error = str(exc)
+                if state == "succeeded":
+                    state, reason = "failed", "runtime_placement_invalid"
     job.update(
         {
             "state": state,
@@ -329,6 +511,13 @@ def _finish_job(
             "assignment": None,
         }
     )
+    if runtime_placements is not None:
+        job["runtime_placements"] = runtime_placements
+        job.pop("runtime_placement_error", None)
+    elif placement_error is not None:
+        job["runtime_placement_error"] = placement_error
+    if placement_status is not None:
+        job["runtime_placement_status"] = placement_status
     job.pop("pid", None)
     job.pop("pending_returncode", None)
     for stream_name in ("stdout", "stderr"):

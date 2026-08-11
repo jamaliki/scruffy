@@ -577,6 +577,31 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
             spec["resources"],
         )
 
+    async def test_cpu_only_submission_keeps_positive_defaults(self) -> None:
+        result = await dispatch_tool(
+            self.root,
+            "submit_job",
+            {
+                "_project_id": "project-a",
+                "request_id": "analysis/cpu-only",
+                "name": "analysis",
+                "argv": ["python", "analyze.py"],
+                "cwd": "/shared/code/project",
+                "gpus_per_node": 0,
+            },
+        )
+
+        spec = dict(list_requests(self.root))[result["job_id"]]
+        self.assertEqual(
+            {
+                "nodes": 1,
+                "gpus_per_node": 0,
+                "cpus_per_node": 1,
+                "memory_gb_per_node": 4,
+            },
+            spec["resources"],
+        )
+
     async def test_stale_cursor_returns_authoritative_overview(self) -> None:
         _commit(self.root, [], jobs={"job-1": _job("job-1")})
 

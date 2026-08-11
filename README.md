@@ -524,8 +524,10 @@ checks the recovered state and runs `scruffy --root "$SCRUFFY_ROOT" resume`.
 ### Moving to a replacement allocation
 
 Keep `SCRUFFY_ROOT` at a stable home-backed location rather than naming it after
-the Slurm allocation. The queue state does not need to be copied. Before the old
-allocation ends, drain it and let checkpointing workloads finish when possible:
+the Slurm allocation. The queue state does not need to be copied. A Slurm
+requeue that reuses the same numeric job ID is still a replacement when its
+restart count or inventory changes. Before the old allocation ends, drain it
+and let checkpointing workloads finish when possible:
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" drain
@@ -541,8 +543,10 @@ scruffy --root "$SCRUFFY_ROOT" resume
 
 The summary and MCP overview include a bounded `handover` count of lost,
 queued, blocked, and currently inventory-ineligible jobs. Inspect it before
-resuming. New submissions are still rejected when they cannot fit the current
-inventory; only durable work inherited from an older allocation is retained.
+resuming. Only an exact allocation-incarnation match may reattach active steps
+or inherit a drain. New submissions are still rejected when they cannot fit the
+current inventory; only durable work inherited from an older allocation is
+retained.
 
 The controller deliberately runs one submitted argv per job. It numbers
 immutable attempts but is not an automatic retry engine, dynamic workflow

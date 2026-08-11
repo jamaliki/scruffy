@@ -436,10 +436,21 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     )
     for event in events:
         allocation_id = event.get("allocation_id")
-        if allocation_id and (
-            rebuilding or event.get("kind") == "allocation.started"
-        ):
-            state["allocation"] = {"id": str(allocation_id), "state": "recovered"}
+        allocation_kind = event.get("kind") in {
+            "allocation.started",
+            "allocation.resumed",
+        }
+        if allocation_id and (state.get("allocation") is None or allocation_kind):
+            recovered_allocation = {
+                "id": str(allocation_id),
+                "state": "recovered",
+            }
+            data = event.get("data")
+            if allocation_kind and isinstance(data, dict):
+                incarnation = data.get("incarnation")
+                if isinstance(incarnation, dict):
+                    recovered_allocation["incarnation"] = copy.deepcopy(incarnation)
+            state["allocation"] = recovered_allocation
         admitted = event.get("jobs") if event.get("kind") == "submission.admitted" else None
         if isinstance(admitted, list):
             for candidate in admitted:

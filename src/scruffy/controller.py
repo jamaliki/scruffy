@@ -34,7 +34,7 @@ from .protocol import validate_event
 from .provenance import write_request_record, write_result_record
 from .runtime import Controller, OutputNotifier, RunningProcess, abandon_processes
 from .scheduler import InvariantError, assert_invariants, request_can_ever_fit
-from .slurm import allocation_metadata
+from .slurm import AllocationIncarnation, allocation_metadata
 from .state import (
     apply_workload_event,
     commit_snapshot,
@@ -107,6 +107,7 @@ def _initialize_controller(
     slurm_job_id: str | None,
     poll_interval: float,
     cancel_grace: float,
+    allocation_incarnation: AllocationIncarnation | None = None,
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
 ) -> Controller:
@@ -117,14 +118,44 @@ def _initialize_controller(
         if job["state"] in ACTIVE_JOB_STATES
     ]
     previous = state.get("allocation") or {}
+    if launcher == "slurm" and (
+        allocation_incarnation is None
+        or allocation_incarnation.slurm_job_id != slurm_job_id
+    ):
+        raise ValueError("Slurm allocation incarnation is missing or differs")
+    previous_incarnation = None
+    raw_previous_incarnation = previous.get("incarnation")
+    if raw_previous_incarnation is not None:
+        try:
+            previous_incarnation = AllocationIncarnation.from_dict(
+                raw_previous_incarnation
+            )
+        except (TypeError, ValueError) as exc:
+            raise UnsafeRecovery(
+                f"invalid persisted allocation incarnation: {exc}"
+            ) from exc
+        if previous.get("id") != previous_incarnation.slurm_job_id:
+            raise UnsafeRecovery(
+                "persisted allocation ID differs from its incarnation"
+            )
     same_slurm_allocation = (
-        launcher == "slurm" and previous.get("id") == allocation_id
+        launcher == "slurm"
+        and previous.get("id") == allocation_id
+        and previous_incarnation == allocation_incarnation
+    )
+    legacy_slurm_allocation = (
+        launcher == "slurm"
+        and raw_previous_incarnation is None
+        and (
+            previous.get("id") == allocation_id
+            or (previous.get("id") is None and bool(state.get("jobs")))
+        )
     )
     previous_allocation_id = previous.get("id")
     replacement = (
         launcher == "slurm"
         and isinstance(previous_allocation_id, str)
-        and previous_allocation_id != allocation_id
+        and not same_slurm_allocation
     )
     if active and launcher == "local":
         raise UnsafeRecovery(
@@ -144,6 +175,15 @@ def _initialize_controller(
             raise UnsafeRecovery(
                 "active Slurm job has no launch token; refusing unsafe recovery"
             )
+        incarnation_sha256 = allocation_incarnation.fingerprint_sha256
+        if active and any(
+            job.get("allocation_incarnation_sha256") != incarnation_sha256
+            for job in active
+        ):
+            raise UnsafeRecovery(
+                "active Slurm job allocation incarnation differs; "
+                "refusing unsafe recovery"
+            )
 
     journal = open_journal(root, int(state.get("journal_generation", 0)))
     messages: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
@@ -153,6 +193,7 @@ def _initialize_controller(
         launcher=launcher,
         allocation_id=allocation_id,
         slurm_job_id=slurm_job_id,
+        allocation_incarnation=allocation_incarnation,
         poll_interval=poll_interval,
         cancel_grace=cancel_grace,
         drain_before_end_seconds=drain_before_end_seconds,
@@ -162,14 +203,25 @@ def _initialize_controller(
         output=OutputNotifier(messages),
     )
 
+    lost_reason = None
     if same_slurm_allocation:
         _reattach_slurm_jobs(controller, active)
     else:
-        # Old Slurm steps cannot exist in a replacement allocation.
+        if legacy_slurm_allocation:
+            active_lost_reason = "allocation_incarnation_unavailable"
+        elif previous.get("id") == allocation_id:
+            active_lost_reason = "allocation_incarnation_changed"
+        else:
+            active_lost_reason = "allocation_replaced"
+        if active:
+            lost_reason = active_lost_reason
+        # A replaced or restarted Slurm incarnation cannot retain its old
+        # steps. Legacy active records are not upgraded to a new incarnation;
+        # launches remain paused below until an operator audits the old work.
         for job in active:
             job["state"] = "lost"
             job["finished_at"] = utc_now()
-            job["reason"] = "allocation_replaced"
+            job["reason"] = active_lost_reason
             job["last_assignment"] = job.get("assignment")
             job["assignment"] = None
             write_result_record(root, job)
@@ -184,6 +236,8 @@ def _initialize_controller(
 
     now = utc_now()
     metadata = allocation_metadata(allocation_id, launcher)
+    if allocation_incarnation is not None:
+        metadata["incarnation"] = allocation_incarnation.to_dict()
     metadata.update(
         {
             "state": "running",
@@ -210,7 +264,12 @@ def _initialize_controller(
             state.get("draining") and previous.get("state") == "draining",
         )
     )
-    preserve_drain = drain_requested and previous.get("id") == allocation_id
+    # A drain belongs to one physical allocation incarnation. Slurm can reuse
+    # the same job ID after requeue, but none of the old steps survive it.
+    preserve_drain = drain_requested and (
+        same_slurm_allocation
+        or (launcher == "local" and previous.get("id") == allocation_id)
+    )
     if preserve_drain:
         metadata["state"] = "draining"
     state["allocation"] = metadata
@@ -218,7 +277,9 @@ def _initialize_controller(
     state["drain_requested"] = preserve_drain
     # Recovery owns existing steps but never admits additional work implicitly.
     # An operator must explicitly resume after checking the recovered snapshot.
-    state["launches_paused"] = same_slurm_allocation or start_paused
+    state["launches_paused"] = (
+        same_slurm_allocation or legacy_slurm_allocation or start_paused
+    )
     ineligible = [
         job["id"]
         for job in state["jobs"].values()
@@ -239,14 +300,27 @@ def _initialize_controller(
             ),
             "ineligible_jobs": len(ineligible),
         }
+        if previous_incarnation is not None:
+            metadata["handover"]["previous_incarnation_sha256"] = (
+                previous_incarnation.fingerprint_sha256
+            )
     emit(
         controller,
         "allocation.resumed" if same_slurm_allocation else "allocation.started",
         data={
             "nodes": [item.to_dict() for item in inventory],
+            "incarnation": (
+                allocation_incarnation.to_dict()
+                if allocation_incarnation is not None
+                else None
+            ),
             "reattached_jobs": (
                 [job["id"] for job in active] if same_slurm_allocation else []
             ),
+            "lost_jobs": (
+                [job["id"] for job in active] if lost_reason is not None else []
+            ),
+            "lost_reason": lost_reason,
             **({"handover": metadata["handover"]} if replacement else {}),
         },
     )
@@ -256,7 +330,13 @@ def _initialize_controller(
             "allocation.launches_paused",
             data={
                 "reason": (
-                    "controller_restart" if same_slurm_allocation else "operator_requested"
+                    "controller_restart"
+                    if same_slurm_allocation
+                    else (
+                        "legacy_incarnation_audit_required"
+                        if legacy_slurm_allocation
+                        else "operator_requested"
+                    )
                 )
             },
         )
@@ -1407,6 +1487,7 @@ def run_controller(
     launcher: str,
     allocation_id: str,
     slurm_job_id: str | None = None,
+    allocation_incarnation: AllocationIncarnation | None = None,
     poll_interval: float = 0.2,
     cancel_grace: float = 30,
     start_paused: bool = False,
@@ -1431,6 +1512,13 @@ def run_controller(
         not slurm_job_id or allocation_id != slurm_job_id
     ):
         raise ValueError("the Slurm allocation ID must equal its Slurm job ID")
+    if launcher == "slurm" and (
+        allocation_incarnation is None
+        or allocation_incarnation.slurm_job_id != slurm_job_id
+    ):
+        raise ValueError("a matching Slurm allocation incarnation is required")
+    if launcher == "local" and allocation_incarnation is not None:
+        raise ValueError("local launchers cannot have a Slurm allocation incarnation")
 
     root = ensure_layout(root)
     with controller_lock(root):
@@ -1443,6 +1531,7 @@ def run_controller(
                     launcher=launcher,
                     allocation_id=allocation_id,
                     slurm_job_id=slurm_job_id,
+                    allocation_incarnation=allocation_incarnation,
                     poll_interval=poll_interval,
                     cancel_grace=cancel_grace,
                     start_paused=start_paused,

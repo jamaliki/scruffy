@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
+import stat
 import tempfile
 import traceback
 import unittest
@@ -14,6 +16,7 @@ from scruffy.storage import (
     ControllerAlreadyRunning,
     ReportConflict,
     RequestConflict,
+    StorageError,
     TransientStorageError,
     accept_known_requests,
     accept_reports,
@@ -23,6 +26,7 @@ from scruffy.storage import (
     archive_terminal_job,
     compact_report_receipts,
     controller_lock,
+    create_immutable_json,
     create_job_id,
     create_journal_generation,
     find_archived_job,
@@ -37,6 +41,7 @@ from scruffy.storage import (
     prune_report_receipts,
     read_event_page,
     read_events,
+    read_immutable_json,
     reject_request,
     report_identity_digest,
     report_was_accepted,
@@ -182,6 +187,42 @@ class StorageTestCase(unittest.TestCase):
             ready_queue.close()
             result_queue.close()
         return sorted(results)
+
+
+class ImmutableJsonTests(StorageTestCase):
+    def test_create_is_exact_mode_no_replace_and_sha_bound(self) -> None:
+        target = self.root / "jobs/job-1/runtime-placement-0.json"
+        document = {"node": "gpu-3", "gpu_ids": [2, 7]}
+
+        digest = create_immutable_json(target, document)
+
+        metadata = target.stat()
+        self.assertEqual(0o444, stat.S_IMODE(metadata.st_mode))
+        self.assertEqual(1, metadata.st_nlink)
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), digest)
+        self.assertEqual((document, digest), read_immutable_json(target))
+        original = target.read_bytes()
+        with self.assertRaises(FileExistsError):
+            create_immutable_json(target, {"attacker": True})
+        self.assertEqual(original, target.read_bytes())
+
+    def test_reader_rejects_mutable_multilink_and_noncanonical_authorities(self) -> None:
+        target = self.root / "authority.json"
+        target.parent.mkdir(parents=True)
+        target.write_text('{"value":1}\n', encoding="utf-8")
+        with self.assertRaisesRegex(StorageError, "immutable JSON authority"):
+            read_immutable_json(target)
+        target.write_text('{"value": 1}\n', encoding="utf-8")
+        target.chmod(0o444)
+        with self.assertRaisesRegex(StorageError, "immutable JSON authority"):
+            read_immutable_json(target)
+        target.chmod(0o644)
+        target.write_text('{"value":1}\n', encoding="utf-8")
+        target.chmod(0o444)
+        alias = self.root / "alias.json"
+        os.link(target, alias)
+        with self.assertRaisesRegex(StorageError, "immutable JSON authority"):
+            read_immutable_json(target)
 
 
 class SubmitRequestTests(StorageTestCase):
