@@ -107,16 +107,17 @@ agents; reading does not consume events for anyone else. Use
   scraping its HTML.
 - Prefer MCP `wait_for_updates` whenever it is available. Do not spend agent
   turns repeatedly invoking shell `sleep` while waiting for queue activity.
-- For a remote team queue, use one loopback Streamable HTTP hub. It keeps one
-  upstream observer and serves every agent's private cursor without opening one
-  SSH wait per agent. Pin projects with `X-Scruffy-Project` in MCP connection
-  configuration, not as a tool argument.
+- For a remote team queue, run one loopback Streamable HTTP hub beside the queue
+  and forward it through a transport-only bridge. The remote hub keeps one
+  observer and serves every agent's private cursor; the local bridge must not
+  duplicate or cache Scruffy's tool schema. Pin projects with
+  `X-Scruffy-Project` in MCP connection configuration, not as a tool argument.
 - A hub or connector error affects only the current call. Retry reads with
   `overview`. Retry an uncertain `submit_job` with identical arguments and its
   stable `request_id`; the queue deduplicates a request already made durable.
   A hub restart may return `reset=true`, in which case rebuild from its overview.
-- Hub implementation upgrades require no Codex restart while its loopback URL
-  and tool schemas remain stable. Restart the supervised hub and retry an
+- Hub implementation upgrades require no Codex restart while its forwarded
+  loopback URL and tool schemas remain stable. Restart the remote hub and retry an
   overlapping wait with its last cursor. Tool-list or schema changes additionally
   require Codex's lightweight MCP configuration reload.
 - Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000

@@ -300,6 +300,7 @@ class HttpHubTests(unittest.IsolatedAsyncioTestCase):
         environment["PYTHONPATH"] = os.pathsep.join(
             filter(None, (str(source_root), environment.get("PYTHONPATH")))
         )
+        environment["SCRUFFY_RELEASE"] = "test-release"
         self.log = open(  # noqa: ASYNC230, SIM115 - retained through tearDown
             Path(self.temporary.name) / "hub.log", "w+"
         )
@@ -410,6 +411,13 @@ class HttpHubTests(unittest.IsolatedAsyncioTestCase):
             [[event["kind"] for event in result["events"]] for result in results],
         )
         self.assertEqual(results[0]["next_cursor"], results[1]["next_cursor"])
+
+    async def test_health_reports_the_deployed_release(self) -> None:
+        content = await asyncio.to_thread(
+            _read_url, f"http://127.0.0.1:{self.port}/health"
+        )
+
+        self.assertIn(b'"release":"test-release"', content)
 
 
 if __name__ == "__main__":

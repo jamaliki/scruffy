@@ -1040,6 +1040,11 @@ def _parser() -> argparse.ArgumentParser:
         default=8766,
         help="loopback port for streamable-http (default: 8766)",
     )
+    parser.add_argument(
+        "--release",
+        default=os.environ.get("SCRUFFY_RELEASE"),
+        help="deployment identifier reported by /health (defaults to SCRUFFY_RELEASE)",
+    )
     parser.add_argument("--rpc-tool", help=argparse.SUPPRESS)
     parser.add_argument("--rpc-params", help=argparse.SUPPRESS)
     parser.add_argument("--rpc-id", help=argparse.SUPPRESS)
@@ -1116,6 +1121,13 @@ def main(argv: list[str] | None = None) -> int:
 
                 caller = local_call
             broker = UpdateBroker(caller)
+
+            def health() -> dict[str, Any]:
+                result = broker.health()
+                if arguments.release:
+                    result["release"] = arguments.release
+                return result
+
             server = create_server(
                 root,
                 HubCaller(caller, broker),
@@ -1124,7 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
                 host="127.0.0.1",
                 port=arguments.port,
                 stateless_http=True,
-                health=broker.health,
+                health=health,
             )
         else:
             server = create_server(root, caller, project_id=project_id)
