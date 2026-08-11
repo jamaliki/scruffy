@@ -269,7 +269,8 @@ class RecoverySafetyTests(unittest.TestCase):
                 "allocation": {"id": "240292", "incarnation": previous.to_dict()},
                 "nodes": {},
                 "jobs": {job["id"]: job},
-                "draining": False,
+                "draining": True,
+                "drain_requested": True,
             },
         )
 
@@ -282,6 +283,7 @@ class RecoverySafetyTests(unittest.TestCase):
             allocation_incarnation=current,
             poll_interval=0.1,
             cancel_grace=30,
+            start_paused=True,
         )
         self.addCleanup(lambda: controller.journal.close())
 
@@ -291,10 +293,59 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertIsNone(recovered["assignment"])
         self.assertIsNotNone(recovered["last_assignment"])
         self.assertNotIn("job-stale", controller.running)
+        self.assertFalse(controller.state["draining"])
+        self.assertFalse(controller.state["drain_requested"])
+        self.assertTrue(controller.state["launches_paused"])
+        self.assertEqual(
+            {
+                "previous_allocation_id": "240292",
+                "previous_incarnation_sha256": previous.fingerprint_sha256,
+                "lost_jobs": 1,
+                "queued_jobs": 0,
+                "blocked_jobs": 0,
+                "ineligible_jobs": 0,
+            },
+            controller.state["allocation"]["handover"],
+        )
         self.assertEqual(
             current.fingerprint_sha256,
             controller.state["allocation"]["incarnation"]["fingerprint_sha256"],
         )
+
+    def test_same_incarnation_preserves_explicit_drain(self) -> None:
+        incarnation = slurm_incarnation()
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {
+                    "id": "240292",
+                    "incarnation": incarnation.to_dict(),
+                },
+                "nodes": {},
+                "jobs": {},
+                "draining": True,
+                "drain_requested": True,
+            },
+        )
+
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=incarnation,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        self.assertTrue(controller.state["draining"])
+        self.assertTrue(controller.state["drain_requested"])
+        self.assertTrue(controller.state["launches_paused"])
 
     def test_same_restart_count_with_new_startup_inventory_loses_old_steps(self) -> None:
         previous = slurm_incarnation(node="gpu-2")

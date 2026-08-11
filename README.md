@@ -429,6 +429,19 @@ Every same-allocation restart begins with launches paused: queued jobs remain
 durable and dependencies may resolve, but nothing new starts until an operator
 checks the recovered state and runs `scruffy --root "$SCRUFFY_ROOT" resume`.
 
+For an allocation replacement, including a Slurm requeue that reuses the same
+job ID, start against the stable queue root with launches paused:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" serve --start-paused
+scruffy --root "$SCRUFFY_ROOT" summary
+scruffy --root "$SCRUFFY_ROOT" resume
+```
+
+Scruffy identifies the physical allocation by its Slurm restart count and
+inventory, not only its job ID. Old active steps become `lost`, while durable
+queued work is held until the explicit `resume`.
+
 The controller deliberately runs one submitted argv per job. It is not a retry
 engine, dynamic workflow fan-out engine, or artifact store: submit retries and
 new tasks explicitly, and keep artifacts in their normal storage.

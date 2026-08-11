@@ -99,6 +99,7 @@ def _initialize_controller(
     poll_interval: float,
     cancel_grace: float,
     allocation_incarnation: AllocationIncarnation | None = None,
+    start_paused: bool = False,
 ) -> Controller:
     state = load_recovered_state(root)
     active = [
@@ -139,6 +140,12 @@ def _initialize_controller(
             previous.get("id") == allocation_id
             or (previous.get("id") is None and bool(state.get("jobs")))
         )
+    )
+    previous_allocation_id = previous.get("id")
+    replacement = (
+        launcher == "slurm"
+        and isinstance(previous_allocation_id, str)
+        and not same_slurm_allocation
     )
     if active and launcher == "local":
         raise UnsafeRecovery(
@@ -231,13 +238,20 @@ def _initialize_controller(
     )
     if slurm_job_id:
         metadata["slurm_job_id"] = slurm_job_id
+    if same_slurm_allocation and isinstance(previous.get("handover"), dict):
+        metadata["handover"] = previous["handover"]
     drain_requested = bool(
         state.get(
             "drain_requested",
             state.get("draining") and previous.get("state") == "draining",
         )
     )
-    preserve_drain = drain_requested and previous.get("id") == allocation_id
+    # A drain belongs to one physical allocation incarnation. Slurm can reuse
+    # the same job ID after requeue, but none of the old steps survive it.
+    preserve_drain = drain_requested and (
+        same_slurm_allocation
+        or (launcher == "local" and previous.get("id") == allocation_id)
+    )
     if preserve_drain:
         metadata["state"] = "draining"
     state["allocation"] = metadata
@@ -245,7 +259,32 @@ def _initialize_controller(
     state["drain_requested"] = preserve_drain
     # Recovery owns existing steps but never admits additional work implicitly.
     # An operator must explicitly resume after checking the recovered snapshot.
-    state["launches_paused"] = same_slurm_allocation or legacy_slurm_allocation
+    state["launches_paused"] = (
+        same_slurm_allocation or legacy_slurm_allocation or start_paused
+    )
+    if replacement:
+        metadata["handover"] = {
+            "previous_allocation_id": previous_allocation_id,
+            "previous_incarnation_sha256": (
+                previous_incarnation.fingerprint_sha256
+                if previous_incarnation is not None
+                else None
+            ),
+            "lost_jobs": len(active),
+            "queued_jobs": sum(
+                job["state"] == "queued" for job in state["jobs"].values()
+            ),
+            "blocked_jobs": sum(
+                job["state"] == "blocked" for job in state["jobs"].values()
+            ),
+            "ineligible_jobs": sum(
+                job["state"] in {"queued", "blocked"}
+                and not request_can_ever_fit(
+                    inventory, ResourceRequest.from_dict(job["request"])
+                )
+                for job in state["jobs"].values()
+            ),
+        }
     emit(
         controller,
         "allocation.resumed" if same_slurm_allocation else "allocation.started",
@@ -263,6 +302,7 @@ def _initialize_controller(
                 [job["id"] for job in active] if lost_reason is not None else []
             ),
             "lost_reason": lost_reason,
+            **({"handover": metadata["handover"]} if replacement else {}),
         },
     )
     if state["launches_paused"]:
@@ -273,7 +313,11 @@ def _initialize_controller(
                 "reason": (
                     "controller_restart"
                     if same_slurm_allocation
-                    else "legacy_incarnation_audit_required"
+                    else (
+                        "legacy_incarnation_audit_required"
+                        if legacy_slurm_allocation
+                        else "operator_requested"
+                    )
                 )
             },
         )
@@ -1148,6 +1192,7 @@ def run_controller(
     allocation_incarnation: AllocationIncarnation | None = None,
     poll_interval: float = 0.2,
     cancel_grace: float = 30,
+    start_paused: bool = False,
 ) -> None:
     """Own a queue until interrupted, retrying transient storage failures."""
 
@@ -1184,6 +1229,7 @@ def run_controller(
                     allocation_incarnation=allocation_incarnation,
                     poll_interval=poll_interval,
                     cancel_grace=cancel_grace,
+                    start_paused=start_paused,
                 )
                 _serve(controller)
                 return

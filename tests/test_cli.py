@@ -309,6 +309,7 @@ class ServeCliTests(unittest.TestCase):
             allocation_incarnation=None,
             poll_interval=0.1,
             cancel_grace=2.5,
+            start_paused=False,
         )
 
     def test_missing_inventory_is_reported_without_a_traceback(self) -> None:
@@ -370,7 +371,22 @@ class ServeCliTests(unittest.TestCase):
             allocation_incarnation=self.incarnation,
             poll_interval=0.2,
             cancel_grace=30,
+            start_paused=False,
         )
+
+    def test_serve_can_start_paused_for_allocation_handover(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"SLURM_JOB_ID": "263105"}, clear=True),
+            mock.patch(
+                "scruffy.cli.discover_slurm_allocation",
+                return_value=(self.inventory, self.incarnation),
+            ),
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+        ):
+            result = main(["--root", str(self.root), "serve", "--start-paused"])
+
+        self.assertEqual(0, result)
+        self.assertTrue(run_controller.call_args.kwargs["start_paused"])
 
     def test_slurm_launcher_requires_a_job_id_before_starting(self) -> None:
         stderr = io.StringIO()

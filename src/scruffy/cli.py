@@ -152,6 +152,7 @@ def _serve(arguments: argparse.Namespace) -> int:
         allocation_incarnation=allocation_incarnation,
         poll_interval=arguments.poll_interval,
         cancel_grace=arguments.cancel_grace,
+        start_paused=arguments.start_paused,
     )
     return 0
 
@@ -404,6 +405,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30,
         help="local seconds before SIGKILL; Slurm uses scancel (default: 30)",
+    )
+    serve.add_argument(
+        "--start-paused",
+        action="store_true",
+        help="discover and reconcile the allocation without launching queued jobs",
     )
     serve.set_defaults(handler=_serve)
 
