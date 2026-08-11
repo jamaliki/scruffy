@@ -453,11 +453,12 @@ def _submit_job(
     gpus = params.get("gpus_per_node", 1)
     cpus = params.get("cpus_per_node")
     memory = params.get("memory_gb_per_node")
+    default_units = max(1, gpus) if type(gpus) is int else 1
     request = ResourceRequest(
         nodes=params.get("nodes", 1),
         gpus_per_node=gpus,
-        cpus_per_node=14 * gpus if cpus is None else cpus,
-        memory_gb_per_node=128 * gpus if memory is None else memory,
+        cpus_per_node=14 * default_units if cpus is None else cpus,
+        memory_gb_per_node=128 * default_units if memory is None else memory,
     )
     return enqueue_job(
         root,

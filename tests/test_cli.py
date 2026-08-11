@@ -70,6 +70,32 @@ class SubmitCliTests(unittest.TestCase):
             needs=[],
         )
 
+    def test_cpu_only_submit_keeps_positive_cpu_and_memory_defaults(self) -> None:
+        with (
+            mock.patch(
+                "scruffy.cli.submit_job",
+                return_value={"job_id": "job-cpu", "state": "submitted"},
+            ) as submit,
+            mock.patch("scruffy.cli._json"),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "submit",
+                    "--gpus-per-node",
+                    "0",
+                    "--",
+                    "true",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            ResourceRequest(1, 0, 14, 128),
+            submit.call_args.kwargs["request"],
+        )
+
     def test_submit_parses_workflow_dependencies(self) -> None:
         response = {"job_id": "job-infer", "state": "submitted"}
         with (

@@ -38,7 +38,10 @@ IDs are available in `SCRUFFY_PHYSICAL_GPU_IDS`/`SCRUFFY_STEP_GPU_IDS` and in th
 immutable per-node runtime-placement record referenced by the job.
 `SCRUFFY_GPU_IDS` deliberately follows the workload-visible
 `CUDA_VISIBLE_DEVICES` mapping; `SCRUFFY_RESERVED_GPU_IDS` retains the admission
-ledger identity. Local development mode still maps the reservation directly.
+ledger identity. CPU-only requests use `--gpus-per-node 0`; their step explicitly
+requests `--gres=none`, exposes empty Scruffy/CUDA device mappings, and publishes
+an authenticated empty placement record. Local development mode still maps the
+reservation directly.
 Scruffy trusts every process able to write `SCRUFFY_ROOT`; it is not a multi-user
 security boundary.
 

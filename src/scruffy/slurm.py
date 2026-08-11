@@ -410,7 +410,7 @@ def build_srun_argv(
     if not slurm_job_id:
         raise ValueError("a Slurm job ID is required for the Slurm launcher")
     nodes = len(node_names)
-    return [
+    argv = [
         "srun",
         f"--jobid={slurm_job_id}",
         f"--job-name={name}",
@@ -419,22 +419,32 @@ def build_srun_argv(
         f"--nodelist={','.join(node_names)}",
         f"--ntasks={nodes}",
         "--ntasks-per-node=1",
-        f"--gpus-per-node={gpus_per_node}",
-        f"--cpus-per-task={cpus_per_node}",
-        "--cpu-bind=none",
-        f"--mem={memory_gb_per_node}G",
-        "--kill-on-bad-exit=1",
-        f"--wait={wait_seconds}",
-        "--wait-for-children",
-        "--export=ALL",
-        "--label",
-        f"--output={stdout_file}",
-        f"--error={stderr_file}",
-        sys.executable,
-        "-m",
-        "scruffy.worker",
-        str(assignment_file),
     ]
+    if gpus_per_node == 0:
+        # Slurm steps inherit the outer allocation's GRES unless they opt out.
+        # CPU-only work must not receive or hide an allocation GPU.
+        argv.append("--gres=none")
+    else:
+        argv.append(f"--gpus-per-node={gpus_per_node}")
+    argv.extend(
+        [
+            f"--cpus-per-task={cpus_per_node}",
+            "--cpu-bind=none",
+            f"--mem={memory_gb_per_node}G",
+            "--kill-on-bad-exit=1",
+            f"--wait={wait_seconds}",
+            "--wait-for-children",
+            "--export=ALL",
+            "--label",
+            f"--output={stdout_file}",
+            f"--error={stderr_file}",
+            sys.executable,
+            "-m",
+            "scruffy.worker",
+            str(assignment_file),
+        ]
+    )
+    return argv
 
 
 def build_srun_environment(

@@ -171,12 +171,12 @@ class ResourceRequest:
     memory_gb_per_node: int
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "nodes",
+        object.__setattr__(
+            self,
             "gpus_per_node",
-            "cpus_per_node",
-            "memory_gb_per_node",
-        ):
+            _nonnegative_int(self.gpus_per_node, "gpus_per_node"),
+        )
+        for field_name in ("nodes", "cpus_per_node", "memory_gb_per_node"):
             object.__setattr__(
                 self,
                 field_name,
@@ -232,7 +232,11 @@ class NodeReservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "node", _nonempty_string(self.node, "node"))
-        object.__setattr__(self, "gpu_ids", _gpu_ids(self.gpu_ids, "gpu_ids"))
+        object.__setattr__(
+            self,
+            "gpu_ids",
+            _gpu_ids(self.gpu_ids, "gpu_ids", allow_empty=True),
+        )
         object.__setattr__(self, "cpus", _positive_int(self.cpus, "cpus"))
         object.__setattr__(
             self,

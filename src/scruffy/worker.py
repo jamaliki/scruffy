@@ -75,18 +75,24 @@ def _slurm_gpu_environment(
     contract = document.get("runtime_placement_contract")
     if type(contract) is not int or contract != 1:
         raise ValueError("unsupported runtime placement contract")
-    if type(expected) is not int or expected <= 0:
-        raise ValueError("gpus_per_node must be a positive integer")
+    if type(expected) is not int or expected < 0:
+        raise ValueError("gpus_per_node must be a non-negative integer")
     if len(placement["gpu_ids"]) != expected:
         raise ValueError("ledger GPU count differs from the requested Slurm step")
 
     inherited = os.environ
     visible_raw = inherited.get("CUDA_VISIBLE_DEVICES", "")
     step_raw = inherited.get("SLURM_STEP_GPUS", "")
-    visible = _comma_values(visible_raw, "CUDA_VISIBLE_DEVICES")
-    step_gpus = _comma_values(step_raw, "SLURM_STEP_GPUS")
-    if len(visible) != expected or len(step_gpus) != expected:
-        raise ValueError("Slurm GPU mapping count differs from gpus_per_node")
+    if expected == 0:
+        if visible_raw or step_raw:
+            raise ValueError("CPU-only Slurm step unexpectedly exposes GPUs")
+        visible: tuple[str, ...] = ()
+        step_gpus: tuple[str, ...] = ()
+    else:
+        visible = _comma_values(visible_raw, "CUDA_VISIBLE_DEVICES")
+        step_gpus = _comma_values(step_raw, "SLURM_STEP_GPUS")
+        if len(visible) != expected or len(step_gpus) != expected:
+            raise ValueError("Slurm GPU mapping count differs from gpus_per_node")
 
     step_id = inherited.get("SLURM_STEP_ID") or inherited.get("SLURM_STEPID")
     job_id = inherited.get("SLURM_JOB_ID") or inherited.get("SLURM_JOBID")

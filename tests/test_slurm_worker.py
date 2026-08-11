@@ -117,6 +117,24 @@ class SlurmArgumentTests(unittest.TestCase):
         self.assertNotIn("--overlap", argv)
         self.assertIn("--exact", argv)
 
+    def test_cpu_only_step_explicitly_opts_out_of_gres(self) -> None:
+        argv = build_srun_argv(
+            slurm_job_id="240292",
+            name="scruffy-cpu",
+            assignment_file=Path("assignment.json"),
+            stdout_file=Path("stdout.log"),
+            stderr_file=Path("stderr.log"),
+            node_names=["gpu-3"],
+            gpus_per_node=0,
+            cpus_per_node=8,
+            memory_gb_per_node=32,
+        )
+
+        self.assertIn("--gres=none", argv)
+        self.assertFalse(any(item.startswith("--gpus-per-node=") for item in argv))
+        self.assertNotIn("--overlap", argv)
+        self.assertIn("--exact", argv)
+
     def test_full_node_step_requests_all_gpu_tres(self) -> None:
         argv = build_srun_argv(
             slurm_job_id="240292",
@@ -710,6 +728,115 @@ class WorkerPlacementTests(unittest.TestCase):
                     execute_assignment(source)
                 second_exec.assert_not_called()
             self.assertEqual(original, placement_file.read_bytes())
+
+    def test_cpu_only_slurm_worker_binds_empty_device_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            source = Path(temporary) / "assignment.json"
+            document = {
+                "root": str(root),
+                "job_id": "job-cpu",
+                "project_id": "science",
+                "launcher": "slurm",
+                "allocation_incarnation_sha256": "a" * 64,
+                "runtime_placement_contract": 1,
+                "slurm_job_id": "263105",
+                "gpus_per_node": 0,
+                "argv": ["python", "analyze.py"],
+                "cwd": "/work/job-cpu",
+                "env": {
+                    "CUDA_VISIBLE_DEVICES": "7",
+                    "SCRUFFY_GPU_IDS": "7",
+                    "SCRUFFY_PHYSICAL_GPU_IDS": "7",
+                },
+                "assignment": [
+                    {
+                        "node": "gpu-5.cluster",
+                        "gpu_ids": [],
+                        "runtime_placement": (
+                            "jobs/job-cpu/runtime-placement-0.json"
+                        ),
+                    }
+                ],
+            }
+            source.write_text(json.dumps(document), encoding="utf-8")
+            inherited = {
+                "SLURM_JOB_GPUS": "0,1,2,3,4,5,6,7",
+                "SLURM_JOB_ID": "263105",
+                "SLURM_STEP_ID": "43",
+            }
+            with (
+                mock.patch.dict(os.environ, inherited, clear=True),
+                mock.patch("scruffy.worker.current_node", return_value="gpu-5.cluster"),
+                mock.patch("scruffy.worker.os.chdir"),
+                mock.patch("scruffy.worker.os.execvpe") as execvpe,
+            ):
+                execute_assignment(source)
+
+            environment = execvpe.call_args.args[2]
+            self.assertEqual("", environment["CUDA_VISIBLE_DEVICES"])
+            self.assertEqual("", environment["SCRUFFY_GPU_IDS"])
+            self.assertEqual("", environment["SCRUFFY_PHYSICAL_GPU_IDS"])
+            self.assertEqual("", environment["SCRUFFY_STEP_GPU_IDS"])
+            self.assertEqual("", environment["SCRUFFY_RESERVED_GPU_IDS"])
+            placement_file = root.resolve() / "jobs/job-cpu/runtime-placement-0.json"
+            self.assertEqual(
+                {
+                    "schema": 1,
+                    "job_id": "job-cpu",
+                    "node": "gpu-5.cluster",
+                    "requested_gpus": 0,
+                    "ledger_gpu_ids": [],
+                    "slurm_job_id": "263105",
+                    "slurm_step_id": "43",
+                    "slurm_step_gpus": [],
+                    "cuda_visible_devices": [],
+                    "cuda_device_order": None,
+                },
+                json.loads(placement_file.read_text(encoding="utf-8")),
+            )
+
+    def test_cpu_only_slurm_worker_rejects_exposed_devices(self) -> None:
+        document = {
+            "root": "/shared/scruffy",
+            "job_id": "job-cpu",
+            "launcher": "slurm",
+            "allocation_incarnation_sha256": "a" * 64,
+            "runtime_placement_contract": 1,
+            "slurm_job_id": "263105",
+            "gpus_per_node": 0,
+            "argv": ["true"],
+            "cwd": "/tmp",
+            "env": {},
+            "assignment": [
+                {
+                    "node": "gpu-5",
+                    "gpu_ids": [],
+                    "runtime_placement": "jobs/job-cpu/runtime-placement-0.json",
+                }
+            ],
+        }
+        for exposed in (
+            {"CUDA_VISIBLE_DEVICES": "0"},
+            {"SLURM_STEP_GPUS": "7"},
+        ):
+            with tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "assignment.json"
+                source.write_text(json.dumps(document), encoding="utf-8")
+                inherited = {
+                    "SLURM_JOB_ID": "263105",
+                    "SLURM_STEP_ID": "43",
+                    **exposed,
+                }
+                with (
+                    self.subTest(exposed=exposed),
+                    mock.patch.dict(os.environ, inherited, clear=True),
+                    mock.patch("scruffy.worker.current_node", return_value="gpu-5"),
+                    mock.patch("scruffy.worker.os.execvpe") as execvpe,
+                    self.assertRaisesRegex(ValueError, "unexpectedly exposes GPUs"),
+                ):
+                    execute_assignment(source)
+                execvpe.assert_not_called()
 
     def test_slurm_worker_requires_a_canonical_incarnation_binding(self) -> None:
         document = {

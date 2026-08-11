@@ -394,6 +394,93 @@ class RecoverySafetyTests(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual("job-replacement", start.call_args.args[1]["id"])
 
+    def test_legacy_cpu_only_dependency_is_skipped_after_upstream_is_lost(
+        self,
+    ) -> None:
+        cpu_request = ResourceRequest(1, 0, 1, 1)
+        analyze = job_image("job-analyze", "gpu-3")
+        analyze.update(
+            {
+                "request": cpu_request.to_dict(),
+                "assignment": Assignment(
+                    "job-analyze",
+                    cpu_request,
+                    (NodeReservation("gpu-3", (), 1, 1),),
+                ).to_dict(),
+                "launch_token": "scruffy-analyze",
+                "workflow_id": "tmr-recovery",
+                "task_id": "analyze",
+                "needs": [],
+            }
+        )
+        validate = {
+            **job_image("job-validate", "gpu-3"),
+            "state": "blocked",
+            "request": cpu_request.to_dict(),
+            "assignment": None,
+            "queue_order": 2,
+            "workflow_id": "tmr-recovery",
+            "task_id": "validate",
+            "needs": [{"task_id": "analyze", "condition": "succeeded"}],
+            "blockers": [],
+            "dependency_gate_passed": False,
+            "reason": "waiting_for_dependencies",
+        }
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": queue_id(self.root),
+                "last_seq": 0,
+                "allocation": {"id": "240292"},
+                "nodes": {},
+                "jobs": {
+                    "job-analyze": analyze,
+                    "job-validate": validate,
+                },
+                "draining": False,
+            },
+        )
+
+        incarnation = slurm_incarnation(restart_count=1)
+        controller = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=incarnation,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: controller.journal.close())
+
+        self.assertTrue(controller.state["launches_paused"])
+        self.assertEqual("lost", controller.state["jobs"]["job-analyze"]["state"])
+        _refresh_dependencies(controller)
+        recovered = controller.state["jobs"]["job-validate"]
+        self.assertEqual("skipped", recovered["state"])
+        self.assertEqual("dependency_unsatisfied", recovered["reason"])
+        with mock.patch("scruffy.lifecycle.start_job") as start:
+            schedule(controller)
+        start.assert_not_called()
+
+        controller.journal.close()
+        restarted = _initialize_controller(
+            root=self.root,
+            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            launcher="slurm",
+            allocation_id="240292",
+            slurm_job_id="240292",
+            allocation_incarnation=incarnation,
+            poll_interval=0.1,
+            cancel_grace=30,
+        )
+        self.addCleanup(lambda: restarted.journal.close())
+        self.assertTrue(restarted.state["launches_paused"])
+        self.assertEqual("lost", restarted.state["jobs"]["job-analyze"]["state"])
+        self.assertEqual("skipped", restarted.state["jobs"]["job-validate"]["state"])
+
     def test_same_allocation_restart_requires_explicit_resume_to_launch(self) -> None:
         queued = job_image("job-queued", "gpu-3")
         queued.update({"state": "queued", "assignment": None})
@@ -1245,6 +1332,45 @@ class RuntimePlacementAuthorityTests(unittest.TestCase):
         ][-1]
         self.assertEqual(digest, terminal["job"]["runtime_placements"][0]["sha256"])
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), digest)
+
+    def test_cpu_only_terminal_binds_an_authenticated_empty_placement(self) -> None:
+        request = ResourceRequest(1, 0, 1, 1)
+        job = self._job()
+        job["request"] = request.to_dict()
+        job["assignment"] = Assignment(
+            "job-1",
+            request,
+            (NodeReservation("gpu-3", (), 1, 1),),
+        ).to_dict()
+        source = self.root / "jobs/job-1/runtime-placement-0.json"
+        digest = create_immutable_json(
+            source,
+            self._placement(
+                requested_gpus=0,
+                ledger_gpu_ids=[],
+                slurm_step_gpus=[],
+                cuda_visible_devices=[],
+            ),
+        )
+
+        _finish_job(self.controller, "job-1", RunningProcess(mock.Mock(), None), 0)
+
+        self.assertEqual("succeeded", job["state"])
+        self.assertEqual("authenticated", job["runtime_placement_status"])
+        self.assertEqual(
+            [
+                {
+                    "path": "jobs/job-1/runtime-placement-0.json",
+                    "sha256": digest,
+                    "node": "gpu-3",
+                    "slurm_step_id": "240292.7",
+                    "physical_gpu_ids": [],
+                    "visible_gpu_ids": [],
+                    "reserved_gpu_ids": [],
+                }
+            ],
+            job["runtime_placements"],
+        )
 
     def test_success_fails_closed_on_mutable_or_substituted_placement(self) -> None:
         for record, mutate_mode in (
