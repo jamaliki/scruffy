@@ -1408,7 +1408,8 @@ class SlurmLaunchTests(unittest.TestCase):
                 root / "stderr.log",
             )
 
-        self.assertIn("--gpus-per-node=1", argv)
+        self.assertIn("--gpus-per-task=1", argv)
+        self.assertNotIn("--gpu-bind=none", argv)
         self.assertIn("--cpus-per-task=14", argv)
         self.assertIn("--mem=128G", argv)
         self.assertNotIn("--overlap", argv)

@@ -89,6 +89,10 @@ def _slurm_gpu_environment(
         visible: tuple[str, ...] = ()
         step_gpus: tuple[str, ...] = ()
     else:
+        if not visible_raw:
+            raise ValueError(
+                "Slurm reserved GPUs but did not expose CUDA_VISIBLE_DEVICES"
+            )
         visible = _comma_values(visible_raw, "CUDA_VISIBLE_DEVICES")
         step_gpus = _comma_values(step_raw, "SLURM_STEP_GPUS")
         if len(visible) != expected or len(step_gpus) != expected:

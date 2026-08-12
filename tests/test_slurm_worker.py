@@ -52,8 +52,7 @@ class SlurmArgumentTests(unittest.TestCase):
                 "--nodelist=gpu-3,gpu-5",
                 "--ntasks=2",
                 "--ntasks-per-node=1",
-                "--gpus-per-node=2",
-                "--gpu-bind=none",
+                "--gpus-per-task=2",
                 "--cpus-per-task=28",
                 "--cpu-bind=none",
                 "--mem=256G",
@@ -115,7 +114,9 @@ class SlurmArgumentTests(unittest.TestCase):
             memory_gb_per_node=128,
         )
 
-        self.assertIn("--gpus-per-node=1", argv)
+        self.assertIn("--gpus-per-task=1", argv)
+        self.assertFalse(any(item.startswith("--gpus-per-node=") for item in argv))
+        self.assertNotIn("--gpu-bind=none", argv)
         self.assertNotIn("--overlap", argv)
         self.assertIn("--exact", argv)
 
@@ -134,6 +135,7 @@ class SlurmArgumentTests(unittest.TestCase):
 
         self.assertIn("--gres=none", argv)
         self.assertFalse(any(item.startswith("--gpus-per-node=") for item in argv))
+        self.assertFalse(any(item.startswith("--gpus-per-task=") for item in argv))
         self.assertNotIn("--overlap", argv)
         self.assertIn("--exact", argv)
 
@@ -150,7 +152,7 @@ class SlurmArgumentTests(unittest.TestCase):
             memory_gb_per_node=1024,
         )
 
-        self.assertIn("--gpus-per-node=8", argv)
+        self.assertIn("--gpus-per-task=8", argv)
         self.assertIn("--cpus-per-task=112", argv)
         self.assertIn("--mem=1024G", argv)
 

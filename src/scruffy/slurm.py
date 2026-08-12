@@ -403,9 +403,10 @@ def build_srun_argv(
     """Build one argv-only Slurm step for a rectangular multi-node job.
 
     Slurm owns the physical resources for every step. Scruffy chooses nodes and
-    admission slots, while the explicit step request makes Slurm allocate
-    disjoint GPUs, CPUs, and memory. ``--exact`` prevents a partial step from
-    inheriting the remaining resources in the outer allocation.
+    admission slots, while each worker task requests its exact GPUs, CPUs, and
+    memory. Task-scoped GPU requests make Slurm bind a device set to every
+    worker and populate ``CUDA_VISIBLE_DEVICES``. ``--exact`` prevents a
+    partial step from inheriting the remaining outer-allocation resources.
     """
 
     if not slurm_job_id:
@@ -428,7 +429,10 @@ def build_srun_argv(
         # CPU-only work must not receive or hide an allocation GPU.
         argv.append("--gres=none")
     else:
-        argv.extend([f"--gpus-per-node={gpus_per_node}", "--gpu-bind=none"])
+        # There is exactly one worker task per selected node. Request GPUs for
+        # that task rather than merely reserving node-level GRES: Slurm then
+        # owns both exclusivity and the task-visible CUDA device mapping.
+        argv.append(f"--gpus-per-task={gpus_per_node}")
     argv.extend(
         [
             f"--cpus-per-task={cpus_per_node}",
