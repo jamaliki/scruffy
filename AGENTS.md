@@ -133,7 +133,7 @@ agents; reading does not consume events for anyone else. Use
   terminal and means a required successful dependency ended unsuccessfully.
 - Match asynchronous cancel and drain outcomes using the returned `request_id`.
   `drain` survives controller restarts and disables launches until the outer
-  allocation is replaced.
+  allocation is replaced or an operator explicitly runs `scruffy resume`.
 - GPU identity is `(node, gpu_id)`, never a bare global ordinal.
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the

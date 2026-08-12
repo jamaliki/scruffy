@@ -217,7 +217,7 @@ def drain_queue(root: Path) -> dict[str, Any]:
 
 
 def resume_queue(root: Path) -> dict[str, Any]:
-    """Resume launches after a controller-recovery pause."""
+    """Resume launches after an explicit drain or controller-recovery pause."""
 
     request_id = submit_command(root, {"kind": "resume", "submitted_at": utc_now()})
     return {"request_id": request_id, "state": "resume_requested"}

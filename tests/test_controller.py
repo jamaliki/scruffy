@@ -18,6 +18,7 @@ from scruffy.client import (
     cancel_job,
     drain_queue,
     publish_event,
+    resume_queue,
     status,
     submit_job,
     submit_workflow,
@@ -987,6 +988,24 @@ class ControllerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual("already_draining", ignored["data"]["reason"])
         self.assertTrue(status(self.root)["draining"])
+
+        resumed = resume_queue(self.root)
+
+        def resume_outcome() -> dict[str, Any] | None:
+            return next(
+                (
+                    event
+                    for event in read_events(self.root)
+                    if event["kind"] == "allocation.launches_resumed"
+                    and event["data"]["request_id"] == resumed["request_id"]
+                ),
+                None,
+            )
+
+        event = self._wait_until(resume_outcome, "resume acknowledgement")
+        self.assertTrue(event["data"]["cleared_drain"])
+        self.assertFalse(status(self.root)["draining"])
+        self.assertEqual("running", status(self.root)["allocation"]["state"])
 
     def test_drain_survives_same_allocation_controller_restart(self) -> None:
         self._start_controller((0,))

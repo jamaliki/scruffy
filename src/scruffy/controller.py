@@ -1120,21 +1120,25 @@ def _ingest_commands(controller: Controller) -> None:
                 emit(controller, "allocation.draining", data=data)
         elif kind == "resume":
             data = {"request_id": command.get("request_id")}
-            if controller.state["draining"]:
-                emit(
-                    controller,
-                    "allocation.resume_ignored",
-                    data={**data, "reason": "allocation_draining"},
-                )
-            elif not controller.state.get("launches_paused", False):
+            was_draining = bool(controller.state["draining"])
+            if not was_draining and not controller.state.get(
+                "launches_paused", False
+            ):
                 emit(
                     controller,
                     "allocation.resume_ignored",
                     data={**data, "reason": "launches_not_paused"},
                 )
             else:
+                controller.state["draining"] = False
+                controller.state["drain_requested"] = False
                 controller.state["launches_paused"] = False
-                emit(controller, "allocation.launches_resumed", data=data)
+                controller.state["allocation"]["state"] = "running"
+                emit(
+                    controller,
+                    "allocation.launches_resumed",
+                    data={**data, "cleared_drain": was_draining},
+                )
         if not deferred:
             remove_command(source)
 

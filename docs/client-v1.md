@@ -273,13 +273,13 @@ release safe. Cancelling any terminal job, including an archived one, produces
 
 Drain disables new launches for the current allocation. Running jobs continue,
 queued jobs remain durable, and controller restarts preserve the drain. A
-replacement allocation clears it.
+replacement allocation or an explicit `scruffy resume` clears it.
 
 A same-allocation controller restart reattaches existing Slurm steps but starts
 with new launches paused. Queued jobs and dependency transitions remain durable
 without consuming resources. `scruffy resume` asynchronously clears this
-recovery pause after the operator has checked the snapshot; it never overrides
-an explicit drain. Its outcome is `allocation.launches_resumed` or
+recovery pause or an explicit drain after the operator has checked the
+snapshot. Its outcome is `allocation.launches_resumed` or
 `allocation.resume_ignored`, correlated by `request_id`.
 
 `scruffy serve --start-paused` provides the same inspection barrier when a new

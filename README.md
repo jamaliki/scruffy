@@ -486,8 +486,8 @@ Cancellation, drain, and resume requests are asynchronous and return a
 `request_id` that appears on their journal outcome. `drain` disables new
 launches for the current allocation; running jobs continue and queued jobs
 remain durable. The drain survives controller restarts and clears when a
-replacement allocation starts. `resume` clears a recovery or `--start-paused`
-launch pause; it cannot override `drain`.
+replacement allocation starts. An explicit `resume` also reverses a drain or
+clears a recovery or `--start-paused` launch pause.
 Cancelling an archived terminal job produces `job.cancel_ignored`, just like
 cancelling a terminal job still in hot state.
 

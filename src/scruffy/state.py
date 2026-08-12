@@ -490,10 +490,16 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
         elif event.get("kind") == "allocation.draining":
             state["draining"] = True
             state["drain_requested"] = True
+            if isinstance(state.get("allocation"), dict):
+                state["allocation"]["state"] = "draining"
         elif event.get("kind") == "allocation.launches_paused":
             state["launches_paused"] = True
         elif event.get("kind") == "allocation.launches_resumed":
+            state["draining"] = False
+            state["drain_requested"] = False
             state["launches_paused"] = False
+            if isinstance(state.get("allocation"), dict):
+                state["allocation"]["state"] = "running"
         state["last_seq"] = max(int(state.get("last_seq", 0)), int(event["seq"]))
     state["journal_offset"] = journal_offset
     state.setdefault("report_acks", {})
