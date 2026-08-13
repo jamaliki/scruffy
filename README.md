@@ -14,6 +14,113 @@ affiliated with the show or its owners.
 This guarantee covers only work launched through Scruffy. Do not run out-of-band
 GPU processes against its configured inventory.
 
+## Architecture at a Glance
+
+### From Submission to GPU
+
+```mermaid
+flowchart TB
+    producers["Humans · agents · Python clients
+submit asynchronously"]
+    inboxes[["Shared queue root
+requests · workflows · commands · reports"]]
+    controller["Single controller
+one lock · one writer · one resource ledger"]
+    scheduler["Pure scheduler
+dependency gates · fair priority · best fit"]
+    reserve["Durable reservation
+job.starting enters the journal first"]
+    workers["Slurm worker steps
+explicit GPU · CPU · memory ownership"]
+    payload["Job payload
+stdout · stderr · provenance · progress"]
+    state[("Recovery and observation
+journal · snapshot · archived jobs")]
+    observers["Independent readers
+CLI · MCP hub · dashboard"]
+
+    producers -->|non-blocking write| inboxes --> controller --> scheduler
+    scheduler --> reserve --> workers --> payload
+    controller --> state --> observers
+    payload -.->|reports via inbox| controller
+
+    classDef producer fill:#F4F0FF,stroke:#6D5BD0,color:#241C3A,stroke-width:1.5px;
+    classDef storage fill:#F4EDC9,stroke:#9C7B21,color:#352B10,stroke-width:1.5px;
+    classDef core fill:#5B4B8A,stroke:#C7B9FF,color:#FFFFFF,stroke-width:1.5px;
+    classDef schedule fill:#DDF7F3,stroke:#168B83,color:#123B38,stroke-width:1.5px;
+    classDef reservation fill:#FFF4E8,stroke:#D97745,color:#3A2117,stroke-width:1.5px;
+    classDef runtime fill:#E8F0FF,stroke:#4977B8,color:#172D4D,stroke-width:1.5px;
+    classDef observer fill:#FCE8DE,stroke:#D9674B,color:#44231A,stroke-width:1.5px;
+
+    class producers producer;
+    class inboxes,state storage;
+    class controller core;
+    class scheduler schedule;
+    class reserve reservation;
+    class workers,payload runtime;
+    class observers observer;
+    linkStyle default stroke:#88859A,stroke-width:1.5px;
+```
+
+Producers never coordinate with each other and do not wait for resources. They
+write immutable, idempotent requests; the controller is the only process that
+turns those requests into queue state. A launch is fail-closed: Scruffy commits
+the assignment to its recovery journal before creating the worker step, and
+Slurm enforces the worker's physical resource ownership.
+
+### Inside the Controller Loop
+
+```mermaid
+flowchart TB
+    recover["Start or recover
+lock root · replay journal · reattach live steps"]
+    ingest["Ingest immutable inboxes
+requests · commands · reports"]
+    reconcile["Reconcile reality
+deadlines · output · processes · Slurm steps"]
+    dependencies["Refresh workflow gates
+queue ready tasks · skip impossible descendants"]
+    maintain["Bound retained state
+compact journal · archive cold jobs"]
+    fit{"Eligible job fits
+current free resources?"}
+    reserve["Persist assignment
+update ledger · emit job.starting"]
+    launch["Launch worker step
+Slurm supplies physical GPU tokens"]
+    commit["Publish committed view when due
+durable event or heartbeat"]
+    wait["Short asynchronous tick
+new submissions may arrive meanwhile"]
+
+    recover --> ingest --> reconcile --> dependencies --> maintain --> fit
+    fit -->|yes| reserve --> launch --> fit
+    fit -->|no| commit --> wait --> ingest
+
+    classDef recovery fill:#F4F0FF,stroke:#6D5BD0,color:#241C3A,stroke-width:1.5px;
+    classDef core fill:#5B4B8A,stroke:#C7B9FF,color:#FFFFFF,stroke-width:1.5px;
+    classDef reconcileNode fill:#E8F0FF,stroke:#4977B8,color:#172D4D,stroke-width:1.5px;
+    classDef workflow fill:#DDF7F3,stroke:#168B83,color:#123B38,stroke-width:1.5px;
+    classDef choice fill:#FFF4E8,stroke:#D97745,color:#3A2117,stroke-width:1.5px;
+    classDef launchNode fill:#FCE8DE,stroke:#D9674B,color:#44231A,stroke-width:1.5px;
+    classDef storage fill:#F4EDC9,stroke:#9C7B21,color:#352B10,stroke-width:1.5px;
+
+    class recover recovery;
+    class ingest core;
+    class reconcile reconcileNode;
+    class dependencies workflow;
+    class maintain,commit storage;
+    class fit choice;
+    class reserve,launch launchNode;
+    class wait recovery;
+    linkStyle default stroke:#88859A,stroke-width:1.5px;
+```
+
+The loop reconciles durable intent with live worker state before admitting more
+work. Scheduling is a pure calculation over the current inventory and active
+assignments; all filesystem writes, lifecycle transitions, and process launches
+remain in the single-writer controller.
+
 ## Requirements and boundaries
 
 - Python 3.11 or newer. The base package has no Python dependencies; the
