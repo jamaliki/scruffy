@@ -116,6 +116,15 @@ class Controller:
     workflow_signatures: (
         dict[tuple[str, str], tuple[tuple[str, object], ...]] | None
     ) = None
+    gpu_health_mode: str = "off"
+    gpu_isolation: str = "node"
+    gpu_health_interval: float = 10.0
+    health_process: subprocess.Popen[bytes] | None = None
+    health_step_name: str | None = None
+    health_step_id: str | None = None
+    health_launch_snapshot_at: float = 0.0
+    health_retry_at: float = 0.0
+    health_ingest_errors: dict[str, str] = field(default_factory=dict)
 
 
 def copy_stream(

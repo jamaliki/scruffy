@@ -15,10 +15,12 @@ from typing import Any
 from . import __version__
 from .client import (
     cancel_job,
+    clear_gpu_quarantine,
     drain_queue,
     explain,
     observe,
     publish_event,
+    quarantine_gpu,
     resume_queue,
     status,
     submit_job,
@@ -47,6 +49,8 @@ from .summary import (
     QUEUE_VIEW_STATES,
     RUNNING_VIEW_STATES,
     compact_job_page,
+    gpu_view,
+    inspect_gpu,
     resource_view,
 )
 
@@ -165,6 +169,9 @@ def _serve(arguments: argparse.Namespace) -> int:
         cancel_grace=arguments.cancel_grace,
         start_paused=arguments.start_paused,
         drain_before_end_seconds=arguments.drain_before_end_seconds,
+        gpu_health_mode=arguments.gpu_health,
+        gpu_isolation="node",
+        gpu_health_interval=arguments.gpu_health_interval,
     )
     return 0
 
@@ -300,6 +307,39 @@ def _resources(arguments: argparse.Namespace) -> int:
 
     project_id = _project(arguments)
     _json(resource_view(status(_root(arguments), project_id=project_id)))
+    return 0
+
+
+def _gpus(arguments: argparse.Namespace) -> int:
+    _json(gpu_view(status(_root(arguments), project_id=_project(arguments))))
+    return 0
+
+
+def _gpu(arguments: argparse.Namespace) -> int:
+    _json(
+        inspect_gpu(
+            status(_root(arguments), project_id=_project(arguments)),
+            arguments.node,
+            arguments.slot,
+        )
+    )
+    return 0
+
+
+def _gpu_quarantine(arguments: argparse.Namespace) -> int:
+    _json(
+        quarantine_gpu(
+            _root(arguments),
+            arguments.node,
+            arguments.uuid,
+            reason=arguments.reason,
+        )
+    )
+    return 0
+
+
+def _gpu_clear(arguments: argparse.Namespace) -> int:
+    _json(clear_gpu_quarantine(_root(arguments), arguments.node, arguments.uuid))
     return 0
 
 
@@ -511,6 +551,18 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: 900; 0 disables)"
         ),
     )
+    serve.add_argument(
+        "--gpu-health",
+        choices=("off", "observe", "enforce"),
+        default="observe",
+        help="GPU monitor policy (default: observe)",
+    )
+    serve.add_argument(
+        "--gpu-health-interval",
+        type=float,
+        default=10,
+        help="seconds between CUDA/thermal probes (default: 10)",
+    )
     serve.set_defaults(handler=_serve)
 
     submit = commands.add_parser(
@@ -641,6 +693,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="label the project scope; availability remains allocation-wide",
     )
     resources.set_defaults(handler=_resources)
+
+    gpus = commands.add_parser(
+        "gpus", help="list GPU health, identity, and scheduler state"
+    )
+    gpus.set_defaults(handler=_gpus)
+
+    gpu = commands.add_parser("gpu", help="inspect one node-local GPU slot")
+    gpu.add_argument("node")
+    gpu.add_argument("slot", type=int)
+    gpu.set_defaults(handler=_gpu)
+
+    quarantine = commands.add_parser(
+        "gpu-quarantine", help="stop a known physical GPU from future placement"
+    )
+    quarantine.add_argument("node")
+    quarantine.add_argument("uuid")
+    quarantine.add_argument("--reason")
+    quarantine.set_defaults(handler=_gpu_quarantine)
+
+    clear_gpu = commands.add_parser(
+        "gpu-clear", help="clear a known physical GPU's sticky quarantine"
+    )
+    clear_gpu.add_argument("node")
+    clear_gpu.add_argument("uuid")
+    clear_gpu.set_defaults(handler=_gpu_clear)
 
     explain_parser = commands.add_parser(
         "explain",

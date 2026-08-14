@@ -134,7 +134,8 @@ agents; reading does not consume events for anyone else. Use
 - Match asynchronous cancel and drain outcomes using the returned `request_id`.
   `drain` survives controller restarts and disables launches until the outer
   allocation is replaced or an operator explicitly runs `scruffy resume`.
-- GPU identity is `(node, gpu_id)`, never a bare global ordinal.
+- Stable physical GPU identity is `(node, NVIDIA UUID)`, never a bare global
+  ordinal. `gpu_id`/`slot` is the current Scruffy admission mapping.
 - Restarting the controller inside the same Slurm allocation reattaches live
   steps by their persisted launch tokens and pauses new launches. Inspect the
   recovered snapshot, then run `scruffy resume`; do not resubmit attached jobs.
@@ -152,6 +153,10 @@ agents; reading does not consume events for anyone else. Use
 - In Slurm mode each worker step requests its exact GPU, CPU, and memory budget;
   Slurm owns physical GPU selection and exclusivity. Local mode is cooperative.
   Do not launch out-of-band work on Scruffy's inventory.
+- The controller owns GPU health. `serve --gpu-health observe` records CUDA,
+  thermal, and ECC state; `enforce` fails stale nodes closed and withholds a
+  quarantined GPU's whole node from new GPU work. Koochak may checkpoint/exit
+  but must not mutate the parent allocation when Scruffy variables are present.
 - `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
   every node. Lustre `localflock` is not sufficient for a multi-node queue.
 - `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`, `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, and

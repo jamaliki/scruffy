@@ -7,7 +7,7 @@ name = "scruffy-gpu"
 version = "0.1.0"
 description = "A small multi-agent GPU queue inside a multi-node Slurm allocation"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [{name = "Kiarash Jamali"}]
 keywords = ["gpu", "hpc", "slurm", "scheduler", "queue"]
@@ -17,6 +17,7 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "Operating System :: POSIX",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: System :: Distributed Computing",
@@ -46,4 +47,4 @@ scruffy = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"

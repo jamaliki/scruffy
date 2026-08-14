@@ -33,6 +33,8 @@ from .summary import (
     RUNNING_VIEW_STATES,
     build_summary,
     compact_job_page,
+    gpu_view,
+    inspect_gpu,
     job_view,
     resource_totals,
     resource_view,
@@ -51,8 +53,9 @@ SERVER_INSTRUCTIONS = """\
 Scruffy monitors a shared GPU queue. Call overview first and keep its
 as_of_cursor private to this agent. Use queue, running_jobs, blocked_jobs, or
 resources for focused operational views; use list_jobs for another exact state.
-Then inspect_job only for a selected ID that needs detail, and tail_job_output
-only for bounded diagnosis. Use wait_job for one terminal result or
+Use gpus for health and stable physical identity, then inspect_gpu only for a
+selected node-local slot that needs a report. Use inspect_job only for a
+selected job, and tail_job_output only for bounded diagnosis. Use wait_job for one terminal result or
 wait_for_updates for a set of jobs instead of shell sleep or repeated polling,
 and replace the cursor with every returned next_cursor. Wait events contain only
 the change kind and job identity; use inspect_job when details are needed. If
@@ -170,6 +173,7 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
         "counts": copy.deepcopy(value.get("counts", {})),
         "scheduler": copy.deepcopy(value.get("scheduler", {})),
         "resources": resource_totals(value.get("nodes")),
+        "gpu_health": copy.deepcopy(value.get("gpu_health")),
     }
 
 
@@ -624,6 +628,18 @@ async def dispatch_tool(
     if tool == "resources":
         _only(params, set())
         return resource_view(status(root, project_id=project_id))
+    if tool == "gpus":
+        _only(params, set())
+        return gpu_view(status(root, project_id=project_id))
+    if tool == "inspect_gpu":
+        _only(params, {"node", "slot"})
+        node = params.get("node")
+        slot = params.get("slot")
+        if not isinstance(node, str) or not node:
+            raise ValueError("node must not be empty")
+        if type(slot) is not int or slot < 0:
+            raise ValueError("slot must be a non-negative integer")
+        return inspect_gpu(status(root, project_id=project_id), node, slot)
     if tool == "inspect_job":
         _only(params, {"job_id"})
         job_id = params.get("job_id")
@@ -790,6 +806,18 @@ def create_server(
         """Return aggregate and per-node GPU, CPU, and memory availability."""
 
         return await call("resources", {})
+
+    @server.tool()
+    async def gpus() -> dict[str, Any]:
+        """List every GPU with stable UUID, physical IDs, and scheduler state."""
+
+        return await call("gpus", {})
+
+    @server.tool()
+    async def inspect_gpu(node: str, slot: int) -> dict[str, Any]:
+        """Return reportable identity and health details for one GPU slot."""
+
+        return await call("inspect_gpu", {"node": node, "slot": slot})
 
     @server.tool()
     async def list_jobs(

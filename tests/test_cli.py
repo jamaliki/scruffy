@@ -468,6 +468,9 @@ class ServeCliTests(unittest.TestCase):
             cancel_grace=2.5,
             start_paused=True,
             drain_before_end_seconds=120,
+            gpu_health_mode="observe",
+            gpu_isolation="node",
+            gpu_health_interval=10,
         )
 
     def test_missing_inventory_is_reported_without_a_traceback(self) -> None:
@@ -555,6 +558,9 @@ class ServeCliTests(unittest.TestCase):
             cancel_grace=30,
             start_paused=False,
             drain_before_end_seconds=900,
+            gpu_health_mode="observe",
+            gpu_isolation="node",
+            gpu_health_interval=10,
         )
 
     def test_serve_can_start_paused_for_allocation_handover(self) -> None:

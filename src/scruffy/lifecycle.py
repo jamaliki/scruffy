@@ -7,10 +7,12 @@ import signal
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ._compat import UTC
+from .health import unavailable_gpu_ids
 from .models import (
     Assignment,
     NodeReservation,
@@ -386,7 +388,10 @@ def schedule(controller: Controller) -> None:
             for job in queued_images
         ]
         choice = choose_first_fitting_job(
-            controller.inventory, active_assignments(controller.state), queued
+            controller.inventory,
+            active_assignments(controller.state),
+            queued,
+            unavailable_gpu_ids(controller.state.get("gpu_health", {}), controller.inventory),
         )
         if choice is None:
             return

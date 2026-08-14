@@ -23,24 +23,28 @@ flowchart TB
     producers["Humans · agents · Python clients
 submit asynchronously"]
     inboxes[["Shared queue root
-requests · workflows · commands · reports"]]
+requests · workflows · commands · reports · health samples"]]
     controller["Single controller
-one lock · one writer · one resource ledger"]
+one lock · one writer · resource and health authority"]
     scheduler["Pure scheduler
-dependency gates · fair priority · best fit"]
+dependency gates · fair priority · health-filtered best fit"]
     reserve["Durable reservation
 job.starting enters the journal first"]
     workers["Slurm worker steps
 explicit GPU · CPU · memory ownership"]
+    health["Allocation-wide health step
+one sampler per node · all managed GPUs"]
     payload["Job payload
 stdout · stderr · provenance · progress"]
     state[("Recovery and observation
-journal · snapshot · archived jobs")]
+journal · snapshot · archived jobs · GPU health")]
     observers["Independent readers
-CLI · MCP hub · dashboard"]
+CLI · MCP hub · clickable GPU dashboard"]
 
     producers -->|non-blocking write| inboxes --> controller --> scheduler
     scheduler --> reserve --> workers --> payload
+    controller -.->|launch · reattach| health
+    health -->|atomic latest samples| inboxes
     controller --> state --> observers
     payload -.->|reports via inbox| controller
 
@@ -57,7 +61,7 @@ CLI · MCP hub · dashboard"]
     class controller core;
     class scheduler schedule;
     class reserve reservation;
-    class workers,payload runtime;
+    class workers,health,payload runtime;
     class observers observer;
     linkStyle default stroke:#88859A,stroke-width:1.5px;
 ```
@@ -67,23 +71,29 @@ write immutable, idempotent requests; the controller is the only process that
 turns those requests into queue state. A launch is fail-closed: Scruffy commits
 the assignment to its recovery journal before creating the worker step, and
 Slurm enforces the worker's physical resource ownership.
+The controller also owns the overlapping health step. Node samplers report
+physical identity and CUDA, thermal, and ECC evidence but cannot change
+placement themselves; only the controller converts those samples into sticky
+health state and scheduler eligibility.
 
 ### Inside the Controller Loop
 
 ```mermaid
 flowchart TB
     recover["Start or recover
-lock root · replay journal · reattach live steps"]
+lock root · replay journal · reattach workload and health steps"]
     ingest["Ingest immutable inboxes
 requests · commands · reports"]
     reconcile["Reconcile reality
 deadlines · output · processes · Slurm steps"]
+    health["Maintain GPU health
+validate incarnation · ingest samples · update sticky state"]
     dependencies["Refresh workflow gates
 queue ready tasks · skip impossible descendants"]
     maintain["Bound retained state
 compact journal · archive cold jobs"]
     fit{"Eligible job fits
-current free resources?"}
+free health-eligible resources?"}
     reserve["Persist assignment
 update ledger · emit job.starting"]
     launch["Launch worker step
@@ -93,7 +103,7 @@ durable event or heartbeat"]
     wait["Short asynchronous tick
 new submissions may arrive meanwhile"]
 
-    recover --> ingest --> reconcile --> dependencies --> maintain --> fit
+    recover --> ingest --> reconcile --> health --> dependencies --> maintain --> fit
     fit -->|yes| reserve --> launch --> fit
     fit -->|no| commit --> wait --> ingest
 
@@ -108,6 +118,7 @@ new submissions may arrive meanwhile"]
     class recover recovery;
     class ingest core;
     class reconcile reconcileNode;
+    class health reconcileNode;
     class dependencies workflow;
     class maintain,commit storage;
     class fit choice;
@@ -120,16 +131,20 @@ The loop reconciles durable intent with live worker state before admitting more
 work. Scheduling is a pure calculation over the current inventory and active
 assignments; all filesystem writes, lifecycle transitions, and process launches
 remain in the single-writer controller.
+Periodic metrics remain replaceable evidence rather than journal traffic. Only
+health transitions and operator actions are durable events, while enforce mode
+removes stale or quarantined nodes from the scheduler's eligible GPU inventory.
 
 ## Requirements and boundaries
 
-- Python 3.11 or newer. The base package has no Python dependencies; the
+- Python 3.10 or newer. The base package has no Python dependencies; the
   optional MCP server uses the official Python MCP SDK.
 - A POSIX shared filesystem visible at the same absolute `SCRUFFY_ROOT` on every
   client and compute node. Atomic rename and cluster-coherent `flock` are hard
   requirements. On Lustre, verify that distributed `flock` is enabled;
   `localflock` is insufficient. Scruffy cannot detect silently local-only locks.
-- Slurm mode requires `srun`, `scancel`, and `scontrol --json` on the controller.
+- Slurm mode requires `srun`, `scancel`, `scontrol --json`, `nvidia-smi`, and a
+  working NVIDIA Driver API (`libcuda.so.1`) on the compute nodes.
 - Submitted working directories, executables, and referenced files must exist on
   every selected worker node.
 
@@ -145,6 +160,53 @@ The controller's per-node GPU IDs remain deterministic admission slots, while
 `SCRUFFY_GPU_IDS` contains the authoritative tokens visible to the workload.
 Local mode remains cooperative. Scruffy trusts every process able to write
 `SCRUFFY_ROOT`; it is not a multi-user security boundary.
+
+## GPU health and quarantine
+
+In Slurm mode Scruffy can own one allocation-wide, overlapping monitor step.
+Every 10 seconds, one task on each node records:
+
+- stable NVIDIA UUID, node, Scruffy slot, NVIDIA index, Linux minor number, PCI
+  bus ID, serial, model, driver, and VBIOS;
+- current temperature, power, uncorrectable volatile ECC count, and NVIDIA's
+  software/hardware thermal-slowdown reasons; and
+- a CUDA Driver API initialization, device-count, UUID, and context-creation
+  probe for every visible GPU. This catches failures where `nvidia-smi` works
+  but CUDA initialization does not.
+
+Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
+The default is `observe`: automatic failures become visible without changing
+placement. An explicit `gpu-quarantine` always withholds the node.
+In `enforce`, three consecutive bad samples make the affected UUID's
+quarantine sticky; missing or older-than-45-second samples fail closed. An
+operator must explicitly clear a quarantine after investigating it:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" gpus
+scruffy --root "$SCRUFFY_ROOT" gpu gpu-3 5
+scruffy --root "$SCRUFFY_ROOT" gpu-quarantine gpu-3 GPU-... \
+  --reason "Scientific Computing ticket SC-1234"
+scruffy --root "$SCRUFFY_ROOT" gpu-clear gpu-3 GPU-...
+```
+
+Current worker steps request GPU counts and Slurm chooses their physical
+devices. Scruffy therefore cannot safely reuse the healthy GPUs on a node while
+guaranteeing exclusion of one physical UUID. Enforced quarantine marks the bad
+GPU `STOPPED`, marks its healthy peers `NODE HELD`, and admits no new GPU job on
+that node. Existing jobs are not killed automatically; their assignment stays
+owned until normal exit or explicit cancellation. Exact healthy-peer reuse
+requires a separately validated Slurm GRES/device-isolation contract.
+
+Latest samples are replaceable files under `health/samples/`; only status
+transitions and operator actions enter the durable journal. The dashboard makes
+every GPU tile clickable and provides a copy-ready identity and health report
+for Scientific Computing.
+
+Koochak remains responsible only for workload-local response: it may checkpoint
+and exit after detecting a bad CUDA device. When `SCRUFFY_JOB_ID` or
+`SCRUFFY_ROOT` is present, Koochak must not requeue or cancel the parent Slurm
+allocation. Scruffy is the only health authority allowed to change future
+placement.
 
 ## Quick start
 
@@ -175,6 +237,13 @@ complete template.
 ```bash
 export SCRUFFY_ROOT=/shared/runs/scruffy
 scruffy --root "$SCRUFFY_ROOT" serve
+```
+
+After observing health telemetry on the target cluster, enable fail-closed
+placement:
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" serve --gpu-health enforce
 ```
 
 Prefer running the controller as the outer batch script's foreground process.
@@ -212,6 +281,7 @@ Orient and monitor from any number of independent readers:
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" resources
+scruffy --root "$SCRUFFY_ROOT" gpus
 scruffy --root "$SCRUFFY_ROOT" running
 scruffy --root "$SCRUFFY_ROOT" queue
 scruffy --root "$SCRUFFY_ROOT" blocked
@@ -259,10 +329,13 @@ belong to `default`.
 ## Web dashboard
 
 `scruffy dashboard` opens a read-only allocation console on loopback. It shows
-physical GPU ownership, CPU and memory reservations, project scopes, queue
-lanes, failures, recent finishes, and compact job/dependency details. The UI
-uses the same bounded projections as MCP and never returns argv, working
-directories, or environment values.
+physical GPU ownership and health, CPU and memory reservations, project scopes,
+queue lanes, failures, recent finishes, and compact job/dependency details.
+Every GPU tile is clickable and exposes a copy-ready Scientific Computing
+report with UUID, PCI bus ID, serial, NVIDIA index, Linux minor, model, driver,
+VBIOS, metrics, and quarantine reasons. The UI uses the same bounded
+projections as MCP and never returns argv, working directories, or environment
+values.
 
 For a locally visible queue root:
 
@@ -316,6 +389,9 @@ Every server exposes focused monitoring tools:
   queue.
 - `resources()` returns aggregate and per-node GPU, CPU, and memory availability
   without assignment details.
+- `gpus()` returns every physical GPU mapping and its scheduler/health state.
+- `inspect_gpu(node, slot)` returns the copy-ready identity, CUDA probe, current
+  evidence, quarantine reasons, and monitor policy for one Scruffy slot.
 - `list_jobs(state=None, offset=0, limit=50)` returns lightweight job identity,
   name, state, and elapsed time for all jobs or another exact state such as
   `failed` or `succeeded`. Exact workflow, task, request, name-prefix, and

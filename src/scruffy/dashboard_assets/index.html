@@ -132,6 +132,17 @@
     <div id="job-detail" class="job-detail"></div>
   </dialog>
 
+  <dialog id="gpu-dialog" class="job-dialog gpu-dialog">
+    <header>
+      <div><p id="gpu-dialog-state" class="eyebrow">GPU</p><h2 id="gpu-dialog-title">Loading</h2></div>
+      <div class="dialog-actions">
+        <button id="gpu-report-copy" class="icon-button" type="button">Copy report</button>
+        <button id="gpu-dialog-close" class="icon-button" type="button" aria-label="Close GPU details">Close</button>
+      </div>
+    </header>
+    <div id="gpu-detail" class="job-detail"></div>
+  </dialog>
+
   <footer class="footer">
     <span>SCRUFFY / READ-ONLY TELEMETRY</span>
     <span id="queue-id">Queue not connected</span>

@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .health import unavailable_gpu_ids
 from .models import (
     ACTIVE_JOB_STATES,
     DEFAULT_PROJECT,
@@ -165,9 +166,15 @@ def refresh_nodes(
     """Rebuild the public per-node ledger from active assignments."""
 
     assignments = active_assignments(state)
+    health = state.get("gpu_health")
+    health_view = health if isinstance(health, dict) else {}
+    unavailable = unavailable_gpu_ids(health_view, inventory)
     free_by_node = {
-        item.name: item for item in available_resources(inventory, assignments)
+        item.name: item
+        for item in available_resources(inventory, assignments, unavailable)
     }
+    raw_health_nodes = health_view.get("nodes")
+    health_nodes = raw_health_nodes if isinstance(raw_health_nodes, dict) else {}
     nodes = {
         item.name: {
             "capacity": item.to_dict(),
@@ -177,6 +184,10 @@ def refresh_nodes(
                 "memory_gb": free_by_node[item.name].memory_gb,
             },
             "assignments": {},
+            "unavailable_gpu_ids": sorted(unavailable.get(item.name, ())),
+            "gpu_devices": _gpu_device_view(
+                item, health_nodes.get(item.name)
+            ),
         }
         for item in inventory
     }
@@ -186,6 +197,38 @@ def refresh_nodes(
             node["assignments"][assignment.job_id] = reservation.to_dict()
     state["nodes"] = nodes
     state["updated_at"] = utc_now()
+
+
+def _gpu_device_view(
+    inventory: NodeInventory, node_health: object
+) -> list[dict[str, Any]]:
+    """Return one bounded public identity/status record per scheduler slot."""
+
+    raw_devices = (
+        node_health.get("devices") if isinstance(node_health, dict) else None
+    )
+    devices = raw_devices.values() if isinstance(raw_devices, dict) else ()
+    by_slot = {
+        device.get("slot"): device
+        for device in devices
+        if isinstance(device, dict) and type(device.get("slot")) is int
+    }
+    return [
+        copy.deepcopy(
+            by_slot.get(
+                slot,
+                {
+                    "node": inventory.name,
+                    "slot": slot,
+                    "uuid": None,
+                    "status": "unknown",
+                    "last_sample_at": None,
+                    "last_received_at": None,
+                },
+            )
+        )
+        for slot in inventory.gpu_ids
+    ]
 
 
 def emit(
@@ -413,6 +456,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "journal_offset": 0,
                 "allocation": None,
                 "nodes": {},
+                "gpu_health": None,
                 "jobs": {},
                 "report_acks": {},
                 "report_ack_v": 1,
@@ -477,6 +521,11 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                     },
                     recorded_at=str(event.get("recorded_at") or event.get("at") or ""),
                 )
+        if event.get("kind") == "resource.gpu_health_changed":
+            data = event.get("data")
+            recovered_health = data.get("gpu_health") if isinstance(data, dict) else None
+            if isinstance(recovered_health, dict):
+                state["gpu_health"] = copy.deepcopy(recovered_health)
         report_id = event.get("report_id")
         if isinstance(report_id, str):
             digest = event.get("report_digest")

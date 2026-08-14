@@ -1,8 +1,9 @@
-# Workload events v1
+# Workload reports and GPU health events v1
 
 Scruffy jobs may publish bounded semantic updates into the same non-consuming
-journal as queue lifecycle and output-reference events. Queue and Slurm state
-remain authoritative for execution outcomes and GPU ownership.
+journal as queue lifecycle, GPU health, and output-reference events. Queue and
+Slurm state remain authoritative for execution outcomes and GPU ownership; the
+controller remains authoritative for health-based scheduling eligibility.
 
 ## Producer envelope
 
@@ -73,8 +74,26 @@ at or before that committed snapshot watermark, never a partially committed
 batch. The active and immediately previous journal generations are retained;
 an observer cursor from any earlier generation resets to the current snapshot.
 
+## Controller-owned GPU health events
+
+GPU monitor samples are not workload reports and do not use the producer
+envelope. Node-local samplers atomically replace their latest evidence under
+`health/samples/`; the controller validates the allocation-incarnation
+fingerprint and physical `(node, NVIDIA UUID)` identity before accepting it.
+Periodic metric updates remain outside the journal.
+
+The controller emits `resource.gpu_health_changed` only for health status
+transitions and operator quarantine/clear actions. Its `data.transitions`
+contains the bounded changes and `data.gpu_health` contains the complete health
+projection required for replay. An operator-command outcome also includes the
+correlated `data.request_id`. Producers cannot publish this event kind or
+directly change quarantine state.
+
 ## Authority
 
 Workload events update only `job.workload` in the current snapshot. They cannot
 change lifecycle state, assignments, resources, exit codes, or terminal results.
 Only Scruffy's process and Slurm reconciliation path can do that.
+Likewise, GPU evidence can change future placement only after the controller's
+health policy accepts it; workload reports and Koochak observations have no
+scheduling authority.

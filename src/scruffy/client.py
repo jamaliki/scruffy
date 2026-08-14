@@ -223,6 +223,61 @@ def resume_queue(root: Path) -> dict[str, Any]:
     return {"request_id": request_id, "state": "resume_requested"}
 
 
+def quarantine_gpu(
+    root: Path, node: str, uuid: str, *, reason: str | None = None
+) -> dict[str, Any]:
+    """Asynchronously stop one known physical GPU from future placement."""
+
+    _validate_gpu_identity(node, uuid)
+    if reason is not None and (
+        not isinstance(reason, str) or not reason.strip() or len(reason) > 1024
+    ):
+        raise ValueError("reason must be 1-1024 characters when provided")
+    command = {
+        "kind": "gpu.quarantine",
+        "node": node,
+        "uuid": uuid,
+        "submitted_at": utc_now(),
+    }
+    if reason:
+        command["reason"] = reason
+    request_id = submit_command(root, command)
+    return {
+        "request_id": request_id,
+        "node": node,
+        "uuid": uuid,
+        "state": "gpu_quarantine_requested",
+    }
+
+
+def clear_gpu_quarantine(root: Path, node: str, uuid: str) -> dict[str, Any]:
+    """Asynchronously clear one known physical GPU's sticky quarantine."""
+
+    _validate_gpu_identity(node, uuid)
+    request_id = submit_command(
+        root,
+        {
+            "kind": "gpu.clear",
+            "node": node,
+            "uuid": uuid,
+            "submitted_at": utc_now(),
+        },
+    )
+    return {
+        "request_id": request_id,
+        "node": node,
+        "uuid": uuid,
+        "state": "gpu_clear_requested",
+    }
+
+
+def _validate_gpu_identity(node: str, uuid: str) -> None:
+    if not isinstance(node, str) or not node or node.strip() != node:
+        raise ValueError("node must be a non-empty trimmed string")
+    if not isinstance(uuid, str) or not uuid or uuid.strip() != uuid:
+        raise ValueError("uuid must be a non-empty trimmed string")
+
+
 def _submitted_from_spec(
     job_id: str, spec: dict[str, Any] | None
 ) -> dict[str, Any]:

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 from collections import Counter
 from collections.abc import Collection
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
+from ._compat import UTC
 from .models import (
     ACTIVE_JOB_STATES,
     DEFAULT_PROJECT,
@@ -295,6 +297,8 @@ def resource_view(state: dict[str, Any]) -> dict[str, Any]:
                     "cpus_total": int(capacity.get("cpus", 0) or 0),
                     "memory_gb_free": int(free.get("memory_gb", 0) or 0),
                     "memory_gb_total": int(capacity.get("memory_gb", 0) or 0),
+                    "unavailable_gpu_ids": list(node.get("unavailable_gpu_ids", [])),
+                    "gpu_devices": list(node.get("gpu_devices", [])),
                 }
             )
     allocation = state.get("allocation")
@@ -310,8 +314,90 @@ def resource_view(state: dict[str, Any]) -> dict[str, Any]:
         },
         "totals": resource_totals(nodes),
         "scheduler": scheduler_explanation(state),
+        "gpu_health": state.get("gpu_health"),
         "nodes": rows,
     }
+
+
+def gpu_view(state: dict[str, Any]) -> dict[str, Any]:
+    """Return every managed GPU with identity, ownership, and scheduler state."""
+
+    rows: list[dict[str, Any]] = []
+    nodes = state.get("nodes")
+    if isinstance(nodes, dict):
+        for node_name, node in sorted(nodes.items(), key=lambda item: _node_sort_key(item[0])):
+            if not isinstance(node, dict):
+                continue
+            free = set(node.get("free", {}).get("gpu_ids", []))
+            unavailable = set(node.get("unavailable_gpu_ids", []))
+            owners = {
+                gpu_id: job_id
+                for job_id, reservation in node.get("assignments", {}).items()
+                if isinstance(reservation, dict)
+                for gpu_id in reservation.get("gpu_ids", [])
+            }
+            devices = node.get("gpu_devices", [])
+            for raw_device in devices if isinstance(devices, list) else []:
+                if not isinstance(raw_device, dict):
+                    continue
+                device = copy.deepcopy(raw_device)
+                slot = device.get("slot")
+                owner = owners.get(slot)
+                status = device.get("status")
+                if owner:
+                    scheduler_state = "assigned"
+                elif slot in unavailable and status == "quarantined":
+                    scheduler_state = "stopped"
+                elif slot in unavailable and status == "healthy":
+                    scheduler_state = "node_held"
+                elif slot in unavailable:
+                    scheduler_state = "health_unknown"
+                elif status == "quarantined":
+                    scheduler_state = "quarantined_observed"
+                elif slot in free:
+                    scheduler_state = "free"
+                else:
+                    scheduler_state = "unavailable"
+                rows.append(
+                    {
+                        **device,
+                        "node": node_name,
+                        "assigned_job_id": owner,
+                        "scheduler_state": scheduler_state,
+                    }
+                )
+    return {
+        "v": 1,
+        "queue_id": state.get("queue_id"),
+        "project_id": state.get("project_id"),
+        "as_of_cursor": state_cursor(state),
+        "policy": {
+            "mode": state.get("gpu_health", {}).get("mode"),
+            "isolation": state.get("gpu_health", {}).get("isolation"),
+        }
+        if isinstance(state.get("gpu_health"), dict)
+        else {},
+        "gpus": rows,
+    }
+
+
+def inspect_gpu(state: dict[str, Any], node: str, slot: int) -> dict[str, Any]:
+    """Return one GPU's complete reportable identity and scheduler state."""
+
+    view = gpu_view(state)
+    for device in view["gpus"]:
+        if device.get("node") == node and device.get("slot") == slot:
+            health = state.get("gpu_health")
+            health_node = health.get("nodes", {}).get(node, {}) if isinstance(health, dict) else {}
+            return {
+                **device,
+                "policy": view["policy"],
+                "cuda_probe": health_node.get("cuda_probe"),
+                "last_received_at": health_node.get("last_received_at"),
+                "monitor": health.get("monitor") if isinstance(health, dict) else None,
+                "as_of_cursor": view["as_of_cursor"],
+            }
+    raise KeyError(f"unknown GPU slot {slot} on node {node!r}")
 
 
 def _queue_order(job: dict[str, Any]) -> int:
@@ -433,6 +519,7 @@ def build_summary(
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
         "launches_paused": bool(state.get("launches_paused", False)),
+        "gpu_health": copy.deepcopy(state.get("gpu_health")),
         "counts": dict(sorted(counts.items())),
         "scheduler": scheduler_explanation({**state, "jobs": {job["id"]: job for job in jobs}}),
         "archived_jobs": sum(int(count) for count in archived_counts.values()),

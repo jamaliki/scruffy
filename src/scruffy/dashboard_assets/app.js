@@ -10,6 +10,7 @@ const view = {
   snapshot: null, project: "all", search: "", connected: false, loading: false,
   lastSuccessAt: null,
   workflowKey: "", workflowData: null, workflowDataKey: "", workflowLoading: false,
+  gpuReport: "",
 };
 
 function telemetryIsStale(snapshot) {
@@ -39,11 +40,12 @@ function metric(label, value, detail) {
 function renderMetrics(snapshot, stale) {
   const totals = resourceTotals(snapshot.nodes);
   const counts = snapshot.counts || {};
-  const usedGpus = totals.gpus - totals.freeGpus;
+  const usedGpus = Object.values(snapshot.nodes || {}).reduce((total, node) => total + gpuOwners(node).size, 0);
+  const stoppedGpus = Math.max(0, totals.gpus - totals.freeGpus - usedGpus);
   const usedCpus = totals.cpus - totals.freeCpus;
   const usedMemory = totals.memory - totals.freeMemory;
   replace(byId("metrics"), [
-    metric("GPU occupancy", `${stale ? "?" : usedGpus} / ${totals.gpus}`, stale ? "availability unknown" : `${totals.freeGpus} available`),
+    metric("GPU allocation", `${stale ? "?" : usedGpus} / ${totals.gpus}`, stale ? "availability unknown" : `${totals.freeGpus} available · ${stoppedGpus} stopped/held`),
     metric("CPU allocation", `${stale ? "?" : usedCpus} / ${totals.cpus}`, stale ? "availability unknown" : `${totals.freeCpus} cores available`),
     metric("Memory allocation", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)}`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB available`),
     metric("Waiting", String(Number(counts.submitted || 0) + Number(counts.queued || 0)), `${counts.blocked || 0} dependency-blocked`),
@@ -67,6 +69,8 @@ function renderNode(name, nodeState, jobs, stale) {
   header.append(element("h3", "node-name", name));
   const gpuIds = nodeState.capacity?.gpu_ids || [];
   const free = new Set(nodeState.free?.gpu_ids || []);
+  const unavailable = new Set(nodeState.unavailable_gpu_ids || []);
+  const devices = new Map((nodeState.gpu_devices || []).map((device) => [device.slot, device]));
   header.append(element("span", "node-free", stale ? "GPU availability unknown" : `${free.size} / ${gpuIds.length} GPUs free`));
   const rack = element("div", "gpu-rack");
   const owners = gpuOwners(nodeState);
@@ -74,19 +78,28 @@ function renderNode(name, nodeState, jobs, stale) {
     const jobId = owners.get(gpuId);
     const job = jobs.get(jobId);
     const project = job?.project_id || "default";
+    const device = devices.get(gpuId) || {slot: gpuId, status: "unknown"};
     const available = free.has(gpuId);
-    const tile = element("button", available ? `gpu ${stale ? "unknown" : "free"}` : "gpu occupied");
+    let schedulerState = "unavailable", label = "UNAVAILABLE";
+    if (jobId) { schedulerState = "occupied"; label = job?.name || jobId || "ASSIGNED"; }
+    else if (unavailable.has(gpuId) && device.status === "quarantined") { schedulerState = "stopped"; label = "STOPPED"; }
+    else if (unavailable.has(gpuId) && device.status === "healthy") { schedulerState = "node-held"; label = "NODE HELD"; }
+    else if (unavailable.has(gpuId)) { schedulerState = "unknown"; label = "HEALTH UNKNOWN"; }
+    else if (device.status === "quarantined") { schedulerState = "flagged"; label = "FLAGGED"; }
+    else if (available) { schedulerState = stale ? "unknown" : "free"; label = stale ? "UNKNOWN" : "FREE"; }
+    const tile = element("button", `gpu ${schedulerState}${device.status === "quarantined" ? " unhealthy" : ""}`);
     tile.type = "button";
     tile.append(element("span", "gpu-id", `GPU ${gpuId}`));
-    tile.append(element("strong", "gpu-owner", available ? (stale ? "UNKNOWN" : "FREE") : (job?.name || jobId || "ASSIGNED")));
-    if (!available) {
+    tile.append(element("strong", "gpu-owner", label));
+    tile.dataset.gpuNode = name;
+    tile.dataset.gpuSlot = String(gpuId);
+    if (jobId) {
       tile.style.setProperty("--project-color", projectColor(project));
       tile.dataset.jobId = jobId || "";
       tile.classList.toggle("foreign", view.project !== "all" && project !== view.project);
-      tile.title = `${job?.name || jobId} · ${project}`;
-    } else {
-      tile.disabled = true;
     }
+    const realId = device.uuid || "UUID not observed";
+    tile.title = `${realId} · PCI ${device.pci_bus_id || "unknown"}${jobId ? ` · ${job?.name || jobId} · ${project}` : ""}`;
     rack.append(tile);
   }
   const capacity = nodeState.capacity || {};
@@ -106,7 +119,8 @@ function renderNodes(snapshot) {
   const stale = telemetryIsStale(snapshot);
   replace(byId("nodes"), entries.length ? entries.map(([name, state]) => renderNode(name, state, jobs, stale)) : [empty("No managed nodes are visible.")]);
   const totals = resourceTotals(snapshot.nodes);
-  byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available`;
+  const withheld = entries.reduce((total, [, node]) => total + (node.unavailable_gpu_ids || []).length, 0);
+  byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available / ${withheld} health-withheld`;
 }
 
 function legendItem(label, color = null, project = null) {
@@ -413,6 +427,63 @@ async function openJob(jobId) {
   }
 }
 
+function gpuReport(device) {
+  const metrics = device.metrics || {};
+  return [
+    "Scruffy GPU health report",
+    `Node: ${device.node}`,
+    `Scruffy slot: ${device.slot}`,
+    `NVIDIA UUID: ${device.uuid || "unknown"}`,
+    `NVIDIA index: ${device.nvidia_index ?? "unknown"}`,
+    `Linux minor number: ${device.minor_number ?? "unknown"}`,
+    `PCI bus ID: ${device.pci_bus_id || "unknown"}`,
+    `Serial: ${device.serial || "unknown"}`,
+    `Model: ${device.name || "unknown"}`,
+    `Driver: ${device.driver_version || "unknown"}`,
+    `VBIOS: ${device.vbios_version || "unknown"}`,
+    `Health status: ${device.status || "unknown"}`,
+    `Scheduler state: ${device.scheduler_state || "unknown"}`,
+    `Assigned job: ${device.assigned_job_id || "none"}`,
+    `Last sample: ${device.last_sample_at || "never"}`,
+    `Controller received: ${device.last_received_at || "never"}`,
+    `Quarantined at: ${device.quarantined_at || "not quarantined"}`,
+    `Quarantine reason: ${JSON.stringify(device.quarantine_reason || [])}`,
+    `Last reasons: ${JSON.stringify(device.last_reasons || [])}`,
+    `Temperature C: ${metrics.temperature_c ?? "unknown"}`,
+    `Thermal slowdown: ${metrics.thermal_slowdown ?? "unknown"}`,
+    `Uncorrectable ECC errors: ${metrics.uncorrectable_ecc_errors ?? "unknown"}`,
+    `CUDA probe: ${JSON.stringify(device.cuda_probe || {})}`,
+    `Policy: ${JSON.stringify(device.policy || {})}`,
+  ].join("\n");
+}
+
+async function openGpu(node, slot) {
+  const dialog = byId("gpu-dialog");
+  byId("gpu-dialog-title").textContent = `${node} / GPU ${slot}`;
+  byId("gpu-dialog-state").textContent = "Reading physical identity";
+  byId("gpu-report-copy").textContent = "Copy report";
+  view.gpuReport = "";
+  replace(byId("gpu-detail"), [empty("Loading GPU health and identity…")]);
+  if (!dialog.open) dialog.showModal();
+  try {
+    const response = await fetch(`/api/gpus/${encodeURIComponent(node)}/${encodeURIComponent(slot)}`, {cache: "no-store"});
+    const device = await response.json();
+    if (!response.ok) throw new Error(device.error || "GPU lookup failed");
+    const metrics = device.metrics || {};
+    byId("gpu-dialog-title").textContent = `${device.node} / GPU ${device.slot}`;
+    byId("gpu-dialog-state").textContent = `${device.scheduler_state} // ${device.status}`;
+    view.gpuReport = gpuReport(device);
+    replace(byId("gpu-detail"), [
+      detailSection("Physical identity", [["NVIDIA UUID", device.uuid], ["PCI bus ID", device.pci_bus_id], ["Serial", device.serial], ["NVIDIA index", device.nvidia_index], ["Linux minor", device.minor_number], ["Model", device.name]]),
+      detailSection("Health", [["Status", device.status], ["Scheduler", device.scheduler_state], ["Last sample", device.last_sample_at], ["Controller received", device.last_received_at], ["Reasons", JSON.stringify(device.last_reasons || [])], ["Quarantined", device.quarantined_at], ["Source", device.quarantine_source]]),
+      detailSection("Telemetry", [["Temperature C", metrics.temperature_c], ["Power W", metrics.power_draw_w], ["Power limit W", metrics.power_limit_w], ["Thermal slowdown", metrics.thermal_slowdown], ["Uncorrectable ECC", metrics.uncorrectable_ecc_errors]]),
+      detailSection("Runtime and reporting", [["Driver", device.driver_version], ["VBIOS", device.vbios_version], ["CUDA probe", JSON.stringify(device.cuda_probe || {})], ["Assigned job", device.assigned_job_id], ["Policy", JSON.stringify(device.policy || {})]]),
+    ]);
+  } catch (error) {
+    replace(byId("gpu-detail"), [empty(error.message)]);
+  }
+}
+
 async function loadOverview(refreshWorkflow = false) {
   if (view.loading) return;
   view.loading = true; byId("refresh").disabled = true;
@@ -446,6 +517,11 @@ document.addEventListener("click", (event) => {
     if (view.workflowKey && view.workflowKey !== previousWorkflow) loadWorkflow();
     return;
   }
+  const gpuTarget = event.target.closest("[data-gpu-node]");
+  if (gpuTarget) {
+    openGpu(gpuTarget.dataset.gpuNode, gpuTarget.dataset.gpuSlot);
+    return;
+  }
   const target = event.target.closest("[data-job-id]");
   if (target) openJob(target.dataset.jobId);
 });
@@ -455,6 +531,13 @@ byId("workflow-filter").addEventListener("change", (event) => { view.workflowKey
 byId("refresh").addEventListener("click", () => loadOverview(true));
 byId("dialog-close").addEventListener("click", () => byId("job-dialog").close());
 byId("job-dialog").addEventListener("click", (event) => { if (event.target === byId("job-dialog")) byId("job-dialog").close(); });
+byId("gpu-dialog-close").addEventListener("click", () => byId("gpu-dialog").close());
+byId("gpu-dialog").addEventListener("click", (event) => { if (event.target === byId("gpu-dialog")) byId("gpu-dialog").close(); });
+byId("gpu-report-copy").addEventListener("click", async () => {
+  if (!view.gpuReport) return;
+  await navigator.clipboard.writeText(view.gpuReport);
+  byId("gpu-report-copy").textContent = "Copied";
+});
 
 loadOverview(false);
 setInterval(() => loadOverview(false), 5_000);

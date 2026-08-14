@@ -62,7 +62,9 @@ class UnsafeRecovery(StorageError):
 def utc_now() -> str:
     """Return a lexically sortable UTC timestamp."""
 
-    from datetime import UTC, datetime
+    from datetime import datetime
+
+    from ._compat import UTC
 
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 

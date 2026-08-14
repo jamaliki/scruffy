@@ -53,7 +53,7 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         return
     try:
         await asyncio.wait_for(process.wait(), timeout=2)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -132,7 +132,7 @@ async def call_remote(
     timeout = _call_timeout(tool, params)
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
-    except TimeoutError as exc:
+    except asyncio.TimeoutError as exc:
         await _stop_process(process)
         raise GatewayError(
             f"Remote Scruffy {tool} exceeded its {timeout:g}s connector deadline "

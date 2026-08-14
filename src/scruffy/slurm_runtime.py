@@ -45,17 +45,24 @@ def _job_error(
 def refresh_slurm_snapshot(controller: Controller, now: float) -> None:
     """Refresh at most once a second to avoid a tight slurmctld RPC loop."""
 
-    needs_reconciliation = any(
+    job_needs_reconciliation = any(
         not controller.state["jobs"][job_id].get("slurm_step_id")
         or running.final_state is not None
         or running.process is None
         or running.process.poll() is not None
         for job_id, running in controller.running.items()
     )
-    retry_interval = 5 if controller.slurm_query_error else 1
+    health_needs_reconciliation = controller.health_step_name is not None
+    needs_reconciliation = job_needs_reconciliation or health_needs_reconciliation
+    retry_interval = (
+        5
+        if controller.slurm_query_error
+        else 1
+        if job_needs_reconciliation or controller.health_step_id is None
+        else 10
+    )
     if (
         controller.launcher != "slurm"
-        or not controller.running
         or not needs_reconciliation
         or now - controller.last_slurm_query < retry_interval
     ):

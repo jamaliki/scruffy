@@ -95,6 +95,18 @@ def _handler(reader: QueueReader) -> type[BaseHTTPRequestHandler]:
                 if request.path == "/api/overview":
                     self._json(reader("overview", {"limit": 100, "compact": False}))
                     return
+                gpu_prefix = "/api/gpus/"
+                if request.path.startswith(gpu_prefix):
+                    encoded = request.path[len(gpu_prefix) :].split("/")
+                    if len(encoded) != 2:
+                        self._error(HTTPStatus.BAD_REQUEST, "node and GPU slot are required")
+                        return
+                    node, raw_slot = (unquote(value) for value in encoded)
+                    if not node or not raw_slot.isascii() or not raw_slot.isdecimal():
+                        self._error(HTTPStatus.BAD_REQUEST, "invalid node or GPU slot")
+                        return
+                    self._json(reader("inspect_gpu", {"node": node, "slot": int(raw_slot)}))
+                    return
                 prefix = "/api/jobs/"
                 if request.path.startswith(prefix):
                     job_id = unquote(request.path[len(prefix) :])

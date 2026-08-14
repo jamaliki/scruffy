@@ -15,6 +15,8 @@ include the effects of returned events.
 | Full state or one job | `scruffy status [JOB_ID]` | `status(root, job_id=None)` |
 | Bounded orientation | `scruffy summary` | `summary(root)` |
 | Resource availability | `scruffy resources` | MCP `resources()` |
+| GPU identity and health | `scruffy gpus` | MCP `gpus()` |
+| Inspect one GPU slot | `scruffy gpu NODE SLOT` | MCP `inspect_gpu(node, slot)` |
 | Resource queue | `scruffy queue` | MCP `queue()` |
 | Running jobs | `scruffy running` | MCP `running_jobs()` |
 | Dependency-blocked jobs | `scruffy blocked` | MCP `blocked_jobs()` |
@@ -27,10 +29,15 @@ include the effects of returned events.
 | Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
 | Resume after recovery | `scruffy resume` | `resume_queue(root)` |
+| Quarantine a GPU | `scruffy gpu-quarantine NODE UUID` | `quarantine_gpu(...)` |
+| Clear GPU quarantine | `scruffy gpu-clear NODE UUID` | `clear_gpu_quarantine(...)` |
 
 All operations use `--root ROOT` or `SCRUFFY_ROOT`. Every participant must see
 that directory at the same absolute path. CLI commands emit JSON except `logs`
 and `observe --follow`, which are streaming interfaces.
+The Python client supports Python 3.10 and newer. A remote producer may use a
+different supported Python minor version from the controller because the
+durable boundary is the versioned JSON-compatible filesystem contract.
 
 Submission, full-state views, summaries, explanations, and observations accept
 a project selector through `--project`, `SCRUFFY_PROJECT`, or the Python
@@ -88,8 +95,18 @@ The focused CLI and MCP views return that same cursor with compact job
 identities. `queue` contains `submitted` and `queued`; `running` contains every
 resource-holding active state; `blocked` contains only dependency-blocked jobs.
 `resources` reports aggregate and per-node free and total GPU, CPU, and memory
-capacity without assignment details. Paginate job views while `more` is true,
-then inspect only the selected job that needs detail.
+capacity without assignment details. Its node rows also expose
+`unavailable_gpu_ids` and bounded `gpu_devices` identity/status records. `gpus`
+returns every device with `scheduler_state`; `inspect_gpu` adds the node CUDA
+probe and monitor policy. Stable physical identity is `(node, uuid)`. `slot` is
+Scruffy's current admission ID and can be remapped after hardware maintenance.
+Paginate job views while `more` is true, then inspect only the selected item
+that needs detail.
+
+GPU scheduler states are `free`, `assigned`, `stopped`, `node_held`,
+`health_unknown`, and `quarantined_observed`. `stopped` identifies the
+quarantined UUID. `node_held` means a healthy peer is withheld because current
+count-based Slurm steps cannot exclude one exact physical UUID.
 
 Operational job views use scheduler-relevant order: running jobs are newest
 started first, blocked jobs are newest admitted first, and queued jobs are
@@ -230,6 +247,10 @@ v1 readers. A contained per-item storage failure is published as a `notice`
 whose `data.kind` is `storage.item_skipped`; the controller continues serving
 unrelated work.
 
+`resource.gpu_health_changed` contains `data.transitions` plus the complete
+bounded `data.gpu_health` projection needed for replay. Scruffy journals health
+status changes and operator actions, not every periodic metric sample.
+
 ## Retention
 
 After compaction, hot state contains every nonterminal job and the newest 1,000
@@ -270,6 +291,17 @@ The corresponding outcome event repeats `request_id`. Cancellation retains its
 assignment until launcher exit, output closure, and Slurm reconciliation prove
 release safe. Cancelling any terminal job, including an archived one, produces
 `job.cancel_ignored` rather than `command.rejected`.
+
+`quarantine_gpu` and `clear_gpu_quarantine` use the same immutable command
+inbox. Their correlated outcome is `resource.gpu_health_changed`; an unknown
+`(node, uuid)` produces `command.rejected`. Automatic quarantine requires three
+consecutive CUDA, thermal-slowdown, or uncorrectable-ECC failures and never
+clears itself after later good samples. A failed NVIDIA query produces no valid
+sample; in `serve --gpu-health enforce`, missing or stale telemetry withholds
+the node from new GPU work.
+The default `observe` mode records and displays automatic health state without
+withholding capacity. An explicit operator quarantine always withholds the node
+until `gpu-clear`, regardless of monitor mode.
 
 Drain disables new launches for the current allocation. Running jobs continue,
 queued jobs remain durable, and controller restarts preserve the drain. A

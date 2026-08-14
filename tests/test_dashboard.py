@@ -77,7 +77,45 @@ def _state(root: Path) -> dict:
                         "memory_gb": 128,
                     }
                 },
+                "unavailable_gpu_ids": [1],
+                "gpu_devices": [
+                    {
+                        "node": "gpu-0",
+                        "slot": 0,
+                        "uuid": "GPU-aaaa",
+                        "nvidia_index": 0,
+                        "minor_number": 0,
+                        "pci_bus_id": "00000000:17:00.0",
+                        "serial": "SERIAL-A",
+                        "name": "NVIDIA H100 80GB HBM3",
+                        "status": "healthy",
+                    },
+                    {
+                        "node": "gpu-0",
+                        "slot": 1,
+                        "uuid": "GPU-bbbb",
+                        "nvidia_index": 1,
+                        "minor_number": 1,
+                        "pci_bus_id": "00000000:65:00.0",
+                        "serial": "SERIAL-B",
+                        "name": "NVIDIA H100 80GB HBM3",
+                        "status": "quarantined",
+                        "last_reasons": ["thermal_slowdown"],
+                    },
+                ],
             }
+        },
+        "gpu_health": {
+            "v": 1,
+            "mode": "enforce",
+            "isolation": "node",
+            "monitor": {"status": "running"},
+            "nodes": {
+                "gpu-0": {
+                    "cuda_probe": {"ok": True},
+                    "devices": {},
+                }
+            },
         },
         "jobs": {"job-1": job},
         "archived_jobs": 0,
@@ -142,6 +180,7 @@ class DashboardTests(unittest.TestCase):
         overview, _ = self.get("/api/overview")
         job, _ = self.get("/api/jobs/job-1")
         workflow, _ = self.get("/api/workflows/workflow-1?project=koochak")
+        gpu, _ = self.get("/api/gpus/gpu-0/1")
 
         self.assertIn(b"SCRUFFY", html)
         self.assertIn(b"<h1>Resources</h1>", html)
@@ -177,6 +216,9 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn(b"GPU/n", model)
         self.assertIn(b'"node" : "nodes"', model)
         self.assertIn(b"setInterval(() => loadOverview(false), 5_000)", app)
+        self.assertIn(b"Copy report", html)
+        self.assertIn(b"NVIDIA UUID", app)
+        self.assertEqual("GPU-bbbb", json.loads(gpu)["uuid"])
         self.assertIn(b"...(snapshot?.queued || []), ...(snapshot?.submitted || [])", model)
         self.assertTrue(mascot.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual("image/png", mascot_headers["Content-Type"])

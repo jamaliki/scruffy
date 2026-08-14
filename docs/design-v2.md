@@ -74,6 +74,24 @@ Every mutation API requires an explicit GPU count; zero must be intentional.
 stores an absolute deadline at launch, reconstructs its remaining duration after
 a same-allocation restart, and terminates the job with reason `timeout`.
 
+### GPU health authority
+
+One controller-owned Slurm step overlaps all managed nodes and GPUs. Node-local
+workers publish atomic latest samples containing NVIDIA physical identity,
+thermal/ECC telemetry, and CUDA Driver API context probes. The controller alone
+turns those observations into `healthy`, `suspect`, or sticky `quarantined`
+state. High-rate metrics stay in replaceable samples and the current snapshot;
+only state transitions and operator commands enter the journal.
+Samples are bound to the outer allocation-incarnation fingerprint, so a requeue
+cannot reuse healthy freshness from the previous physical execution.
+
+The durable key is `(node, NVIDIA UUID)`. Scheduler slot, NVIDIA index, Linux
+minor, and PCI bus ID are reportable mappings, not stable identity. Missing or
+stale evidence fails closed only in enforce mode. Because current job steps ask
+Slurm for GPU counts rather than exact UUIDs, one quarantined GPU withholds its
+entire node from new GPU placement. Existing leases remain owned and are not
+terminated implicitly.
+
 ### Workflow attempts
 
 `(project_id, workflow_id, task_id)` is a logical task identity. Every admitted
@@ -94,6 +112,8 @@ Read interfaces project the same authoritative state for different costs:
 - queue/running/blocked/list operations return identities, with exact filters.
 - `inspect_job` exposes lifecycle, placement, provenance, and dependencies but
   never raw argv or environment values.
+- `gpus` and `inspect_gpu` expose physical identity, health evidence, scheduler
+  withholding, and a Scientific Computing report without mutation.
 - `tail_job_output` reads one job-owned stream with a hard 64 KiB bound.
 - `wait_job` composes the event cursor, terminal inspection, and optional stderr
   tail without adding controller state.
@@ -108,8 +128,8 @@ view instead of asking the controller to retain unbounded history.
   bounded manifest of declared and worker-validated artifacts.
 - Scientific concepts such as canary promotion and “no candidates” are client
   workflow or workload-outcome concepts, not scheduler lifecycle states.
-- GPU quarantine and automatic infrastructure retries require trustworthy
-  failure evidence. They should not be driven by stderr string matching.
+- Infrastructure retry remains a workload/client policy. GPU quarantine uses
+  controller-owned CUDA, thermal, and ECC evidence, never stderr matching.
 - Start-time estimates are intentionally absent. Scruffy reports deterministic
   blockers and resource eligibility instead of an unreliable ETA.
 

@@ -9,7 +9,7 @@ impossible through Scruffy's queue API.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 from .models import (
@@ -153,15 +153,18 @@ def assert_invariants(
 def available_resources(
     inventory: Sequence[NodeInventory],
     assignments: Sequence[Assignment] = (),
+    unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
 ) -> tuple[NodeAvailability, ...]:
     """Return the resources currently free on each inventory node."""
 
     assert_invariants(inventory, assignments)
-    return _available_resources(inventory, assignments)
+    return _available_resources(inventory, assignments, unavailable_gpu_ids)
 
 
 def _available_resources(
-    inventory: Sequence[NodeInventory], assignments: Sequence[Assignment]
+    inventory: Sequence[NodeInventory],
+    assignments: Sequence[Assignment],
+    unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
 ) -> tuple[NodeAvailability, ...]:
     """Compute availability after callers have validated the complete ledger."""
 
@@ -173,6 +176,10 @@ def _available_resources(
             free_gpu_ids[reservation.node].difference_update(reservation.gpu_ids)
             free_cpus[reservation.node] -= reservation.cpus
             free_memory[reservation.node] -= reservation.memory_gb
+    if unavailable_gpu_ids:
+        for node_name, gpu_ids in unavailable_gpu_ids.items():
+            if node_name in free_gpu_ids:
+                free_gpu_ids[node_name].difference_update(gpu_ids)
     return tuple(
         NodeAvailability(
             name=node.name,
@@ -224,6 +231,7 @@ def choose_assignment(
     inventory: Sequence[NodeInventory],
     assignments: Sequence[Assignment],
     job: QueuedJob,
+    unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
 ) -> Assignment | None:
     """Choose an atomic best-fit assignment, or return ``None`` if it must wait."""
 
@@ -232,7 +240,9 @@ def choose_assignment(
     assert_invariants(inventory, assignments)
     if any(active.job_id == job.job_id for active in assignments):
         raise InvariantError(f"job {job.job_id!r} is already assigned")
-    assignment = _candidate_assignment(_available_resources(inventory, assignments), job)
+    assignment = _candidate_assignment(
+        _available_resources(inventory, assignments, unavailable_gpu_ids), job
+    )
     if assignment is None:
         return None
     # Validate the proposed assignment against the whole state before exposing it.
@@ -268,6 +278,7 @@ def choose_first_fitting_job(
     inventory: Sequence[NodeInventory],
     assignments: Sequence[Assignment],
     queued_jobs: Sequence[QueuedJob],
+    unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
 ) -> tuple[QueuedJob, Assignment] | None:
     """Return the first queued job that currently fits.
 
@@ -286,7 +297,9 @@ def choose_first_fitting_job(
     if duplicate is not None:
         raise InvariantError(f"job {duplicate!r} is already assigned")
 
-    free_nodes = _available_resources(inventory, assignments)
+    free_nodes = _available_resources(
+        inventory, assignments, unavailable_gpu_ids
+    )
     for job in queued_jobs:
         assignment = _candidate_assignment(free_nodes, job)
         if assignment is not None:

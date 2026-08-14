@@ -10,11 +10,12 @@ import sys
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from ._compat import UTC
 from .models import NodeInventory, validate_inventory
 
 # SchedMD documents these as outer allocation, array, cluster, or submission
@@ -478,6 +479,58 @@ def build_srun_environment(
         ):
             del environment[name]
     return environment
+
+
+def build_health_srun_argv(
+    *,
+    slurm_job_id: str,
+    name: str,
+    root: Path,
+    node_names: list[str],
+    gpus_per_node: int,
+    interval: float,
+    allocation_incarnation_sha256: str,
+) -> list[str]:
+    """Build one overlapping, allocation-wide GPU health monitor step."""
+
+    if not slurm_job_id or not node_names:
+        raise ValueError("health monitoring requires a Slurm job and nodes")
+    if type(gpus_per_node) is not int or gpus_per_node < 1:
+        raise ValueError("health monitoring requires at least one GPU per node")
+    if interval <= 0:
+        raise ValueError("health interval must be positive")
+    if len(allocation_incarnation_sha256) != 64:
+        raise ValueError("health monitoring requires an allocation fingerprint")
+    nodes = len(node_names)
+    return [
+        "srun",
+        f"--jobid={slurm_job_id}",
+        f"--job-name={name}",
+        "--overlap",
+        "--exact",
+        f"--nodes={nodes}",
+        f"--nodelist={','.join(node_names)}",
+        f"--ntasks={nodes}",
+        "--ntasks-per-node=1",
+        f"--gpus-per-task={gpus_per_node}",
+        "--cpus-per-task=1",
+        "--cpu-bind=none",
+        "--mem=1G",
+        "--kill-on-bad-exit=1",
+        "--wait=0",
+        "--export=ALL",
+        "--output=/dev/null",
+        f"--error={root / 'health' / 'monitor-%N.err'}",
+        sys.executable,
+        "-m",
+        "scruffy.health_worker",
+        "--root",
+        str(root),
+        "--interval",
+        str(interval),
+        "--allocation-incarnation-sha256",
+        allocation_incarnation_sha256,
+    ]
 
 
 def live_steps(slurm_job_id: str) -> tuple[SlurmStep, ...]:

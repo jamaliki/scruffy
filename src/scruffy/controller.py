@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import copy
 import queue
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ._compat import UTC
+from .health import (
+    GPU_ISOLATION_MODES,
+    HEALTH_MODES,
+    HealthError,
+    bind_health_incarnation,
+    ensure_health_state,
+    ingest_health_sample,
+    set_quarantine,
+)
 from .lifecycle import (
     begin_shutdown,
     drain_messages,
@@ -32,9 +44,22 @@ from .models import (
 )
 from .protocol import validate_event
 from .provenance import write_request_record, write_result_record
-from .runtime import Controller, OutputNotifier, RunningProcess, abandon_processes
+from .runtime import (
+    Controller,
+    OutputNotifier,
+    RunningProcess,
+    abandon_processes,
+    signal_process,
+)
 from .scheduler import InvariantError, assert_invariants, request_can_ever_fit
-from .slurm import AllocationIncarnation, allocation_metadata
+from .slurm import (
+    AllocationIncarnation,
+    SlurmStep,
+    allocation_metadata,
+    build_health_srun_argv,
+    build_srun_environment,
+    cancel_step,
+)
 from .state import (
     apply_workload_event,
     commit_snapshot,
@@ -63,6 +88,7 @@ from .storage import (
     list_submissions,
     open_journal,
     read_events,
+    read_json,
     record_request_receipt,
     reject_request,
     remove_cold_job_directories,
@@ -95,6 +121,7 @@ COMMAND_OUTCOME_KINDS = {
     "allocation.drain_ignored",
     "allocation.launches_resumed",
     "allocation.resume_ignored",
+    "resource.gpu_health_changed",
 }
 
 
@@ -110,8 +137,20 @@ def _initialize_controller(
     allocation_incarnation: AllocationIncarnation | None = None,
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
+    gpu_health_mode: str = "observe",
+    gpu_isolation: str = "node",
+    gpu_health_interval: float = 10,
 ) -> Controller:
     state = load_recovered_state(root)
+    health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
+    bind_health_incarnation(
+        health,
+        (
+            allocation_incarnation.fingerprint_sha256
+            if allocation_incarnation is not None
+            else None
+        ),
+    )
     active = [
         job
         for job in state.get("jobs", {}).values()
@@ -201,6 +240,16 @@ def _initialize_controller(
         journal=journal,
         messages=messages,
         output=OutputNotifier(messages),
+        gpu_health_mode=gpu_health_mode,
+        gpu_isolation=gpu_isolation,
+        gpu_health_interval=gpu_health_interval,
+        health_step_name=(
+            f"scruffy-health-{allocation_incarnation.fingerprint_sha256[:12]}"
+            if launcher == "slurm"
+            and gpu_health_mode != "off"
+            and allocation_incarnation is not None
+            else None
+        ),
     )
 
     lost_reason = None
@@ -1139,6 +1188,36 @@ def _ingest_commands(controller: Controller) -> None:
                     "allocation.launches_resumed",
                     data={**data, "cleared_drain": was_draining},
                 )
+        elif kind in {"gpu.quarantine", "gpu.clear"}:
+            request_id = command.get("request_id")
+            try:
+                transition = set_quarantine(
+                    controller.state["gpu_health"],
+                    node=str(command.get("node") or ""),
+                    uuid=str(command.get("uuid") or ""),
+                    quarantined=kind == "gpu.quarantine",
+                    at=utc_now(),
+                    reason=(
+                        str(command["reason"]) if isinstance(command.get("reason"), str) else None
+                    ),
+                )
+            except HealthError as exc:
+                emit(
+                    controller,
+                    "command.rejected",
+                    data={"request_id": request_id, "reason": str(exc)},
+                )
+            else:
+                _emit_gpu_health(controller, [transition], request_id=request_id)
+        else:
+            emit(
+                controller,
+                "command.rejected",
+                data={
+                    "request_id": command.get("request_id"),
+                    "reason": f"unknown_command:{kind}",
+                },
+            )
         if not deferred:
             remove_command(source)
 
@@ -1400,6 +1479,207 @@ def _heartbeat(controller: Controller) -> None:
     commit_snapshot(controller)
 
 
+def _emit_gpu_health(
+    controller: Controller,
+    transitions: list[dict[str, Any]],
+    *,
+    request_id: object | None = None,
+) -> None:
+    data: dict[str, Any] = {
+        "transitions": copy.deepcopy(transitions),
+        "gpu_health": copy.deepcopy(controller.state["gpu_health"]),
+    }
+    if request_id is not None:
+        data["request_id"] = request_id
+    emit(controller, "resource.gpu_health_changed", data=data)
+
+
+def _set_health_monitor_status(
+    controller: Controller, status: str, *, error: str | None = None
+) -> bool:
+    health = controller.state["gpu_health"]
+    monitor = health.setdefault("monitor", {})
+    expected_step = controller.health_step_id
+    if (
+        monitor.get("status") == status
+        and monitor.get("error") == error
+        and monitor.get("slurm_step_id") == expected_step
+    ):
+        return False
+    monitor.update({"status": status, "error": error, "changed_at": utc_now()})
+    if controller.health_step_id:
+        monitor["slurm_step_id"] = controller.health_step_id
+    else:
+        monitor.pop("slurm_step_id", None)
+    return True
+
+
+def _ingest_gpu_health(controller: Controller) -> None:
+    if controller.gpu_health_mode == "off":
+        return
+    health = controller.state["gpu_health"]
+    errors = health.setdefault("sample_errors", {})
+    transitions: list[dict[str, Any]] = []
+    sample_updated = False
+    durable_changed = False
+    for inventory_node in controller.inventory:
+        source = controller.root / "health" / "samples" / f"{inventory_node.name}.json"
+        if not source.exists():
+            continue
+        try:
+            document = read_json(source)
+            if not isinstance(document, dict):
+                raise HealthError("health sample must be an object")
+            expected_incarnation = (
+                controller.allocation_incarnation.fingerprint_sha256
+                if controller.allocation_incarnation is not None
+                else None
+            )
+            if (
+                expected_incarnation is not None
+                and document.get("allocation_incarnation_sha256") != expected_incarnation
+            ):
+                raise HealthError("health sample belongs to another allocation incarnation")
+            before = health.get("nodes", {}).get(inventory_node.name, {}).get("last_sample_at")
+            transitions.extend(ingest_health_sample(health, controller.inventory, document))
+            after = health["nodes"][inventory_node.name].get("last_sample_at")
+            if after != before:
+                health["nodes"][inventory_node.name]["last_received_at"] = utc_now()
+                sample_updated = True
+        except (HealthError, OSError, StorageError) as exc:
+            message = str(exc)
+            if errors.get(inventory_node.name) != message:
+                errors[inventory_node.name] = message
+                durable_changed = True
+            continue
+        if inventory_node.name in errors:
+            del errors[inventory_node.name]
+            durable_changed = True
+    monitor_status = "degraded" if errors else "running"
+    if sample_updated and _set_health_monitor_status(controller, monitor_status):
+        durable_changed = True
+    if transitions or durable_changed:
+        _emit_gpu_health(controller, transitions)
+
+
+def _health_monitor_matches(controller: Controller) -> list[SlurmStep]:
+    matches = [
+        step
+        for step in controller.slurm_steps
+        if step.name == controller.health_step_name
+        or (controller.health_step_id and step.step_id == controller.health_step_id)
+    ]
+    return list({step.step_id: step for step in matches}.values())
+
+
+def _health_monitor_error(controller: Controller, error: str) -> None:
+    controller.health_process = None
+    controller.health_step_id = None
+    controller.health_retry_at = time.monotonic() + 5
+    if _set_health_monitor_status(controller, "error", error=error):
+        _emit_gpu_health(controller, [])
+
+
+def _attach_health_monitor(controller: Controller, step: SlurmStep) -> None:
+    controller.health_step_id = step.step_id
+    current_status = controller.state["gpu_health"].get("monitor", {}).get("status", "starting")
+    if current_status not in {"running", "degraded"}:
+        current_status = "starting"
+    if _set_health_monitor_status(controller, str(current_status), error=None):
+        _emit_gpu_health(controller, [])
+
+
+def _reconcile_health_process(controller: Controller) -> bool:
+    """Return true when an existing client is still settling or was handled."""
+
+    process = controller.health_process
+    if process is None:
+        return False
+    if process.poll() is not None:
+        _health_monitor_error(
+            controller,
+            f"health monitor srun exited with status {process.returncode}",
+        )
+        return True
+    if controller.slurm_snapshot_at <= controller.health_launch_snapshot_at:
+        return True
+    signal_process(process, signal.SIGTERM)
+    _health_monitor_error(controller, "Slurm no longer reports the health monitor step")
+    return True
+
+
+def _launch_health_monitor(controller: Controller) -> None:
+    health_root = controller.root / "health"
+    health_root.mkdir(parents=True, exist_ok=True)
+    try:
+        controller.health_process = subprocess.Popen(
+            build_health_srun_argv(
+                slurm_job_id=controller.slurm_job_id or "",
+                name=controller.health_step_name or "scruffy-health",
+                root=controller.root,
+                node_names=[node.name for node in controller.inventory],
+                gpus_per_node=len(controller.inventory[0].gpu_ids),
+                interval=controller.gpu_health_interval,
+                allocation_incarnation_sha256=(
+                    controller.allocation_incarnation.fingerprint_sha256
+                    if controller.allocation_incarnation is not None
+                    else ""
+                ),
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=build_srun_environment(),
+            start_new_session=True,
+        )
+        controller.health_launch_snapshot_at = controller.slurm_snapshot_at
+    except (OSError, ValueError) as exc:
+        _health_monitor_error(controller, str(exc))
+        return
+    if _set_health_monitor_status(controller, "starting"):
+        _emit_gpu_health(controller, [])
+
+
+def _maintain_health_monitor(controller: Controller) -> None:
+    if controller.launcher != "slurm" or controller.gpu_health_mode == "off":
+        return
+    matches = _health_monitor_matches(controller)
+    if len(matches) > 1:
+        _health_monitor_error(controller, "multiple health monitor steps are live")
+        return
+    if matches:
+        _attach_health_monitor(controller, matches[0])
+        return
+    if _reconcile_health_process(controller):
+        return
+    if (
+        controller.slurm_snapshot_at == 0
+        or controller.slurm_query_error
+        or time.monotonic() < controller.health_retry_at
+    ):
+        return
+    _launch_health_monitor(controller)
+
+
+def _stop_health_monitor(controller: Controller) -> None:
+    if controller.launcher != "slurm" or controller.gpu_health_mode == "off":
+        return
+    process = controller.health_process
+    if process is not None and process.poll() is None:
+        signal_process(process, signal.SIGTERM)
+    if controller.health_step_id:
+        try:
+            cancel_step(controller.slurm_job_id or "", controller.health_step_id)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            if _set_health_monitor_status(controller, "error", error=str(exc)):
+                _emit_gpu_health(controller, [])
+            return
+    controller.health_process = None
+    controller.health_step_id = None
+    if _set_health_monitor_status(controller, "stopped"):
+        _emit_gpu_health(controller, [])
+
+
 def _drain_for_deadline(controller: Controller) -> None:
     """Stop new launches when the configured allocation shutdown window begins."""
 
@@ -1458,11 +1738,14 @@ def _serve(controller: Controller) -> None:
             _drain_for_deadline(controller)
             drain_messages(controller)
             poll_processes(controller)
+            _maintain_health_monitor(controller)
+            _ingest_gpu_health(controller)
             _ingest_reports(controller)
             _refresh_dependencies(controller)
             compact_journal(controller)
             if controller.stopping:
                 begin_shutdown(controller)
+                _stop_health_monitor(controller)
                 if controller.launcher == "slurm" or not controller.running:
                     break
             else:
@@ -1496,12 +1779,19 @@ def run_controller(
     cancel_grace: float = 30,
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
+    gpu_health_mode: str = "observe",
+    gpu_isolation: str = "node",
+    gpu_health_interval: float = 10,
 ) -> None:
     """Own a queue until interrupted, retrying transient storage failures."""
 
     if launcher not in {"local", "slurm"}:
         raise ValueError(f"unknown launcher {launcher!r}")
     inventory = validate_inventory(inventory)
+    if gpu_health_mode not in HEALTH_MODES:
+        raise ValueError(f"unknown GPU health mode {gpu_health_mode!r}")
+    if gpu_isolation not in GPU_ISOLATION_MODES:
+        raise ValueError(f"unknown GPU isolation mode {gpu_isolation!r}")
     if (
         poll_interval <= 0
         or cancel_grace < 0
@@ -1510,6 +1800,8 @@ def run_controller(
         raise ValueError(
             "poll interval must be positive; grace and drain window must be non-negative"
         )
+    if gpu_health_interval <= 0:
+        raise ValueError("GPU health interval must be positive")
     if launcher == "local" and len(inventory) != 1:
         raise ValueError("the local launcher requires a one-node inventory")
     if launcher == "slurm" and (
@@ -1523,6 +1815,12 @@ def run_controller(
         raise ValueError("a matching Slurm allocation incarnation is required")
     if launcher == "local" and allocation_incarnation is not None:
         raise ValueError("local launchers cannot have a Slurm allocation incarnation")
+    if (
+        launcher == "slurm"
+        and gpu_health_mode != "off"
+        and len({len(node.gpu_ids) for node in inventory}) != 1
+    ):
+        raise ValueError("GPU health monitoring requires homogeneous GPU counts")
 
     root = ensure_layout(root)
     with controller_lock(root):
@@ -1540,6 +1838,9 @@ def run_controller(
                     cancel_grace=cancel_grace,
                     start_paused=start_paused,
                     drain_before_end_seconds=drain_before_end_seconds,
+                    gpu_health_mode=gpu_health_mode,
+                    gpu_isolation=gpu_isolation,
+                    gpu_health_interval=gpu_health_interval,
                 )
                 _serve(controller)
                 return

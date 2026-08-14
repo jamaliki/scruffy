@@ -286,7 +286,7 @@ class UpdateBroker:
                     break
                 try:
                     await asyncio.wait_for(self._condition.wait(), remaining)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     break
 
         if reset_reason:

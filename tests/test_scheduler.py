@@ -139,6 +139,36 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(free["gpu-b"].cpus, 0)
         self.assertEqual(free["gpu-b"].memory_gb, 0)
 
+    def test_unavailable_gpus_are_removed_without_invalidating_active_work(self) -> None:
+        active = self.assignment_for("active", "gpu-a", (0,))
+
+        free = {
+            node.name: node
+            for node in available_resources(
+                self.inventory,
+                (active,),
+                {"gpu-a": {0, 2}, "unknown-node": {0}},
+            )
+        }
+
+        self.assertEqual((1, 3, 4, 5, 6, 7), free["gpu-a"].gpu_ids)
+
+    def test_placement_skips_unavailable_gpu_slots(self) -> None:
+        job = QueuedJob("healthy-only", request(gpus=4))
+
+        assignment = choose_assignment(
+            self.inventory,
+            (),
+            job,
+            {"gpu-b": {0}, "gpu-a": {0, 1, 2, 3, 4}, "gpu-c": {0}},
+        )
+
+        self.assertIsNotNone(assignment)
+        assert assignment is not None
+        reservation = assignment.reservations[0]
+        self.assertEqual("gpu-c", reservation.node)
+        self.assertEqual((1, 2, 3, 4), reservation.gpu_ids)
+
     def test_gpu_overlap_is_rejected(self) -> None:
         first = self.assignment_for("first", "gpu-a", (0,))
         second = self.assignment_for("second", "gpu-a", (0,))
