@@ -27,7 +27,7 @@ requests · workflows · commands · reports · health samples"]]
     controller["Single controller
 one lock · one writer · resource and health authority"]
     scheduler["Pure scheduler
-dependency gates · fair priority · health-filtered best fit"]
+lifecycle + artifact gates · fair priority · health-filtered best fit"]
     reserve["Durable reservation
 job.starting enters the journal first"]
     workers["Slurm worker steps
@@ -46,7 +46,7 @@ CLI · MCP hub · clickable GPU dashboard"]
     controller -.->|launch · reattach| health
     health -->|atomic latest samples| inboxes
     controller --> state --> observers
-    payload -.->|reports via inbox| controller
+    payload -.->|progress + typed artifact publications| controller
 
     classDef producer fill:#F4F0FF,stroke:#6D5BD0,color:#241C3A,stroke-width:1.5px;
     classDef storage fill:#F4EDC9,stroke:#9C7B21,color:#352B10,stroke-width:1.5px;
@@ -89,7 +89,8 @@ deadlines · output · processes · Slurm steps"]
     health["Maintain GPU health
 validate incarnation · ingest samples · update sticky state"]
     dependencies["Refresh workflow gates
-queue ready tasks · skip impossible descendants"]
+lifecycle needs · typed artifact evidence
+blocked tasks reserve nothing"]
     maintain["Bound retained state
 compact journal · archive cold jobs"]
     fit{"Eligible job fits
