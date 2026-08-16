@@ -69,6 +69,7 @@ class SubmitCliTests(unittest.TestCase):
             workflow_id=None,
             task_id=None,
             needs=[],
+            wait_for=[],
         )
 
     def test_cpu_only_submit_keeps_positive_cpu_and_memory_defaults(self) -> None:
@@ -118,6 +119,8 @@ class SubmitCliTests(unittest.TestCase):
                     "train",
                     "--needs",
                     "evaluate:terminal",
+                    "--wait-for-artifact",
+                    "train:checkpoint/step000000007.pt",
                     "--",
                     "true",
                 ]
@@ -132,6 +135,16 @@ class SubmitCliTests(unittest.TestCase):
                 {"task_id": "evaluate", "condition": "terminal"},
             ],
             submit.call_args.kwargs["needs"],
+        )
+        self.assertEqual(
+            [
+                {
+                    "kind": "artifact",
+                    "task_id": "train",
+                    "artifact_id": "checkpoint/step000000007.pt",
+                }
+            ],
+            submit.call_args.kwargs["wait_for"],
         )
 
     def test_submit_uses_explicit_project_namespace(self) -> None:

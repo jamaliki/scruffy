@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from scruffy.protocol import EVENT_KINDS, MAX_EVENT_BYTES, ProtocolError, validate_event
+from scruffy.protocol import (
+    EVENT_KINDS,
+    MAX_EVENT_BYTES,
+    ProtocolError,
+    artifact_publication,
+    validate_event,
+)
 
 
 def event(**changes: object) -> dict[str, object]:
@@ -68,6 +74,39 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual("small", validated["data"]["text"])
         with self.assertRaisesRegex(ProtocolError, str(MAX_EVENT_BYTES)):
             validate_event(event(data={"text": "x" * MAX_EVENT_BYTES}))
+
+    def test_only_strict_artifact_publications_gain_scheduling_meaning(self) -> None:
+        publication = {
+            "v": 1,
+            "artifact_id": "checkpoint/step000000007.pt",
+            "path": "/runs/step000000007.pt",
+            "size_bytes": 123,
+            "sha256": "a" * 64,
+            "manifest_path": "/runs/step000000007.pt.ready.json",
+        }
+        validated = validate_event(
+            event(
+                kind="workload.artifact",
+                data={"artifact_type": "checkpoint", "publication": publication},
+            )
+        )
+        self.assertEqual(publication, artifact_publication(validated["data"]))
+        self.assertIsNone(artifact_publication({"location": "/runs/checkpoint.pt"}))
+
+        malformed = (
+            {**publication, "path": "relative.pt"},
+            {**publication, "sha256": "A" * 64},
+            {**publication, "size_bytes": -1},
+            {key: value for key, value in publication.items() if key != "manifest_path"},
+        )
+        for candidate in malformed:
+            with self.subTest(publication=candidate), self.assertRaises(ProtocolError):
+                validate_event(
+                    event(
+                        kind="workload.artifact",
+                        data={"publication": candidate},
+                    )
+                )
 
 
 if __name__ == "__main__":

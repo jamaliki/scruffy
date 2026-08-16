@@ -114,6 +114,18 @@ def _needs(values: list[str]) -> list[dict[str, str]]:
     return dependencies
 
 
+def _artifact_conditions(values: list[str]) -> list[dict[str, str]]:
+    conditions = []
+    for value in values:
+        task_id, separator, artifact_id = value.partition(":")
+        if not separator or not task_id or not artifact_id:
+            raise ValueError("artifact condition must be TASK_ID:ARTIFACT_ID")
+        conditions.append(
+            {"kind": "artifact", "task_id": task_id, "artifact_id": artifact_id}
+        )
+    return conditions
+
+
 def _json_object(value: str, label: str) -> dict[str, Any]:
     try:
         result = json.loads(value)
@@ -208,6 +220,7 @@ def _submit(arguments: argparse.Namespace) -> int:
         workflow_id=arguments.workflow_id,
         task_id=arguments.task_id,
         needs=_needs(arguments.needs),
+        wait_for=_artifact_conditions(arguments.wait_for_artifact),
     )
     _json(result)
     return 0
@@ -615,6 +628,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="TASK[:CONDITION]",
         help="dependency condition: succeeded (default) or terminal",
+    )
+    submit.add_argument(
+        "--wait-for-artifact",
+        action="append",
+        default=[],
+        metavar="TASK:ARTIFACT_ID",
+        help="block until a workflow task publishes an immutable artifact",
     )
     submit.add_argument("command", nargs=argparse.REMAINDER, help="argv to execute")
     submit.set_defaults(handler=_submit)

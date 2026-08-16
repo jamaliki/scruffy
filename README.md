@@ -568,7 +568,10 @@ publishes one immutable envelope; the controller creates every task or none.
         "nodes": 1, "gpus_per_node": 1,
         "cpus_per_node": 14, "memory_gb_per_node": 128
       },
-      "needs": [{"task_id": "train", "condition": "succeeded"}]
+      "wait_for": [{
+        "kind": "artifact", "task_id": "train",
+        "artifact_id": "checkpoint/step000100000.pt"
+      }]
     }
   ]
 }
@@ -586,7 +589,8 @@ project, and a dependency never binds across projects.
 ```bash
 scruffy --root "$SCRUFFY_ROOT" submit \
   --workflow-id experiment-7 --task-id infer \
-  --needs train:succeeded --gpus-per-node 1 -- python infer.py
+  --wait-for-artifact train:checkpoint/step000100000.pt \
+  --gpus-per-node 1 -- python infer.py
 
 scruffy --root "$SCRUFFY_ROOT" submit \
   --workflow-id experiment-7 --task-id train \
@@ -601,6 +605,16 @@ final. A failed, cancelled, lost, rejected, or skipped task ID may be reclaimed
 by a new job with a new `request_id`; retry skipped dependants the same way.
 Active duplicate task IDs, self-dependencies, and cycles are rejected. Use
 `scruffy explain JOB_ID` for the resolved dependency state.
+
+Artifact conditions are independent of lifecycle dependencies. A task may wait
+for an intermediate artifact while its producer continues running, or declare
+both `wait_for` and `needs` when it also requires successful producer exit. Only
+a strict typed publication from the named task satisfies the condition; ordinary
+artifact messages remain observations. Satisfaction is journaled on the
+consumer with the exact producer job, event, path, byte count, and SHA256, and
+therefore survives controller restarts and allocation handover. A terminal
+producer without matching evidence leaves the consumer safely blocked rather
+than racing a late report into `skipped`.
 
 ## Workload progress and output
 
@@ -625,9 +639,10 @@ scruffy report workload.progress \
   --data-json '{"phase":"training","step":12000,"metrics":{"loss":1.42}}'
 ```
 
-Workload reports are capped at 64 KiB and cannot change lifecycle state, exit
-status, assignments, or GPU ownership. Keep raw logs, metric histories,
-configuration, and artifact bytes elsewhere. See
+Workload reports are capped at 64 KiB and cannot directly change lifecycle
+state, exit status, assignments, or GPU ownership. A strictly typed artifact
+publication may satisfy only a matching, predeclared workflow condition. Keep
+raw logs, metric histories, configuration, and artifact bytes elsewhere. See
 [the workload event contract](docs/events-v1.md).
 
 Reports accepted in one controller tick are group-committed with one journal

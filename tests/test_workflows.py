@@ -18,6 +18,8 @@ def task(
     project_id: str = "default",
     state: str = "queued",
     needs: list[dict[str, str]] | None = None,
+    wait_for: list[dict[str, str]] | None = None,
+    condition_satisfactions: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "project_id": project_id,
@@ -25,11 +27,19 @@ def task(
         "task_id": task_id,
         "state": state,
         "needs": [] if needs is None else needs,
+        "wait_for": [] if wait_for is None else wait_for,
+        "condition_satisfactions": (
+            [] if condition_satisfactions is None else condition_satisfactions
+        ),
     }
 
 
 def need(task_id: str, condition: str = "succeeded") -> dict[str, str]:
     return {"task_id": task_id, "condition": condition}
+
+
+def artifact(task_id: str, artifact_id: str) -> dict[str, str]:
+    return {"kind": "artifact", "task_id": task_id, "artifact_id": artifact_id}
 
 
 class WorkflowValidationTests(unittest.TestCase):
@@ -82,6 +92,28 @@ class WorkflowValidationTests(unittest.TestCase):
             with self.subTest(needs=raw_needs), self.assertRaises(WorkflowError):
                 validate_workflows([task("root"), job])
 
+    def test_artifact_conditions_are_strict_and_require_a_workflow(self) -> None:
+        valid = task("infer", wait_for=[artifact("train", "checkpoint/step7.pt")])
+        validate_workflows([task("train"), valid])
+
+        malformed: tuple[object, ...] = (
+            None,
+            "checkpoint",
+            [{}],
+            [{"kind": "file", "task_id": "train", "artifact_id": "x"}],
+            [{"kind": "artifact", "task_id": "train"}],
+        )
+        for wait_for in malformed:
+            candidate = task("infer")
+            candidate["wait_for"] = wait_for
+            with self.subTest(wait_for=wait_for), self.assertRaises(WorkflowError):
+                validate_workflows([task("train"), candidate])
+
+        with self.assertRaisesRegex(WorkflowError, "needs or wait_for"):
+            validate_workflows(
+                [{"wait_for": [artifact("train", "checkpoint/step7.pt")]}]
+            )
+
     def test_task_ids_are_unique_within_but_not_across_workflows(self) -> None:
         validate_workflows([task("train", workflow_id="a"), task("train", workflow_id="b")])
         validate_workflows(
@@ -133,6 +165,17 @@ class WorkflowValidationTests(unittest.TestCase):
             ):
                 validate_workflows(jobs)
 
+        with self.assertRaisesRegex(WorkflowError, "dependency cycle"):
+            validate_workflows(
+                [
+                    task("train", needs=[need("infer")]),
+                    task(
+                        "infer",
+                        wait_for=[artifact("train", "checkpoint/step7.pt")],
+                    ),
+                ]
+            )
+
     def test_terminal_task_edges_do_not_keep_a_repaired_graph_cyclic(self) -> None:
         cancelled = task("a", state="cancelled", needs=[need("b")])
         replacement = task("b", needs=[need("a")])
@@ -155,6 +198,39 @@ class WorkflowValidationTests(unittest.TestCase):
 
 
 class WorkflowResolutionTests(unittest.TestCase):
+    def test_artifact_condition_blocks_until_exact_evidence_is_recorded(self) -> None:
+        condition = artifact("train", "checkpoint/step7.pt")
+        producer = task("train", state="running")
+        consumer = task("infer", state="blocked", wait_for=[condition])
+
+        pending = resolve_dependencies(consumer, [producer, consumer])
+        self.assertEqual("blocked", pending["decision"])
+        self.assertEqual("condition_pending", pending["blockers"][0]["reason"])
+
+        consumer["condition_satisfactions"] = [
+            {
+                **condition,
+                "producer_job_id": "job-train",
+                "publication": {"sha256": "a" * 64},
+            }
+        ]
+        self.assertEqual(
+            "ready", resolve_dependencies(consumer, [producer, consumer])["decision"]
+        )
+
+    def test_terminal_producer_without_publication_remains_safely_blocked(self) -> None:
+        producer = task("train", state="succeeded")
+        consumer = task(
+            "infer",
+            state="blocked",
+            wait_for=[artifact("train", "checkpoint/step7.pt")],
+        )
+
+        resolution = resolve_dependencies(consumer, [producer, consumer])
+
+        self.assertEqual("blocked", resolution["decision"])
+        self.assertEqual("condition_pending", resolution["blockers"][0]["reason"])
+
     def test_newest_valid_retry_shadows_failed_and_invalid_attempts(self) -> None:
         attempts = [
             {**task("train", state="failed"), "queue_order": 1},

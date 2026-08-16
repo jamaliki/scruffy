@@ -188,6 +188,7 @@ button.legend-item.selected { box-shadow:inset 0 -2px 0 var(--project-color); }
 .workflow-edges { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
 .workflow-edge { fill:none; stroke:var(--teal); stroke-width:2; vector-effect:non-scaling-stroke; }
 .workflow-edge.terminal { stroke:var(--warning); stroke-dasharray:6 5; }
+.workflow-edge.artifact { stroke:var(--accent); stroke-dasharray:2 5; }
 .workflow-node { position:absolute; padding:11px 13px; display:grid; align-content:center; gap:7px; overflow:hidden; border:1px solid var(--rule); border-left:4px solid var(--slate); background:linear-gradient(145deg,var(--surface),var(--surface-alt)); color:var(--ink); text-align:left; box-shadow:0 8px 18px rgba(0,8,9,.2); }
 .workflow-node:hover { z-index:2; border-color:var(--heading); background:var(--surface-high); transform:translateY(-1px); }
 .workflow-node.active { border-left-color:var(--accent); }

@@ -373,7 +373,7 @@ def compact_explanation(value: dict[str, Any]) -> dict[str, Any]:
 
     result = {
         key: copy.deepcopy(value[key])
-        for key in ("v", "dependencies", "blockers", "explanation")
+        for key in ("v", "dependencies", "conditions", "blockers", "explanation")
         if key in value
     }
     result["job"] = compact_job(value["job"])
@@ -463,6 +463,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
             "workflow_id",
             "task_id",
             "needs",
+            "wait_for",
             "environment",
         },
     )
@@ -492,6 +493,13 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
         needs = []
     elif not isinstance(needs, list) or not all(isinstance(item, dict) for item in needs):
         raise ValueError("needs must be a list of dependency objects")
+    wait_for = params.get("wait_for")
+    if wait_for is None:
+        wait_for = []
+    elif not isinstance(wait_for, list) or not all(
+        isinstance(item, dict) for item in wait_for
+    ):
+        raise ValueError("wait_for must be a list of condition objects")
     if "gpus_per_node" not in params:
         raise ValueError("gpus_per_node is required; use 0 explicitly for CPU-only work")
     gpus = params["gpus_per_node"]
@@ -516,6 +524,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
         workflow_id=params.get("workflow_id"),
         task_id=params.get("task_id"),
         needs=needs,
+        wait_for=wait_for,
     )
 
 
@@ -962,6 +971,7 @@ def create_server(
             workflow_id: str | None = None,
             task_id: str | None = None,
             needs: list[dict[str, str]] | None = None,
+            wait_for: list[dict[str, str]] | None = None,
             environment: dict[str, str] | None = None,
         ) -> dict[str, Any]:
             """Durably enqueue a job in this server's pinned project.
@@ -986,6 +996,7 @@ def create_server(
                     "workflow_id": workflow_id,
                     "task_id": task_id,
                     "needs": needs,
+                    "wait_for": wait_for,
                     "environment": {} if environment is None else environment,
                 },
             )

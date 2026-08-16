@@ -551,6 +551,15 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
             "argv": ["/shared/env/bin/python", "train.py"],
             "cwd": "/shared/code/project",
             "gpus_per_node": 2,
+            "workflow_id": "campaign",
+            "task_id": "infer",
+            "wait_for": [
+                {
+                    "kind": "artifact",
+                    "task_id": "train",
+                    "artifact_id": "checkpoint/step000000007.pt",
+                }
+            ],
         }
 
         with self.assertRaisesRegex(ValueError, "project-pinned"):
@@ -567,6 +576,7 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["job_id"], second["job_id"])
         spec = dict(list_requests(self.root))[first["job_id"]]
         self.assertEqual("project-a", spec["project_id"])
+        self.assertEqual(params["wait_for"], spec["wait_for"])
         self.assertEqual(
             {
                 "nodes": 1,

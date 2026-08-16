@@ -95,6 +95,10 @@ agents; reading does not consume events for anyone else. Use
   IDs cannot contain `:`. A succeeded task identity is
   final; after any other terminal result, retry it with a new `request_id` in
   the same workflow.
+- Use `--wait-for-artifact TASK:ARTIFACT_ID` or workflow `wait_for` for an
+  intermediate immutable artifact. This reserves no resources while blocked.
+  Only a strict typed publication from that task releases the condition;
+  lifecycle `needs` remain separate and may be combined with it.
 - Prefer `summary` for bounded orientation; `resources`, `running`, `queue`, or
   `blocked` for compact operational views; `explain` for one dependency chain;
   and `observe` for incremental monitoring.
@@ -168,6 +172,9 @@ agents; reading does not consume events for anyone else. Use
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.
+- A typed artifact publication contains a stable artifact ID, absolute immutable
+  path, size, SHA256, and ready-manifest path. Generic workload strings never
+  release conditions, and the controller never polls artifact storage.
 - A workload report `event_id` deduplicates only across the active and previous
   journal generations. Do not use it as a permanent exactly-once record.
 - Scruffy numbers immutable task attempts but does not automatically retry or

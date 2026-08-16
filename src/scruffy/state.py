@@ -73,8 +73,9 @@ def apply_workload_event(
 ) -> None:
     """Project one validated producer event onto a job's current workload view.
 
-    Producer reports are deliberately unable to alter lifecycle or placement
-    fields.  The complete event remains in the journal; this projection only
+    Producer reports cannot directly alter lifecycle or placement fields. A
+    strictly typed artifact publication may separately satisfy an explicitly
+    declared workflow condition in the controller; this projection itself only
     keeps the bounded latest values agents need for a quick status check.
     """
 

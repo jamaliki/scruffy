@@ -282,7 +282,7 @@ function renderWorkflowGraph() {
     const bend = Math.max(36, (endX - startX) / 2);
     const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
     line.setAttribute("d", `M ${startX} ${startY} C ${startX + bend} ${startY}, ${endX - bend} ${endY}, ${endX} ${endY}`);
-    line.classList.add("workflow-edge", edge.condition === "terminal" ? "terminal" : "success");
+    line.classList.add("workflow-edge", edge.condition === "terminal" ? "terminal" : edge.condition === "artifact" ? "artifact" : "success");
     svg.append(line);
   }
   const children = [svg];

@@ -43,11 +43,16 @@ def _workflow_fields(
     workflow_id: str | None,
     task_id: str | None,
     needs: Sequence[Mapping[str, str]] | None,
+    wait_for: Sequence[Mapping[str, str]] | None,
 ) -> dict[str, Any]:
     """Validate one task's local metadata without requiring upstream jobs yet."""
 
     dependencies = () if needs is None else needs
-    candidate: dict[str, object] = {"needs": dependencies}
+    conditions = () if wait_for is None else wait_for
+    candidate: dict[str, object] = {
+        "needs": dependencies,
+        "wait_for": conditions,
+    }
     if workflow_id is not None:
         candidate["workflow_id"] = workflow_id
     if task_id is not None:
@@ -59,6 +64,7 @@ def _workflow_fields(
         "workflow_id": workflow_id,
         "task_id": task_id,
         "needs": [dict(need) for need in dependencies],
+        "wait_for": [dict(condition) for condition in conditions],
     }
 
 
@@ -75,6 +81,7 @@ def submit_job(
     workflow_id: str | None = None,
     task_id: str | None = None,
     needs: Sequence[Mapping[str, str]] | None = None,
+    wait_for: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Durably enqueue a job and return immediately with its stable job ID."""
 
@@ -95,7 +102,7 @@ def submit_job(
         "env": dict(sorted(environment.items())),
         "resources": request.to_dict(),
         **({"project_id": project_id} if project_id != DEFAULT_PROJECT else {}),
-        **_workflow_fields(workflow_id, task_id, needs),
+        **_workflow_fields(workflow_id, task_id, needs, wait_for),
     }
     job_id, deduplicated = submit_request(root, spec)
     return {
@@ -296,17 +303,21 @@ def _submitted_from_spec(
     workflow: dict[str, Any] = {}
     workflow_id, task_id = document.get("workflow_id"), document.get("task_id")
     needs = document.get("needs", [])
-    if workflow_id is not None or task_id is not None or needs:
+    wait_for = document.get("wait_for", [])
+    if workflow_id is not None or task_id is not None or needs or wait_for:
         if (
             isinstance(workflow_id, str)
             and isinstance(task_id, str)
             and isinstance(needs, list)
             and all(isinstance(need, dict) for need in needs)
+            and isinstance(wait_for, list)
+            and all(isinstance(condition, dict) for condition in wait_for)
         ):
             workflow = {
                 "workflow_id": workflow_id,
                 "task_id": task_id,
                 "needs": copy.deepcopy(needs),
+                "wait_for": copy.deepcopy(wait_for),
             }
         else:
             valid = False
@@ -746,6 +757,10 @@ def inspect_workflow(
                 "reason": job.get("reason"),
                 "attempt": job.get("attempt"),
                 "needs": copy.deepcopy(job.get("needs") or []),
+                "wait_for": copy.deepcopy(job.get("wait_for") or []),
+                "condition_satisfactions": copy.deepcopy(
+                    job.get("condition_satisfactions") or []
+                ),
                 "blockers": copy.deepcopy(job.get("blockers") or []),
                 "submitted_at": job.get("submitted_at"),
                 "attempts": [

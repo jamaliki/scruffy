@@ -16,6 +16,7 @@ from .models import TERMINAL_JOB_STATES, job_project
 Job = Mapping[str, object]
 TaskKey = tuple[str, str, str]
 Need = tuple[str, str]
+ArtifactCondition = tuple[str, str]
 
 DEPENDENCY_CONDITIONS = frozenset({"succeeded", "terminal"})
 
@@ -36,6 +37,13 @@ def _task_id(value: object, label: str) -> str:
     identifier = _identifier(value, label)
     if ":" in identifier:
         raise WorkflowError(f"{label} must not contain ':'")
+    return identifier
+
+
+def _artifact_id(value: object, label: str) -> str:
+    identifier = _identifier(value, label)
+    if len(identifier) > 256 or any(ord(character) < 32 for character in identifier):
+        raise WorkflowError(f"{label} must be at most 256 printable characters")
     return identifier
 
 
@@ -81,6 +89,45 @@ def _dependencies(job: Job, label: str) -> tuple[Need, ...]:
         seen.add(task_id)
         dependencies.append((task_id, condition))
     return tuple(dependencies)
+
+
+def _artifact_conditions(job: Job, label: str) -> tuple[ArtifactCondition, ...]:
+    raw_conditions = job.get("wait_for", ())
+    if isinstance(raw_conditions, (str, bytes)) or not isinstance(
+        raw_conditions, Sequence
+    ):
+        raise WorkflowError(f"{label}.wait_for must be an array")
+
+    conditions: list[ArtifactCondition] = []
+    seen: set[ArtifactCondition] = set()
+    for index, raw_condition in enumerate(raw_conditions):
+        condition_label = f"{label}.wait_for[{index}]"
+        if not isinstance(raw_condition, Mapping):
+            raise WorkflowError(f"{condition_label} must be an object")
+        expected = {"kind", "task_id", "artifact_id"}
+        if set(raw_condition) != expected:
+            raise WorkflowError(
+                f"{condition_label} must contain exactly kind, task_id and artifact_id"
+            )
+        if raw_condition["kind"] != "artifact":
+            raise WorkflowError(f"{condition_label}.kind must equal 'artifact'")
+        condition = (
+            _task_id(raw_condition["task_id"], f"{condition_label}.task_id"),
+            _artifact_id(
+                raw_condition["artifact_id"], f"{condition_label}.artifact_id"
+            ),
+        )
+        if condition in seen:
+            raise WorkflowError(f"{label} has duplicate artifact condition {condition!r}")
+        seen.add(condition)
+        conditions.append(condition)
+    return tuple(conditions)
+
+
+def artifact_conditions(job: Job) -> tuple[ArtifactCondition, ...]:
+    """Return one task's validated artifact conditions."""
+
+    return _artifact_conditions(job, "job")
 
 
 def _materialize(jobs: Iterable[Job]) -> tuple[Job, ...]:
@@ -149,20 +196,24 @@ def _validated_graph(
 ) -> tuple[
     dict[TaskKey, Job],
     dict[TaskKey, tuple[Need, ...]],
+    dict[TaskKey, tuple[ArtifactCondition, ...]],
     tuple[TaskKey, ...],
 ]:
     ordered = _materialize(jobs)
     by_key: dict[TaskKey, Job] = {}
     needs: dict[TaskKey, tuple[Need, ...]] = {}
+    conditions: dict[TaskKey, tuple[ArtifactCondition, ...]] = {}
 
     for index, job in enumerate(ordered):
         label = f"jobs[{index}]"
         key = _identity(job, label)
         dependencies = _dependencies(job, label)
+        artifact_waits = _artifact_conditions(job, label)
         if key is None:
-            if dependencies:
+            if dependencies or artifact_waits:
                 raise WorkflowError(
-                    f"{label} cannot declare needs without workflow_id and task_id"
+                    f"{label} cannot declare needs or wait_for without "
+                    "workflow_id and task_id"
                 )
             continue
         if key in by_key:
@@ -181,10 +232,26 @@ def _validated_graph(
             or job.get("dependency_gate_passed") is True
             else dependencies
         )
+        conditions[key] = (
+            ()
+            if job.get("state") in TERMINAL_JOB_STATES
+            or job.get("dependency_gate_passed") is True
+            else artifact_waits
+        )
 
-    _validate_self_dependencies(needs)
-    order = _validate_cycles(needs)
-    return by_key, needs, order
+    graph_edges = {
+        key: tuple(
+            (task_id, "dependency")
+            for task_id in dict.fromkeys(
+                [task_id for task_id, _ in needs[key]]
+                + [task_id for task_id, _ in conditions[key]]
+            )
+        )
+        for key in by_key
+    }
+    _validate_self_dependencies(graph_edges)
+    order = _validate_cycles(graph_edges)
+    return by_key, needs, conditions, order
 
 
 def validate_workflows(jobs: Iterable[Job]) -> None:
@@ -243,6 +310,7 @@ def _blockers(
     key: TaskKey,
     by_key: Mapping[TaskKey, Job],
     needs: Mapping[TaskKey, tuple[Need, ...]],
+    conditions: Mapping[TaskKey, tuple[ArtifactCondition, ...]],
     states: Mapping[TaskKey, object] | None = None,
 ) -> list[dict[str, object]]:
     project_id, workflow_id, _ = key
@@ -279,6 +347,41 @@ def _blockers(
                 "reason": reason,
             }
         )
+    job = by_key[key]
+    satisfied = {
+        (item.get("task_id"), item.get("artifact_id"))
+        for item in job.get("condition_satisfactions", ())
+        if isinstance(item, Mapping)
+    }
+    for task_id, artifact_id in conditions[key]:
+        if (task_id, artifact_id) in satisfied:
+            continue
+        dependency_key = (project_id, workflow_id, task_id)
+        dependency = by_key.get(dependency_key)
+        if dependency is None:
+            blockers.append(
+                {
+                    "kind": "artifact",
+                    "task_id": task_id,
+                    "artifact_id": artifact_id,
+                    "state": "missing",
+                    "reason": "condition_source_missing",
+                }
+            )
+            continue
+        state = dependency.get("state") if states is None else states[dependency_key]
+        blockers.append(
+            {
+                "kind": "artifact",
+                "task_id": task_id,
+                "artifact_id": artifact_id,
+                "state": state,
+                # Publication may be durably spooled immediately before a
+                # producer exits and become visible on a later controller
+                # tick. Never turn that observation race into a skipped job.
+                "reason": "condition_pending",
+            }
+        )
     return blockers
 
 
@@ -287,10 +390,11 @@ def _target_key(job: Job, by_key: Mapping[TaskKey, Job]) -> TaskKey | None:
         raise WorkflowError("job must be an object")
     key = _identity(job, "job")
     dependencies = _dependencies(job, "job")
+    conditions = _artifact_conditions(job, "job")
     if key is None:
-        if dependencies:
+        if dependencies or conditions:
             raise WorkflowError(
-                "job cannot declare needs without workflow_id and task_id"
+                "job cannot declare needs or wait_for without workflow_id and task_id"
             )
         return None
     if key not in by_key:
@@ -304,9 +408,12 @@ def _resolution(
     key: TaskKey | None,
     by_key: Mapping[TaskKey, Job],
     needs: Mapping[TaskKey, tuple[Need, ...]],
+    conditions: Mapping[TaskKey, tuple[ArtifactCondition, ...]],
     states: Mapping[TaskKey, object] | None = None,
 ) -> dict[str, object]:
-    blockers = [] if key is None else _blockers(key, by_key, needs, states)
+    blockers = (
+        [] if key is None else _blockers(key, by_key, needs, conditions, states)
+    )
     unsatisfied = any(
         blocker["reason"] == "dependency_unsatisfied" for blocker in blockers
     )
@@ -325,13 +432,13 @@ def _resolution(
 def resolve_blocked_jobs(jobs: Iterable[Job]) -> dict[TaskKey, dict[str, object]]:
     """Resolve all blocked tasks to a fixed point from one graph build."""
 
-    by_key, needs, order = _validated_graph(jobs)
+    by_key, needs, conditions, order = _validated_graph(jobs)
     states = {key: job.get("state") for key, job in by_key.items()}
     resolutions: dict[TaskKey, dict[str, object]] = {}
     for key in order:
         if states[key] != "blocked":
             continue
-        resolution = _resolution(key, by_key, needs, states)
+        resolution = _resolution(key, by_key, needs, conditions, states)
         resolutions[key] = resolution
         if resolution["decision"] == "ready":
             states[key] = "queued"
@@ -343,5 +450,5 @@ def resolve_blocked_jobs(jobs: Iterable[Job]) -> dict[TaskKey, dict[str, object]
 def resolve_dependencies(job: Job, jobs: Iterable[Job]) -> dict[str, object]:
     """Resolve one job to ``ready``, ``blocked``, or ``skipped``."""
 
-    by_key, needs, _ = _validated_graph(jobs)
-    return _resolution(_target_key(job, by_key), by_key, needs)
+    by_key, needs, conditions, _ = _validated_graph(jobs)
+    return _resolution(_target_key(job, by_key), by_key, needs, conditions)

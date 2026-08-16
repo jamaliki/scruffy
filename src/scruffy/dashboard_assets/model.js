@@ -103,7 +103,7 @@ export function workflowChoices(snapshot, project = "all", search = "") {
     const key = JSON.stringify([jobProject, workflow]);
     const current = grouped.get(key) || {key, project: jobProject, workflow_id: workflow, jobs: 0, links: 0, active: 0, attention: 0, newest: ""};
     current.jobs += 1;
-    current.links += job.needs?.length || 0;
+    current.links += workflowEdges(job).length;
     if (["running", "starting", "finishing", "queued", "submitted", "blocked"].includes(job.state)) current.active += 1;
     if (["failed", "lost", "rejected", "skipped"].includes(job.state)) current.attention += 1;
     current.newest = [current.newest, job.finished_at, job.started_at, job.submitted_at].filter(Boolean).sort().at(-1) || "";
@@ -115,10 +115,18 @@ export function workflowChoices(snapshot, project = "all", search = "") {
   );
 }
 
+export function workflowEdges(task = {}) {
+  return [
+    ...(task.needs || []).map((need) => ({...need, condition: need.condition || "succeeded"})),
+    ...(task.wait_for || []).filter((condition) => condition.kind === "artifact")
+      .map((condition) => ({...condition, condition: "artifact"})),
+  ];
+}
+
 export function dependencyLinkedTasks(tasks = []) {
   const linked = new Set();
   for (const task of tasks) {
-    for (const need of task.needs || []) {
+    for (const need of workflowEdges(task)) {
       linked.add(task.task_id);
       if (need.task_id) linked.add(need.task_id);
     }
@@ -129,7 +137,7 @@ export function dependencyLinkedTasks(tasks = []) {
 export function workflowLayout(tasks = []) {
   const nodes = new Map(tasks.map((task) => [task.task_id, {...task, missing: false}]));
   for (const task of tasks) {
-    for (const need of task.needs || []) {
+    for (const need of workflowEdges(task)) {
       if (need.task_id && !nodes.has(need.task_id)) {
         nodes.set(need.task_id, {task_id: need.task_id, name: "Missing dependency", state: "missing", needs: [], missing: true});
       }
@@ -142,7 +150,7 @@ export function workflowLayout(tasks = []) {
     if (visiting.has(taskId)) return 0;
     visiting.add(taskId);
     const task = nodes.get(taskId);
-    const parents = (task?.needs || []).map((need) => need.task_id).filter((taskId) => nodes.has(taskId));
+    const parents = workflowEdges(task).map((need) => need.task_id).filter((taskId) => nodes.has(taskId));
     const depth = parents.length ? Math.max(...parents.map(depthOf)) + 1 : 0;
     visiting.delete(taskId); depths.set(taskId, depth); return depth;
   };
@@ -162,7 +170,7 @@ export function workflowLayout(tasks = []) {
   const positionedById = new Map(positioned.map((task) => [task.task_id, task]));
   const edges = [];
   for (const task of positioned) {
-    for (const need of task.needs || []) {
+    for (const need of workflowEdges(task)) {
       const source = positionedById.get(need.task_id);
       if (source) edges.push({source, target: task, condition: need.condition || "succeeded"});
     }
@@ -190,7 +198,7 @@ export function focusedWorkflowTasks(tasks = [], maximum = 120) {
     const taskId = pending.shift();
     if (included.has(taskId) || !byId.has(taskId)) continue;
     included.add(taskId);
-    for (const need of byId.get(taskId).needs || []) pending.push(need.task_id);
+    for (const need of workflowEdges(byId.get(taskId))) pending.push(need.task_id);
   }
   const selected = tasks.filter((task) => included.has(task.task_id));
   return {tasks: selected, omitted: tasks.length - selected.length};

@@ -213,6 +213,8 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b"export function workflowLayout", model)
         self.assertIn(b"export function focusedWorkflowTasks", model)
         self.assertIn(b"export function dependencyLinkedTasks", model)
+        self.assertIn(b"export function workflowEdges", model)
+        self.assertIn(b".workflow-edge.artifact", css)
         self.assertNotIn(b"GPU/n", model)
         self.assertIn(b'"node" : "nodes"', model)
         self.assertIn(b"setInterval(() => loadOverview(false), 5_000)", app)

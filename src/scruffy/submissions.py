@@ -29,6 +29,7 @@ TASK_KEYS = frozenset(
         "environment",
         "resources",
         "needs",
+        "wait_for",
     }
 )
 
@@ -79,14 +80,19 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
     workflow_id = spec.get("workflow_id")
     task_id = spec.get("task_id")
     needs = spec.get("needs", [])
-    if workflow_id is not None or task_id is not None or needs:
+    wait_for = spec.get("wait_for", [])
+    if workflow_id is not None or task_id is not None or needs or wait_for:
         if not isinstance(needs, list):
             raise ValueError("needs must be a JSON array")
+        if not isinstance(wait_for, list):
+            raise ValueError("wait_for must be a JSON array")
         job.update(
             {
                 "workflow_id": workflow_id,
                 "task_id": task_id,
                 "needs": copy.deepcopy(needs),
+                "wait_for": copy.deepcopy(wait_for),
+                "condition_satisfactions": [],
                 "blockers": [],
                 "dependency_gate_passed": False,
             }
@@ -118,6 +124,7 @@ def _task_spec(
     environment = task.get("environment", {})
     resources = task.get("resources")
     needs = task.get("needs", [])
+    wait_for = task.get("wait_for", [])
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"tasks[{index}].name must be a non-empty string")
     if not isinstance(argv, list) or not argv or not all(
@@ -134,6 +141,10 @@ def _task_spec(
     request = ResourceRequest.from_dict(resources)
     if not isinstance(needs, list) or not all(isinstance(item, dict) for item in needs):
         raise ValueError(f"tasks[{index}].needs must be a list of dependency objects")
+    if not isinstance(wait_for, list) or not all(
+        isinstance(item, dict) for item in wait_for
+    ):
+        raise ValueError(f"tasks[{index}].wait_for must be a list of condition objects")
     return {
         "v": 1,
         "job_id": create_job_id(request_id, project_id=project_id),
@@ -148,6 +159,7 @@ def _task_spec(
         "workflow_id": workflow_id,
         "task_id": task_id,
         "needs": [dict(item) for item in needs],
+        "wait_for": [dict(item) for item in wait_for],
     }
 
 
@@ -197,10 +209,10 @@ def workflow_submission(
     known_tasks = set(task_ids)
     missing = sorted(
         {
-            str(need.get("task_id"))
+            str(reference.get("task_id"))
             for spec in specs
-            for need in spec["needs"]
-            if need.get("task_id") not in known_tasks
+            for reference in [*spec["needs"], *spec["wait_for"]]
+            if reference.get("task_id") not in known_tasks
         }
     )
     if missing:

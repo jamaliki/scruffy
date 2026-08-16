@@ -1,19 +1,20 @@
 """Validation for events reported by code running inside Scruffy jobs.
 
-Workload reports are untrusted annotations: the controller may publish them,
-but they can never change job lifecycle or resource ownership.  Keeping the
-wire format here, independent of the controller, gives producers one small
-stdlib-only contract to depend on.
+Workload reports are untrusted annotations and never instructions. A strict
+artifact publication may satisfy a gate that the consumer declared in
+advance; no report can otherwise change lifecycle or resource ownership.
+Keeping the wire format here, independent of the controller, gives producers
+one small stdlib-only contract to depend on.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from datetime import datetime
 from typing import Any
-
 
 EVENT_KINDS = frozenset(
     {
@@ -36,6 +37,10 @@ MAX_SOURCE_VALUE_CHARS = 256
 MAX_JSON_DEPTH = 32
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PUBLICATION_KEYS = frozenset(
+    {"v", "artifact_id", "path", "size_bytes", "sha256", "manifest_path"}
+)
 
 
 class ProtocolError(ValueError):
@@ -123,6 +128,48 @@ def _json_value(value: object, label: str, depth: int = 0) -> Any:
     raise ProtocolError(f"{label} contains a non-JSON value: {type(value).__name__}")
 
 
+def artifact_publication(data: object) -> dict[str, Any] | None:
+    """Return a strict artifact publication, or ``None`` for an observation."""
+
+    if not isinstance(data, dict) or "publication" not in data:
+        return None
+    publication = data["publication"]
+    if not isinstance(publication, dict) or set(publication) != _PUBLICATION_KEYS:
+        raise ProtocolError(
+            "data.publication must contain exactly v, artifact_id, path, "
+            "size_bytes, sha256 and manifest_path"
+        )
+    if type(publication["v"]) is not int or publication["v"] != 1:
+        raise ProtocolError("data.publication.v must equal 1")
+    artifact_id = _string(
+        publication["artifact_id"], "data.publication.artifact_id", max_chars=256
+    )
+    artifact_path = _string(
+        publication["path"], "data.publication.path", max_chars=4096
+    )
+    manifest_path = _string(
+        publication["manifest_path"],
+        "data.publication.manifest_path",
+        max_chars=4096,
+    )
+    if not os.path.isabs(artifact_path) or not os.path.isabs(manifest_path):
+        raise ProtocolError("published artifact and manifest paths must be absolute")
+    size = publication["size_bytes"]
+    if type(size) is not int or size < 0:
+        raise ProtocolError("data.publication.size_bytes must be non-negative")
+    digest = publication["sha256"]
+    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+        raise ProtocolError("data.publication.sha256 must be lowercase SHA256")
+    return {
+        "v": 1,
+        "artifact_id": artifact_id,
+        "path": artifact_path,
+        "size_bytes": size,
+        "sha256": digest,
+        "manifest_path": manifest_path,
+    }
+
+
 def validate_event(value: object) -> dict[str, Any]:
     """Validate and detach one workload event for durable publication.
 
@@ -150,6 +197,9 @@ def validate_event(value: object) -> dict[str, Any]:
     if not isinstance(value["data"], dict):
         raise ProtocolError("data must be a JSON object")
 
+    data = _json_value(value["data"], "data")
+    if kind == "workload.artifact":
+        artifact_publication(data)
     event = {
         "v": 1,
         "event_id": event_id,
@@ -157,7 +207,7 @@ def validate_event(value: object) -> dict[str, Any]:
         "occurred_at": _timestamp(value["occurred_at"]),
         "kind": kind,
         "source": _source(value["source"]),
-        "data": _json_value(value["data"], "data"),
+        "data": data,
     }
     encoded = json.dumps(
         event,
@@ -174,5 +224,6 @@ __all__ = [
     "EVENT_KINDS",
     "MAX_EVENT_BYTES",
     "ProtocolError",
+    "artifact_publication",
     "validate_event",
 ]

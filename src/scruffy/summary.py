@@ -75,11 +75,14 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "task_id": job.get("task_id"),
         "attempt": job.get("attempt"),
         "needs": list(job.get("needs") or []),
+        "wait_for": list(job.get("wait_for") or []),
+        "condition_satisfactions": list(job.get("condition_satisfactions") or []),
         "blockers": list(job.get("blockers") or []),
         "assignment": job.get("assignment"),
         "placement": job.get("assignment") or job.get("last_assignment"),
         "provenance": job.get("provenance"),
         "resolved_dependencies": list(job.get("resolved_dependencies") or []),
+        "resolved_conditions": list(job.get("resolved_conditions") or []),
         "allocation_incarnation_sha256": job.get(
             "allocation_incarnation_sha256"
         ),
@@ -564,10 +567,33 @@ def explain_job(state: dict[str, Any], job_id: str) -> dict[str, Any]:
                 "reason": upstream.get("reason") if upstream else "missing_dependency",
             }
         )
+    satisfactions = {
+        (item.get("task_id"), item.get("artifact_id")): item
+        for item in job.get("condition_satisfactions") or []
+        if isinstance(item, dict)
+    }
+    conditions = []
+    for condition in job.get("wait_for") or []:
+        if not isinstance(condition, dict):
+            continue
+        identity = (condition.get("task_id"), condition.get("artifact_id"))
+        upstream = by_task.get(
+            (job_project(job), job.get("workflow_id"), condition.get("task_id"))
+        )
+        conditions.append(
+            {
+                **condition,
+                "job_id": upstream.get("id") if upstream else None,
+                "state": upstream.get("state") if upstream else "missing",
+                "satisfied": identity in satisfactions,
+                "evidence": copy.deepcopy(satisfactions.get(identity)),
+            }
+        )
     return {
         "v": 1,
         "job": job,
         "dependencies": dependencies,
+        "conditions": conditions,
         "blockers": list(job.get("blockers") or []),
         "explanation": job.get("reason") or job.get("state"),
     }

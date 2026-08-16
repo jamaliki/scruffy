@@ -60,6 +60,7 @@ def write_request_record(root: Path, job: dict[str, Any]) -> Path:
         "environment_sha256": _digest(job.get("env", {})),
         "request": job["request"],
         "needs": list(job.get("needs") or []),
+        "wait_for": list(job.get("wait_for") or []),
     }
     digest = _digest(record)
     atomic_write_json(request_file, record, mode=0o444)
@@ -106,6 +107,7 @@ def launch_record(
         "environment_sha256": _digest(job.get("env", {})),
         "request": assignment.request.to_dict(),
         "dependencies": list(job.get("resolved_dependencies") or []),
+        "conditions": list(job.get("resolved_conditions") or []),
         "assignment_sha256": _digest(assignment.to_dict()),
         "assignment": assignment.to_dict(),
         "result_path": str(result_file),

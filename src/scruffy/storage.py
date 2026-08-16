@@ -621,6 +621,9 @@ _ARCHIVED_JOB_FIELDS = (
     "workflow_id",
     "task_id",
     "needs",
+    "wait_for",
+    "condition_satisfactions",
+    "resolved_conditions",
     "workflow_invalid",
     "project_id",
 )

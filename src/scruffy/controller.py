@@ -42,7 +42,7 @@ from .models import (
     normalize_project_id,
     validate_inventory,
 )
-from .protocol import validate_event
+from .protocol import artifact_publication, validate_event
 from .provenance import write_request_record, write_result_record
 from .runtime import (
     Controller,
@@ -104,6 +104,7 @@ from .storage import (
 from .submissions import job_from_spec
 from .workflows import (
     WorkflowError,
+    artifact_conditions,
     resolve_blocked_jobs,
     resolve_dependencies,
     select_task_attempts,
@@ -447,6 +448,7 @@ def _rejected_job(
                 "workflow_id": workflow_id,
                 "task_id": task_id,
                 "needs": [],
+                "wait_for": [],
                 "blockers": [],
                 "workflow_invalid": True,
             }
@@ -457,6 +459,7 @@ def _rejected_job(
 def _mark_workflow_rejected(job: dict[str, Any], exc: Exception) -> None:
     job["workflow_invalid"] = True
     job["needs"] = []
+    job["wait_for"] = []
     job["state"] = "rejected"
     job["finished_at"] = utc_now()
     job["reason"] = "invalid_workflow"
@@ -474,7 +477,7 @@ def _resolution_workflow_jobs(
         if candidate_project != project_id or candidate_workflow != workflow_id:
             continue
         if candidate.get("workflow_invalid"):
-            candidate = {**candidate, "needs": []}
+            candidate = {**candidate, "needs": [], "wait_for": []}
         resolution_jobs.append(candidate)
     return resolution_jobs
 
@@ -623,6 +626,143 @@ def _resolved_dependency_ids(
     return result
 
 
+def _resolved_condition_evidence(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return satisfied evidence in the immutable declaration order."""
+
+    evidence = {
+        (item.get("task_id"), item.get("artifact_id")): item
+        for item in job.get("condition_satisfactions") or []
+        if isinstance(item, dict)
+    }
+    return [
+        copy.deepcopy(evidence[(task_id, artifact_id)])
+        for task_id, artifact_id in artifact_conditions(job)
+        if (task_id, artifact_id) in evidence
+    ]
+
+
+def _condition_evidence(
+    *,
+    producer: dict[str, Any],
+    publication: dict[str, Any],
+    producer_event_id: str,
+    occurred_at: str,
+    queue_event_id: str | None = None,
+) -> dict[str, Any]:
+    result = {
+        "kind": "artifact",
+        "task_id": producer["task_id"],
+        "artifact_id": publication["artifact_id"],
+        "producer_job_id": producer["id"],
+        "producer_event_id": producer_event_id,
+        "occurred_at": occurred_at,
+        "publication": copy.deepcopy(publication),
+    }
+    if queue_event_id is not None:
+        result["queue_event_id"] = queue_event_id
+    return result
+
+
+def _remember_condition(job: dict[str, Any], evidence: dict[str, Any]) -> bool:
+    """Attach one immutable condition result, returning whether it was new."""
+
+    identity = (evidence["task_id"], evidence["artifact_id"])
+    satisfactions = job.setdefault("condition_satisfactions", [])
+    if any(
+        isinstance(item, dict)
+        and (item.get("task_id"), item.get("artifact_id")) == identity
+        for item in satisfactions
+    ):
+        return False
+    satisfactions.append(copy.deepcopy(evidence))
+    return True
+
+
+def _satisfy_from_current_artifacts(
+    job: dict[str, Any], workflow_jobs: Iterable[dict[str, Any]]
+) -> None:
+    """Resolve a newly admitted wait from the producer's bounded live view."""
+
+    selected = select_task_attempts(workflow_jobs)
+    project_id = job_project(job)
+    workflow_id = str(job.get("workflow_id") or "")
+    for task_id, artifact_id in artifact_conditions(job):
+        producer = selected.get((project_id, workflow_id, task_id))
+        workload = producer.get("workload") if producer is not None else None
+        artifacts = workload.get("latest_artifacts") if isinstance(workload, dict) else None
+        if not isinstance(artifacts, list):
+            continue
+        for item in reversed(artifacts):
+            if not isinstance(item, dict):
+                continue
+            try:
+                publication = artifact_publication(item)
+            except ValueError:
+                continue
+            if publication is None or publication["artifact_id"] != artifact_id:
+                continue
+            _remember_condition(
+                job,
+                _condition_evidence(
+                    producer=producer,
+                    publication=publication,
+                    producer_event_id=str(item.get("event_id") or "unknown"),
+                    occurred_at=str(item.get("occurred_at") or "unknown"),
+                ),
+            )
+            break
+
+
+def _satisfy_artifact_waiters(
+    controller: Controller,
+    producer: dict[str, Any],
+    event: dict[str, Any],
+    queue_event_id: str,
+) -> None:
+    """Apply one typed publication only to explicitly waiting workflow jobs."""
+
+    publication = artifact_publication(event["data"])
+    workflow_id = producer.get("workflow_id")
+    task_id = producer.get("task_id")
+    if publication is None or not isinstance(workflow_id, str) or not isinstance(
+        task_id, str
+    ):
+        return
+    project_id = job_project(producer)
+    selected = select_task_attempts(
+        _resolution_workflow_jobs(
+            controller.state["jobs"].values(), project_id, workflow_id
+        )
+    ).get((project_id, workflow_id, task_id))
+    if selected is None or selected.get("id") != producer.get("id"):
+        return
+    for job in controller.state["jobs"].values():
+        if (
+            job.get("state") != "blocked"
+            or job.get("workflow_invalid")
+            or job_project(job) != project_id
+            or job.get("workflow_id") != workflow_id
+            or (task_id, publication["artifact_id"]) not in artifact_conditions(job)
+        ):
+            continue
+        evidence = _condition_evidence(
+            producer=producer,
+            publication=publication,
+            producer_event_id=event["event_id"],
+            occurred_at=event["occurred_at"],
+            queue_event_id=queue_event_id,
+        )
+        if _remember_condition(job, evidence):
+            emit(
+                controller,
+                "condition.satisfied",
+                job=job,
+                data=evidence,
+                durable=False,
+                snapshot=False,
+            )
+
+
 def _initial_job_event(
     controller: Controller,
     job: dict[str, Any],
@@ -645,11 +785,13 @@ def _initial_job_event(
     workflow_jobs = _resolution_workflow_jobs(
         prospective.values(), job_project(job), job["workflow_id"]
     )
+    _satisfy_from_current_artifacts(job, workflow_jobs)
     resolution = resolve_dependencies(job, workflow_jobs)
     job["blockers"] = resolution["blockers"]
     if resolution["decision"] == "ready":
         job["dependency_gate_passed"] = True
         job["resolved_dependencies"] = _resolved_dependency_ids(job, workflow_jobs)
+        job["resolved_conditions"] = _resolved_condition_evidence(job)
         return "job.queued"
     elif resolution["decision"] == "blocked":
         job["dependency_gate_passed"] = False
@@ -1000,7 +1142,20 @@ def _workflow_groups(
         if not isinstance(workflow_id, str) or not isinstance(task_id, str):
             continue
         workflow_key = (job_project(job), workflow_id)
-        signatures.setdefault(workflow_key, []).append((job["id"], job.get("state")))
+        condition_signature = tuple(
+            sorted(
+                (
+                    str(item.get("task_id")),
+                    str(item.get("artifact_id")),
+                    str((item.get("publication") or {}).get("sha256")),
+                )
+                for item in job.get("condition_satisfactions") or []
+                if isinstance(item, dict)
+            )
+        )
+        signatures.setdefault(workflow_key, []).append(
+            (job["id"], (job.get("state"), condition_signature))
+        )
         workflows.setdefault(workflow_key, []).append(job)
         if job.get("state") == "blocked" and not job.get("workflow_invalid"):
             blocked.setdefault(workflow_key, []).append(job)
@@ -1077,12 +1232,13 @@ def _refresh_dependencies(controller: Controller) -> None:
                 job["resolved_dependencies"] = _resolved_dependency_ids(
                     job, resolution_jobs
                 )
+                job["resolved_conditions"] = _resolved_condition_evidence(job)
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
                 job["dependency_gate_passed"] = True
                 job["state"] = "skipped"
                 job["finished_at"] = utc_now()
-                job["reason"] = "dependency_unsatisfied"
+                job["reason"] = resolution["reason"]
                 job["blockers"] = blockers
                 write_result_record(controller.root, job)
                 emit(controller, "job.skipped", job=job)
@@ -1449,6 +1605,13 @@ def _ingest_reports(
             snapshot=False,
         )
         apply_workload_event(job, event, recorded_at=journal_event["recorded_at"])
+        if event["kind"] == "workload.artifact":
+            _satisfy_artifact_waiters(
+                controller,
+                job,
+                event,
+                journal_event["event_id"],
+            )
         controller.state.setdefault("report_acks", {})[_report_id(source)] = digest
         acknowledged.append((source, digest))
         new_report_ids.append(_report_id(source))

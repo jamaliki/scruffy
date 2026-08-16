@@ -40,6 +40,32 @@ The encoded envelope is limited to 64 KiB. It must contain only finite JSON
 values. Producers must put raw logs, configurations, checkpoint bytes, and full
 metric histories elsewhere and publish only bounded summaries or references.
 
+### Artifact publication
+
+An ordinary `workload.artifact` remains an observation. It gains scheduling
+meaning only when `data.publication` has this exact shape:
+
+```json
+{
+  "artifact_type": "checkpoint",
+  "publication": {
+    "v": 1,
+    "artifact_id": "checkpoint/step000100000.pt",
+    "path": "/shared/runs/step000100000.pt",
+    "size_bytes": 1827364512,
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "manifest_path": "/shared/runs/step000100000.pt.ready.json"
+  }
+}
+```
+
+Both paths must be absolute, the digest must be lowercase SHA256, and the
+producer must publish the ready manifest only after atomically installing and
+syncing the immutable artifact. A matching `wait_for` condition is scoped to
+the producer task's project and workflow. Scruffy records the exact evidence on
+the consumer and emits `condition.satisfied`; it never reads or hashes artifact
+bytes in the controller loop.
+
 `event_id` is an idempotency key scoped to one job. Reusing it with the same
 job, kind, source, and data is safe; the first occurrence timestamp is retained,
 so a retry may provide a newly generated timestamp. Reusing an ID for different
@@ -91,8 +117,10 @@ directly change quarantine state.
 
 ## Authority
 
-Workload events update only `job.workload` in the current snapshot. They cannot
-change lifecycle state, assignments, resources, exit codes, or terminal results.
+Workload events update `job.workload` in the current snapshot. They cannot
+directly change lifecycle state, assignments, resources, exit codes, or terminal
+results. A strict artifact publication can satisfy only an explicit workflow
+condition declared before admission; arbitrary report data has no such power.
 Only Scruffy's process and Slurm reconciliation path can do that.
 Likewise, GPU evidence can change future placement only after the controller's
 health policy accepts it; workload reports and Koochak observations have no

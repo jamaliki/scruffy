@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -216,6 +217,7 @@ class ControllerIntegrationTests(unittest.TestCase):
         workflow_id: str | None = None,
         task_id: str | None = None,
         needs: tuple[dict[str, str], ...] = (),
+        wait_for: tuple[dict[str, str], ...] = (),
     ) -> str:
         response = submit_job(
             self.root,
@@ -229,6 +231,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             workflow_id=workflow_id,
             task_id=task_id,
             needs=needs,
+            wait_for=wait_for,
         )
         self.assertEqual("submitted", response["state"])
         self.assertFalse(response["deduplicated"])
@@ -741,6 +744,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             source={"name": "koochak", "node": "local-node"},
         )
         self.assertTrue(retry["deduplicated"])
+
         events = [
             event
             for event in read_events(self.root)
@@ -772,6 +776,115 @@ class ControllerIntegrationTests(unittest.TestCase):
         release.write_text("go")
         self.assertEqual(
             "succeeded", wait_for_job(self.root, job_id, timeout=TIMEOUT)["state"]
+        )
+
+    def test_typed_artifact_report_releases_a_blocked_condition(self) -> None:
+        self._start_controller((0,))
+        release = self.workspace / "release-artifact-producer"
+        producer = self._submit(
+            "artifact-producer",
+            "import os, time; from pathlib import Path; "
+            "release=Path(os.environ['RELEASE']); "
+            "exec(\"while not release.exists():\\n time.sleep(0.01)\")",
+            environment={"RELEASE": str(release)},
+            workflow_id="artifact-flow",
+            task_id="train",
+        )
+        self._wait_for_state(producer, "running")
+        artifact_id = "checkpoint/step000000007.pt"
+        consumer = self._submit(
+            "artifact-consumer",
+            "print('consumed')",
+            workflow_id="artifact-flow",
+            task_id="infer",
+            wait_for=(
+                {
+                    "kind": "artifact",
+                    "task_id": "train",
+                    "artifact_id": artifact_id,
+                },
+            ),
+        )
+        self._wait_for_state(consumer, "blocked")
+
+        publish_event(
+            self.root,
+            job_id=producer,
+            event_id="observational-artifact",
+            kind="workload.artifact",
+            data={"artifact_type": "checkpoint", "location": "/runs/step7.pt"},
+        )
+        self._wait_until(
+            lambda: any(
+                event.get("source_event_id") == "observational-artifact"
+                for event in read_events(self.root)
+            ),
+            "observational artifact ingestion",
+        )
+        self.assertEqual("blocked", status(self.root, consumer)["state"])
+
+        checkpoint = self.workspace / "step000000007.pt"
+        manifest = self.workspace / "step000000007.pt.ready.json"
+        checkpoint.write_bytes(b"complete-checkpoint")
+        publication = {
+            "v": 1,
+            "artifact_id": artifact_id,
+            "path": str(checkpoint),
+            "size_bytes": checkpoint.stat().st_size,
+            "sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            "manifest_path": str(manifest),
+        }
+        manifest.write_text(json.dumps(publication), encoding="utf-8")
+        publish_event(
+            self.root,
+            job_id=producer,
+            event_id="published-step-7",
+            kind="workload.artifact",
+            data={"artifact_type": "checkpoint", "publication": publication},
+        )
+
+        queued = self._wait_for_state(consumer, "queued")
+        self.assertEqual(producer, queued["resolved_conditions"][0]["producer_job_id"])
+        self.assertEqual(
+            publication,
+            queued["resolved_conditions"][0]["publication"],
+        )
+        late_consumer = self._submit(
+            "artifact-consumer-late",
+            "print('consumed late')",
+            workflow_id="artifact-flow",
+            task_id="infer-late",
+            wait_for=(
+                {
+                    "kind": "artifact",
+                    "task_id": "train",
+                    "artifact_id": artifact_id,
+                },
+            ),
+        )
+        late = self._wait_for_state(late_consumer, "queued")
+        self.assertEqual(producer, late["resolved_conditions"][0]["producer_job_id"])
+        release.write_text("go", encoding="utf-8")
+        self.assertEqual(
+            "succeeded", wait_for_job(self.root, producer, timeout=TIMEOUT)["state"]
+        )
+        completed = wait_for_job(self.root, consumer, timeout=TIMEOUT)
+        self.assertEqual("succeeded", completed["state"])
+        self.assertEqual(
+            "succeeded",
+            wait_for_job(self.root, late_consumer, timeout=TIMEOUT)["state"],
+        )
+        launch = json.loads(
+            (self.root / completed["provenance"]["launch"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(publication, launch["conditions"][0]["publication"])
+        self.assertEqual(
+            1,
+            sum(
+                event.get("kind") == "condition.satisfied"
+                and event.get("job_id") == consumer
+                for event in read_events(self.root)
+            ),
         )
 
     def test_async_success_and_failure_emit_output_before_terminal(self) -> None:

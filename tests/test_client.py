@@ -207,6 +207,13 @@ class ObserveTests(unittest.TestCase):
             workflow_id="experiment-7",
             task_id="infer",
             needs=({"task_id": "train", "condition": "succeeded"},),
+            wait_for=(
+                {
+                    "kind": "artifact",
+                    "task_id": "train",
+                    "artifact_id": "checkpoint/step000000007.pt",
+                },
+            ),
         )
 
         submitted = status(self.root, response["job_id"])
@@ -215,6 +222,16 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(
             [{"task_id": "train", "condition": "succeeded"}],
             submitted["needs"],
+        )
+        self.assertEqual(
+            [
+                {
+                    "kind": "artifact",
+                    "task_id": "train",
+                    "artifact_id": "checkpoint/step000000007.pt",
+                }
+            ],
+            submitted["wait_for"],
         )
         with self.assertRaisesRegex(ValueError, "provide.*together"):
             submit_job(
