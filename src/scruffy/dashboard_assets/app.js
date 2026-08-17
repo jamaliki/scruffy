@@ -13,7 +13,7 @@ const view = {
   snapshot: null, project: "all", search: "", connected: false, loading: false,
   lastSuccessAt: null,
   workflowKey: "", workflowData: null, workflowDataKey: "", workflowLoading: false,
-  gpuReport: "",
+  gpuReport: "", gpuJobId: "",
   log: {
     jobId: "", name: "", stream: "stdout", state: "", chunks: [],
     loading: false, following: false, retained: true, generation: 0,
@@ -652,12 +652,31 @@ function gpuSummary(device) {
   return section;
 }
 
+function assignedJobSummary(jobId) {
+  const job = uniqueJobs(view.snapshot || {}).get(jobId);
+  const section = element("section", "gpu-job-summary");
+  const copy = element("div", "gpu-job-copy");
+  copy.append(
+    element("span", "gpu-job-label", "Assigned workload"),
+    element("strong", "gpu-job-name", job?.name || jobId),
+    element("span", "gpu-job-meta", `${job?.project_id || "default"} · ${readableLabel(job?.state || "active")}`),
+  );
+  const button = element("button", "icon-button primary-action", "View job & output");
+  button.type = "button";
+  button.dataset.openAssignedJob = jobId;
+  section.append(copy, button);
+  return section;
+}
+
 async function openGpu(node, slot) {
   const dialog = byId("gpu-dialog");
+  const jobButton = byId("gpu-job-open");
   byId("gpu-dialog-title").textContent = `${node} / GPU ${slot}`;
   byId("gpu-dialog-state").textContent = "Reading physical identity";
   byId("gpu-report-copy").textContent = "Copy report";
   view.gpuReport = "";
+  view.gpuJobId = "";
+  jobButton.hidden = true;
   replace(byId("gpu-detail"), [empty("Loading GPU health and identity…")]);
   if (!dialog.open) dialog.showModal();
   try {
@@ -667,11 +686,14 @@ async function openGpu(node, slot) {
     byId("gpu-dialog-title").textContent = `${device.node} / GPU ${device.slot}`;
     byId("gpu-dialog-state").textContent = `${readableLabel(device.status)} · ${readableLabel(device.scheduler_state)}`;
     view.gpuReport = gpuReport(device);
+    view.gpuJobId = device.assigned_job_id || "";
+    jobButton.hidden = !view.gpuJobId;
     const cuda = cudaSummary(device);
     const reasons = device.last_reasons || [];
     const policy = device.policy || {};
     replace(byId("gpu-detail"), [
       gpuSummary(device),
+      ...(view.gpuJobId ? [assignedJobSummary(view.gpuJobId)] : []),
       detailSection("Physical identity", [["Model", device.name], ["NVIDIA UUID", device.uuid], ["PCI bus", device.pci_bus_id], ["Serial", device.serial], ["Device", `index ${device.nvidia_index ?? "?"} · Linux minor ${device.minor_number ?? "?"}`]]),
       detailSection("Runtime & policy", [["CUDA", cuda.error ? `${cuda.label} · ${cuda.error}` : `${cuda.label} · ${cuda.detail}`], ["Driver", device.driver_version], ["VBIOS", device.vbios_version], ["Scheduling", `${readableLabel(policy.mode)} · ${readableLabel(policy.isolation)} isolation`], ["Assigned job", device.assigned_job_id || "None"]]),
       detailSection("Observation", [["Sampled", compactTime(device.last_sample_at)], ["Received", compactTime(device.last_received_at)], ["Health notes", reasons.length ? reasons.map(readableLabel).join(" · ") : "No health warnings"], ...(device.quarantined_at ? [["Quarantined", compactTime(device.quarantined_at)], ["Source", readableLabel(device.quarantine_source)]] : [])]),
@@ -705,6 +727,12 @@ async function loadOverview(refreshWorkflow = false) {
 }
 
 document.addEventListener("click", (event) => {
+  const assignedJob = event.target.closest("[data-open-assigned-job]");
+  if (assignedJob) {
+    byId("gpu-dialog").close();
+    openJob(assignedJob.dataset.openAssignedJob);
+    return;
+  }
   const logTarget = event.target.closest("[data-log-job-id]");
   if (logTarget) {
     openLog(logTarget.dataset.logJobId, logTarget.dataset.logJobName, logTarget.dataset.logStream);
@@ -740,6 +768,12 @@ byId("dialog-close").addEventListener("click", () => byId("job-dialog").close())
 byId("job-dialog").addEventListener("click", (event) => { if (event.target === byId("job-dialog")) byId("job-dialog").close(); });
 byId("gpu-dialog-close").addEventListener("click", () => byId("gpu-dialog").close());
 byId("gpu-dialog").addEventListener("click", (event) => { if (event.target === byId("gpu-dialog")) byId("gpu-dialog").close(); });
+byId("gpu-job-open").addEventListener("click", () => {
+  if (!view.gpuJobId) return;
+  const jobId = view.gpuJobId;
+  byId("gpu-dialog").close();
+  openJob(jobId);
+});
 byId("log-dialog-close").addEventListener("click", closeLog);
 byId("log-dialog").addEventListener("click", (event) => { if (event.target === byId("log-dialog")) closeLog(); });
 byId("log-older").addEventListener("click", () => {
