@@ -131,6 +131,10 @@ class DashboardTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name) / "queue"
         write_state(self.root, _state(self.root))
+        logs = self.root / "jobs" / "job-1"
+        logs.mkdir(parents=True)
+        (logs / "stdout.log").write_bytes(b"first line\rprogress 50%\r\nlast line\n")
+        (logs / "stderr.log").write_text("warning\n")
         self.server = create_server(str(self.root), port=0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -219,6 +223,12 @@ class DashboardTests(unittest.TestCase):
         self.assertIn(b'"node" : "nodes"', model)
         self.assertIn(b"setInterval(() => loadOverview(false), 5_000)", app)
         self.assertIn(b"Copy report", html)
+        self.assertIn(b'id="log-dialog"', html)
+        self.assertIn(b"Load earlier output", html)
+        self.assertIn(b".log-text", css)
+        self.assertIn(b"MAX_VISIBLE_LOG_BYTES", app)
+        self.assertIn(b"/output/${log.stream}", app)
+        self.assertIn(b'PageDown: text.scrollTop + page', app)
         self.assertIn(b"NVIDIA UUID", app)
         self.assertEqual("GPU-bbbb", json.loads(gpu)["uuid"])
         self.assertIn(b"...(snapshot?.queued || []), ...(snapshot?.submitted || [])", model)
@@ -228,6 +238,42 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual("allocation-1", json.loads(overview)["allocation"]["id"])
         self.assertEqual("job-1", json.loads(job)["job"]["id"])
         self.assertEqual("workflow-1", json.loads(workflow)["workflow_id"])
+
+    def test_job_output_is_bounded_paginated_and_human_readable(self) -> None:
+        complete, _ = self.get("/api/jobs/job-1/output/stdout?offset=0&limit=1024")
+        payload = json.loads(complete)
+
+        self.assertEqual("first line\nprogress 50%\nlast line\n", payload["text"])
+        self.assertEqual(0, payload["start"])
+        self.assertEqual(payload["total_bytes"], payload["end"])
+        self.assertFalse(payload["more_before"])
+        self.assertFalse(payload["more_after"])
+        self.assertTrue(payload["retained"])
+
+        tail, _ = self.get("/api/jobs/job-1/output/stdout?limit=9")
+        tail_payload = json.loads(tail)
+        self.assertEqual(9, tail_payload["bytes"])
+        self.assertTrue(tail_payload["more_before"])
+        self.assertEqual(tail_payload["total_bytes"], tail_payload["end"])
+
+        first, _ = self.get("/api/jobs/job-1/output/stdout?offset=0&limit=5")
+        first_payload = json.loads(first)
+        self.assertEqual("first", first_payload["text"])
+        self.assertTrue(first_payload["more_after"])
+
+    def test_missing_and_invalid_job_output_are_contained(self) -> None:
+        (self.root / "jobs" / "job-1" / "stderr.log").unlink()
+        missing, _ = self.get("/api/jobs/job-1/output/stderr")
+        self.assertEqual(False, json.loads(missing)["retained"])
+
+        for target in (
+            "/api/jobs/job-1/output/combined",
+            "/api/jobs/job-1/output/stdout?offset=-1",
+            "/api/jobs/job-1/output/stdout?limit=999999",
+        ):
+            with self.subTest(target=target), self.assertRaises(HTTPError) as invalid:
+                self.get(target)
+            self.assertEqual(400, invalid.exception.code)
 
     def test_unknown_hosts_and_mutations_are_rejected(self) -> None:
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)

@@ -25,6 +25,7 @@ ASSETS = {
     "/assets/model.js": ("model.js", "text/javascript; charset=utf-8"),
     "/assets/scruffy-pixel.png": ("scruffy-pixel.png", "image/png"),
 }
+MAX_DASHBOARD_OUTPUT_BYTES = 256 * 1024
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -109,7 +110,39 @@ def _handler(reader: QueueReader) -> type[BaseHTTPRequestHandler]:
                     return
                 prefix = "/api/jobs/"
                 if request.path.startswith(prefix):
-                    job_id = unquote(request.path[len(prefix) :])
+                    job_route = request.path[len(prefix) :]
+                    parts = job_route.split("/")
+                    if len(parts) == 3 and parts[1] == "output":
+                        job_id, stream = unquote(parts[0]), unquote(parts[2])
+                        if not job_id or "/" in job_id or stream not in {"stdout", "stderr"}:
+                            self._error(HTTPStatus.BAD_REQUEST, "invalid job output stream")
+                            return
+                        query = parse_qs(request.query)
+                        raw_offset = query.get("offset", [None])[-1]
+                        raw_limit = query.get("limit", [str(128 * 1024)])[-1]
+                        if (
+                            raw_offset is not None
+                            and (
+                                not raw_offset.isascii()
+                                or not raw_offset.isdecimal()
+                            )
+                        ) or not raw_limit.isascii() or not raw_limit.isdecimal():
+                            self._error(HTTPStatus.BAD_REQUEST, "invalid output byte range")
+                            return
+                        limit = int(raw_limit)
+                        if not 1 <= limit <= MAX_DASHBOARD_OUTPUT_BYTES:
+                            self._error(HTTPStatus.BAD_REQUEST, "invalid output byte range")
+                            return
+                        params: dict[str, Any] = {
+                            "job_id": job_id,
+                            "stream": stream,
+                            "max_bytes": limit,
+                        }
+                        if raw_offset is not None:
+                            params["offset"] = int(raw_offset)
+                        self._json(reader("read_job_output", params))
+                        return
+                    job_id = unquote(job_route)
                     if not job_id or "/" in job_id:
                         self._error(HTTPStatus.BAD_REQUEST, "invalid job id")
                         return

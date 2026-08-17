@@ -6,11 +6,18 @@ import {
 } from "/assets/model.js";
 
 const byId = (id) => document.getElementById(id);
+const LOG_CHUNK_BYTES = 128 * 1024;
+const MAX_VISIBLE_LOG_BYTES = 2 * 1024 * 1024;
+const LIVE_JOB_STATES = new Set(["starting", "running", "finishing", "cancelling"]);
 const view = {
   snapshot: null, project: "all", search: "", connected: false, loading: false,
   lastSuccessAt: null,
   workflowKey: "", workflowData: null, workflowDataKey: "", workflowLoading: false,
   gpuReport: "",
+  log: {
+    jobId: "", name: "", stream: "stdout", state: "", chunks: [],
+    loading: false, following: false, retained: true, generation: 0,
+  },
 };
 
 function telemetryIsStale(snapshot) {
@@ -396,9 +403,21 @@ function detailSection(title, rows) {
   section.append(element("h3", "", title));
   const list = element("dl", "detail-grid");
   for (const [label, value] of rows) {
-    list.append(element("dt", "", label), element("dd", "", value == null || value === "" ? "—" : String(value)));
+    const description = element("dd");
+    if (value instanceof Node) description.append(value);
+    else description.textContent = value == null || value === "" ? "—" : String(value);
+    list.append(element("dt", "", label), description);
   }
   section.append(list); return section;
+}
+
+function logPathButton(job, stream) {
+  const button = element("button", "log-path", job[stream] || `Open ${stream}`);
+  button.type = "button";
+  button.dataset.logJobId = job.id;
+  button.dataset.logStream = stream;
+  button.dataset.logJobName = job.name || job.id;
+  return button;
 }
 
 async function openJob(jobId) {
@@ -417,7 +436,7 @@ async function openJob(jobId) {
     byId("dialog-project").textContent = `${job.project_id || "default"} // ${job.state}`;
     const sections = [
       detailSection("Lifecycle", [["Job", job.id], ["State", job.state], ["Reason", job.reason], ["Runtime", formatDuration(job.started_at, job.finished_at)], ["Exit code", job.exit_code]]),
-      detailSection("Placement", [["Request", resourceLabel(job)], ["Assignment", JSON.stringify(job.assignment || "Not assigned")], ["Stdout", job.stdout], ["Stderr", job.stderr]]),
+      detailSection("Placement", [["Request", resourceLabel(job)], ["Assignment", JSON.stringify(job.assignment || "Not assigned")], ["Stdout", logPathButton(job, "stdout")], ["Stderr", logPathButton(job, "stderr")]]),
       detailSection("Workflow", [["Workflow", job.workflow_id], ["Task", job.task_id], ["Explanation", explanation.explanation], ["Blockers", JSON.stringify(explanation.blockers || job.blockers || [])]]),
       detailSection("Workload telemetry", scalarTelemetry(job.workload || {})),
     ];
@@ -425,6 +444,108 @@ async function openJob(jobId) {
   } catch (error) {
     replace(byId("job-detail"), [empty(error.message)]);
   }
+}
+
+function visibleLogBytes() {
+  return view.log.chunks.reduce((total, chunk) => total + chunk.bytes, 0);
+}
+
+function trimLogChunks(prepending) {
+  while (view.log.chunks.length > 1 && visibleLogBytes() > MAX_VISIBLE_LOG_BYTES) {
+    if (prepending) view.log.chunks.pop();
+    else view.log.chunks.shift();
+  }
+}
+
+function renderLog(scrollToEnd = false) {
+  const log = view.log;
+  const text = byId("log-text");
+  const body = log.chunks.map((chunk) => chunk.text).join("");
+  text.textContent = body;
+  byId("log-empty").hidden = body.length > 0 || log.loading;
+  const first = log.chunks[0];
+  const last = log.chunks.at(-1);
+  const start = first?.start || 0;
+  const end = last?.end || 0;
+  const total = last?.total_bytes ?? first?.total_bytes ?? 0;
+  byId("log-position").textContent = log.retained
+    ? `${start.toLocaleString()}–${end.toLocaleString()} of ${total.toLocaleString()} bytes`
+    : "Output is not retained on this controller";
+  byId("log-older").disabled = log.loading || !first?.more_before;
+  byId("log-latest").disabled = log.loading || (!last?.more_after && end >= total);
+  byId("log-follow").disabled = !LIVE_JOB_STATES.has(log.state);
+  byId("log-follow").classList.toggle("active", log.following);
+  byId("log-follow").setAttribute("aria-pressed", String(log.following));
+  byId("log-follow").textContent = log.following ? "Following live" : "Follow live";
+  for (const button of document.querySelectorAll(".log-stream")) {
+    const selected = button.dataset.logStream === log.stream;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+  }
+  if (scrollToEnd) text.scrollTop = text.scrollHeight;
+}
+
+async function loadLogRange(mode = "tail") {
+  const log = view.log;
+  if (!log.jobId || log.loading) return;
+  const generation = log.generation;
+  let offset;
+  let limit = LOG_CHUNK_BYTES;
+  if (mode === "older") {
+    const start = log.chunks[0]?.start || 0;
+    offset = Math.max(0, start - LOG_CHUNK_BYTES);
+    limit = start - offset;
+    if (!limit) return;
+  } else if (mode === "append") {
+    offset = log.chunks.at(-1)?.end || 0;
+  }
+  const query = new URLSearchParams({limit: String(limit)});
+  if (offset != null) query.set("offset", String(offset));
+  log.loading = true;
+  renderLog();
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(log.jobId)}/output/${log.stream}?${query}`, {cache: "no-store"});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Output read failed");
+    if (generation !== log.generation) return;
+    log.state = result.state || log.state;
+    log.retained = result.retained;
+    const chunk = {...result};
+    if (mode === "tail") log.chunks = [chunk];
+    else if (mode === "older") log.chunks.unshift(chunk);
+    else if (result.start < offset) log.chunks = [chunk]; // The file was replaced or truncated.
+    else if (chunk.bytes || chunk.total_bytes !== log.chunks.at(-1)?.total_bytes) log.chunks.push(chunk);
+    trimLogChunks(mode === "older");
+    if (!LIVE_JOB_STATES.has(log.state) && !result.more_after) log.following = false;
+    renderLog(mode !== "older" && log.following);
+  } catch (error) {
+    if (generation !== log.generation) return;
+    byId("log-position").textContent = error.message;
+    log.following = false;
+  } finally {
+    if (generation === log.generation) {
+      log.loading = false;
+      renderLog(mode !== "older" && log.following);
+    }
+  }
+}
+
+function openLog(jobId, name, stream) {
+  const log = view.log;
+  log.generation += 1;
+  Object.assign(log, {jobId, name, stream, state: "", chunks: [], loading: false, following: false, retained: true});
+  byId("log-dialog-title").textContent = name || jobId;
+  byId("log-dialog-state").textContent = `${stream} // ${jobId}`;
+  const dialog = byId("log-dialog");
+  if (!dialog.open) dialog.showModal();
+  renderLog();
+  loadLogRange("tail");
+}
+
+function closeLog() {
+  view.log.generation += 1;
+  view.log.following = false;
+  byId("log-dialog").close();
 }
 
 function gpuReport(device) {
@@ -508,6 +629,16 @@ async function loadOverview(refreshWorkflow = false) {
 }
 
 document.addEventListener("click", (event) => {
+  const logTarget = event.target.closest("[data-log-job-id]");
+  if (logTarget) {
+    openLog(logTarget.dataset.logJobId, logTarget.dataset.logJobName, logTarget.dataset.logStream);
+    return;
+  }
+  const logStream = event.target.closest(".log-stream");
+  if (logStream && view.log.jobId && logStream.dataset.logStream !== view.log.stream) {
+    openLog(view.log.jobId, view.log.name, logStream.dataset.logStream);
+    return;
+  }
   const projectFilter = event.target.closest("[data-project-filter]");
   if (projectFilter) {
     const requested = projectFilter.dataset.projectFilter;
@@ -533,6 +664,49 @@ byId("dialog-close").addEventListener("click", () => byId("job-dialog").close())
 byId("job-dialog").addEventListener("click", (event) => { if (event.target === byId("job-dialog")) byId("job-dialog").close(); });
 byId("gpu-dialog-close").addEventListener("click", () => byId("gpu-dialog").close());
 byId("gpu-dialog").addEventListener("click", (event) => { if (event.target === byId("gpu-dialog")) byId("gpu-dialog").close(); });
+byId("log-dialog-close").addEventListener("click", closeLog);
+byId("log-dialog").addEventListener("click", (event) => { if (event.target === byId("log-dialog")) closeLog(); });
+byId("log-older").addEventListener("click", () => {
+  view.log.following = false;
+  loadLogRange("older");
+});
+byId("log-latest").addEventListener("click", () => {
+  view.log.generation += 1;
+  view.log.chunks = [];
+  view.log.loading = false;
+  loadLogRange("tail");
+});
+byId("log-follow").addEventListener("click", () => {
+  if (!LIVE_JOB_STATES.has(view.log.state)) return;
+  view.log.following = !view.log.following;
+  renderLog(view.log.following);
+  if (view.log.following) loadLogRange("append");
+});
+byId("log-text").addEventListener("scroll", () => {
+  const text = byId("log-text");
+  if (view.log.following && text.scrollHeight - text.scrollTop - text.clientHeight > 80) {
+    view.log.following = false;
+    renderLog();
+  }
+});
+byId("log-text").addEventListener("keydown", (event) => {
+  const text = event.currentTarget;
+  const page = Math.max(1, text.clientHeight - 40);
+  const positions = {
+    End: text.scrollHeight,
+    Home: 0,
+    PageDown: text.scrollTop + page,
+    PageUp: text.scrollTop - page,
+  };
+  if (!(event.key in positions)) return;
+  event.preventDefault();
+  text.scrollTop = positions[event.key];
+});
+byId("log-copy").addEventListener("click", async () => {
+  await navigator.clipboard.writeText(byId("log-text").textContent);
+  byId("log-copy").textContent = "Copied";
+  setTimeout(() => { byId("log-copy").textContent = "Copy visible"; }, 1_200);
+});
 byId("gpu-report-copy").addEventListener("click", async () => {
   if (!view.gpuReport) return;
   await navigator.clipboard.writeText(view.gpuReport);
@@ -541,4 +715,7 @@ byId("gpu-report-copy").addEventListener("click", async () => {
 
 loadOverview(false);
 setInterval(() => loadOverview(false), 5_000);
+setInterval(() => {
+  if (byId("log-dialog").open && view.log.following) loadLogRange("append");
+}, 1_500);
 setInterval(() => { if (view.snapshot) renderConnection(view.snapshot); }, 1_000);

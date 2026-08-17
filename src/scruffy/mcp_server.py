@@ -46,6 +46,7 @@ PAGE_SIZE = 64
 POLL_SECONDS = 1.0
 MAX_TRANSIENT_READ_FAILURES = 3
 MAX_LOG_TAIL_BYTES = 64 * 1024
+MAX_LOG_RANGE_BYTES = 256 * 1024
 QUIET_EVENT_KINDS = frozenset({"job.output", "workload.progress"})
 PROJECT_HEADER = "x-scruffy-project"
 
@@ -380,25 +381,18 @@ def compact_explanation(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _tail_job_output(
-    root: Path, params: dict[str, Any], project_id: str | None
-) -> dict[str, Any]:
-    """Read one bounded job-owned log tail without accepting arbitrary paths."""
+def _job_output_source(
+    root: Path,
+    job_id: str,
+    stream: str,
+    project_id: str | None,
+) -> tuple[dict[str, Any], Path]:
+    """Resolve one controller-owned stream without accepting arbitrary paths."""
 
-    _only(params, {"job_id", "stream", "max_bytes"})
-    job_id = params.get("job_id")
-    stream = params.get("stream", "stderr")
-    max_bytes = params.get("max_bytes", 16 * 1024)
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("job_id must be a non-empty string")
     if stream not in {"stdout", "stderr"}:
         raise ValueError("stream must be stdout or stderr")
-    if (
-        isinstance(max_bytes, bool)
-        or not isinstance(max_bytes, int)
-        or not 1 <= max_bytes <= MAX_LOG_TAIL_BYTES
-    ):
-        raise ValueError(f"max_bytes must be between 1 and {MAX_LOG_TAIL_BYTES}")
     job = status(root, job_id, project_id=project_id)
     relative = job.get(stream) or f"jobs/{job_id}/{stream}.log"
     if not isinstance(relative, str):
@@ -407,22 +401,90 @@ def _tail_job_output(
     expected = (root / "jobs" / job_id).resolve()
     if source.parent != expected:
         raise ValueError("job log reference escaped its job directory")
+    return job, source
+
+
+def _read_job_output(
+    root: Path, params: dict[str, Any], project_id: str | None
+) -> dict[str, Any]:
+    """Read one bounded byte range from a job-owned stdout or stderr file."""
+
+    _only(params, {"job_id", "stream", "offset", "max_bytes"})
+    job_id = params.get("job_id")
+    stream = params.get("stream", "stderr")
+    offset = params.get("offset")
+    max_bytes = params.get("max_bytes", 128 * 1024)
+    if offset is not None and (
+        isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+    ):
+        raise ValueError("offset must be a non-negative integer")
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 1 <= max_bytes <= MAX_LOG_RANGE_BYTES
+    ):
+        raise ValueError(f"max_bytes must be between 1 and {MAX_LOG_RANGE_BYTES}")
+    job, source = _job_output_source(root, job_id, stream, project_id)
     try:
-        size = source.stat().st_size
         with source.open("rb") as handle:
-            handle.seek(max(0, size - max_bytes))
+            size = source.stat().st_size
+            start = max(0, size - max_bytes) if offset is None else min(offset, size)
+            handle.seek(start)
             payload = handle.read(max_bytes)
+        retained = True
     except FileNotFoundError:
-        size, payload = 0, b""
+        size, start, payload, retained = 0, 0, b"", False
+    end = start + len(payload)
+    text = payload.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     return {
         "job_id": job_id,
         "state": job.get("state"),
         "stream": stream,
-        "text": payload.decode(errors="replace"),
+        "text": text,
+        "start": start,
+        "end": end,
         "bytes": len(payload),
         "total_bytes": size,
-        "truncated": size > len(payload),
+        "more_before": start > 0,
+        "more_after": end < size,
+        "retained": retained,
     }
+
+
+def _tail_job_output(
+    root: Path, params: dict[str, Any], project_id: str | None
+) -> dict[str, Any]:
+    """Read one bounded job-owned log tail without accepting arbitrary paths."""
+
+    _only(params, {"job_id", "stream", "max_bytes"})
+    max_bytes = params.get("max_bytes", 16 * 1024)
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 1 <= max_bytes <= MAX_LOG_TAIL_BYTES
+    ):
+        raise ValueError(f"max_bytes must be between 1 and {MAX_LOG_TAIL_BYTES}")
+    result = _read_job_output(
+        root,
+        {
+            "job_id": params.get("job_id"),
+            "stream": params.get("stream", "stderr"),
+            "offset": None,
+            "max_bytes": max_bytes,
+        },
+        project_id,
+    )
+    return {
+        key: result[key]
+        for key in (
+            "job_id",
+            "state",
+            "stream",
+            "text",
+            "bytes",
+            "total_bytes",
+        )
+    } | {"truncated": result["more_before"]}
 
 
 def _only(params: dict[str, Any], allowed: set[str]) -> None:
@@ -663,6 +725,8 @@ async def dispatch_tool(
         return inspect_workflow(root, workflow_id, project_id=project_id)
     if tool == "tail_job_output":
         return _tail_job_output(root, params, project_id)
+    if tool == "read_job_output":
+        return _read_job_output(root, params, project_id)
     if tool == "submit_job":
         return _submit_job(root, params, project_id)
     if tool == "validate_workflow":
