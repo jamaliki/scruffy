@@ -11,6 +11,8 @@ from scruffy.summary import (
     build_summary,
     compact_job_page,
     explain_job,
+    gpu_view,
+    inspect_gpu,
     resource_view,
 )
 
@@ -139,6 +141,30 @@ class SummaryTests(unittest.TestCase):
             [node["name"] for node in result["nodes"]],
         )
         self.assertNotIn("assignments", str(result))
+
+    def test_gpu_views_keep_capacity_slots_without_health_samples(self) -> None:
+        state = {
+            "queue_id": "queue-test",
+            "nodes": {
+                "gpu-8": {
+                    "capacity": {"gpu_ids": [0, 1]},
+                    "free": {"gpu_ids": [1]},
+                    "assignments": {"job-1": {"gpu_ids": [0]}},
+                    "gpu_devices": [
+                        {"slot": 0, "uuid": "GPU-known", "status": "healthy"}
+                    ],
+                }
+            },
+            "gpu_health": {"mode": "enforce", "isolation": "node"},
+        }
+
+        devices = gpu_view(state)["gpus"]
+        unsampled = inspect_gpu(state, "gpu-8", 1)
+
+        self.assertEqual([0, 1], [device["slot"] for device in devices])
+        self.assertEqual("GPU-known", devices[0]["uuid"])
+        self.assertEqual("unknown", unsampled["status"])
+        self.assertEqual("free", unsampled["scheduler_state"])
 
     def test_operational_views_use_scheduler_and_recency_order(self) -> None:
         state = {

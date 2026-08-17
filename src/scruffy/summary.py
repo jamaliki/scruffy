@@ -340,11 +340,18 @@ def gpu_view(state: dict[str, Any]) -> dict[str, Any]:
                 for gpu_id in reservation.get("gpu_ids", [])
             }
             devices = node.get("gpu_devices", [])
-            for raw_device in devices if isinstance(devices, list) else []:
-                if not isinstance(raw_device, dict):
+            sampled_devices = devices if isinstance(devices, list) else []
+            by_slot = {
+                device.get("slot"): device
+                for device in sampled_devices
+                if isinstance(device, dict) and type(device.get("slot")) is int
+            }
+            capacity = node.get("capacity", {})
+            gpu_ids = capacity.get("gpu_ids", []) if isinstance(capacity, dict) else []
+            for slot in gpu_ids if isinstance(gpu_ids, list) else []:
+                if type(slot) is not int:
                     continue
-                device = copy.deepcopy(raw_device)
-                slot = device.get("slot")
+                device = copy.deepcopy(by_slot.get(slot, {"slot": slot, "status": "unknown"}))
                 owner = owners.get(slot)
                 status = device.get("status")
                 if owner:
