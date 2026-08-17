@@ -578,6 +578,80 @@ function gpuReport(device) {
   ].join("\n");
 }
 
+function readableLabel(value) {
+  if (value == null || value === "") return "Unknown";
+  return String(value).replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function compactTime(value) {
+  if (!value) return "Never";
+  const time = element("time", "detail-time", formatAge(value));
+  time.dateTime = value;
+  time.title = value;
+  return time;
+}
+
+function gpuStat(label, value, detail, tone = "") {
+  const item = element("div", `gpu-stat ${tone}`.trim());
+  item.append(
+    element("span", "gpu-stat-label", label),
+    element("strong", "gpu-stat-value", value),
+    element("span", "gpu-stat-detail", detail),
+  );
+  return item;
+}
+
+function cudaSummary(device) {
+  const probe = device.cuda_probe || {};
+  const probes = Array.isArray(probe.devices) ? probe.devices : [];
+  const selected = probes.find((item) => item.uuid === device.uuid)
+    || probes.find((item) => item.nvidia_index === device.nvidia_index);
+  const passed = probes.filter((item) => item.ok).length;
+  const total = Number(probe.device_count ?? probes.length);
+  const ok = selected?.ok ?? probe.ok;
+  return {
+    label: ok === true ? "Ready" : ok === false ? "Failed" : "Not sampled",
+    detail: total ? `${passed} of ${total} node GPUs passed` : "No CUDA context result",
+    error: selected?.error || probe.error,
+    tone: ok === true ? "good" : ok === false ? "bad" : "muted",
+  };
+}
+
+function gpuSummary(device) {
+  const metrics = device.metrics || {};
+  const cuda = cudaSummary(device);
+  const section = element("section", "gpu-summary");
+  const headline = element("div", "gpu-summary-headline");
+  const copy = element("div");
+  copy.append(
+    element("span", `health-badge ${device.status || "unknown"}`, readableLabel(device.status)),
+    element(
+      "p",
+      "gpu-summary-copy",
+      device.status === "healthy"
+        ? "This GPU is healthy and ready for scheduler use."
+        : "This GPU needs attention before it should receive work.",
+    ),
+  );
+  const freshness = element("div", "gpu-freshness");
+  freshness.append(element("span", "gpu-stat-label", "Latest observation"), compactTime(device.last_sample_at));
+  headline.append(copy, freshness);
+
+  const stats = element("div", "gpu-stats");
+  const temperature = metrics.temperature_c == null ? "—" : `${metrics.temperature_c}°C`;
+  const power = metrics.power_draw_w == null ? "—" : `${Math.round(metrics.power_draw_w)} W`;
+  const powerDetail = metrics.power_limit_w == null ? "Power draw" : `${Math.round(metrics.power_limit_w)} W limit`;
+  const ecc = metrics.uncorrectable_ecc_errors == null ? "—" : String(metrics.uncorrectable_ecc_errors);
+  stats.append(
+    gpuStat("Temperature", temperature, metrics.thermal_slowdown ? "Thermal slowdown active" : "No thermal slowdown", metrics.thermal_slowdown ? "bad" : "good"),
+    gpuStat("Power", power, powerDetail),
+    gpuStat("CUDA context", cuda.label, cuda.detail, cuda.tone),
+    gpuStat("Uncorrectable ECC", ecc, ecc === "0" ? "No errors observed" : "Errors observed", ecc === "0" ? "good" : "bad"),
+  );
+  section.append(headline, stats);
+  return section;
+}
+
 async function openGpu(node, slot) {
   const dialog = byId("gpu-dialog");
   byId("gpu-dialog-title").textContent = `${node} / GPU ${slot}`;
@@ -590,15 +664,17 @@ async function openGpu(node, slot) {
     const response = await fetch(`/api/gpus/${encodeURIComponent(node)}/${encodeURIComponent(slot)}`, {cache: "no-store"});
     const device = await response.json();
     if (!response.ok) throw new Error(device.error || "GPU lookup failed");
-    const metrics = device.metrics || {};
     byId("gpu-dialog-title").textContent = `${device.node} / GPU ${device.slot}`;
-    byId("gpu-dialog-state").textContent = `${device.scheduler_state} // ${device.status}`;
+    byId("gpu-dialog-state").textContent = `${readableLabel(device.status)} · ${readableLabel(device.scheduler_state)}`;
     view.gpuReport = gpuReport(device);
+    const cuda = cudaSummary(device);
+    const reasons = device.last_reasons || [];
+    const policy = device.policy || {};
     replace(byId("gpu-detail"), [
-      detailSection("Physical identity", [["NVIDIA UUID", device.uuid], ["PCI bus ID", device.pci_bus_id], ["Serial", device.serial], ["NVIDIA index", device.nvidia_index], ["Linux minor", device.minor_number], ["Model", device.name]]),
-      detailSection("Health", [["Status", device.status], ["Scheduler", device.scheduler_state], ["Last sample", device.last_sample_at], ["Controller received", device.last_received_at], ["Reasons", JSON.stringify(device.last_reasons || [])], ["Quarantined", device.quarantined_at], ["Source", device.quarantine_source]]),
-      detailSection("Telemetry", [["Temperature C", metrics.temperature_c], ["Power W", metrics.power_draw_w], ["Power limit W", metrics.power_limit_w], ["Thermal slowdown", metrics.thermal_slowdown], ["Uncorrectable ECC", metrics.uncorrectable_ecc_errors]]),
-      detailSection("Runtime and reporting", [["Driver", device.driver_version], ["VBIOS", device.vbios_version], ["CUDA probe", JSON.stringify(device.cuda_probe || {})], ["Assigned job", device.assigned_job_id], ["Policy", JSON.stringify(device.policy || {})]]),
+      gpuSummary(device),
+      detailSection("Physical identity", [["Model", device.name], ["NVIDIA UUID", device.uuid], ["PCI bus", device.pci_bus_id], ["Serial", device.serial], ["Device", `index ${device.nvidia_index ?? "?"} · Linux minor ${device.minor_number ?? "?"}`]]),
+      detailSection("Runtime & policy", [["CUDA", cuda.error ? `${cuda.label} · ${cuda.error}` : `${cuda.label} · ${cuda.detail}`], ["Driver", device.driver_version], ["VBIOS", device.vbios_version], ["Scheduling", `${readableLabel(policy.mode)} · ${readableLabel(policy.isolation)} isolation`], ["Assigned job", device.assigned_job_id || "None"]]),
+      detailSection("Observation", [["Sampled", compactTime(device.last_sample_at)], ["Received", compactTime(device.last_received_at)], ["Health notes", reasons.length ? reasons.map(readableLabel).join(" · ") : "No health warnings"], ...(device.quarantined_at ? [["Quarantined", compactTime(device.quarantined_at)], ["Source", readableLabel(device.quarantine_source)]] : [])]),
     ]);
   } catch (error) {
     replace(byId("gpu-detail"), [empty(error.message)]);
