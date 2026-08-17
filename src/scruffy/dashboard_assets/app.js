@@ -411,13 +411,56 @@ function detailSection(title, rows) {
   section.append(list); return section;
 }
 
-function logPathButton(job, stream) {
-  const button = element("button", "log-path", job[stream] || `Open ${stream}`);
+function logButton(job, stream) {
+  const button = element("button", "job-output-button");
   button.type = "button";
   button.dataset.logJobId = job.id;
   button.dataset.logStream = stream;
   button.dataset.logJobName = job.name || job.id;
+  button.append(
+    element("span", "job-output-stream", stream),
+    element("span", "job-output-path", job[stream] || "Output is not retained"),
+    element("span", "job-output-open", "Open viewer"),
+  );
   return button;
+}
+
+function jobOverview(job) {
+  const section = element("section", "job-overview");
+  section.append(
+    gpuStat("State", readableLabel(job.state), job.reason ? readableLabel(job.reason) : "Scheduler lifecycle", stateTone(job.state)),
+    gpuStat("Runtime", formatDuration(job.started_at, job.finished_at), job.started_at ? `Started ${formatAge(job.started_at)}` : "Not started"),
+    gpuStat("Resources", `${Number(job.request?.gpus_per_node || 0) * Number(job.request?.nodes || 0)} GPUs`, resourceLabel(job)),
+    gpuStat("Progress", progressLabel(job), job.workload?.last_update_at ? `Updated ${formatAge(job.workload.last_update_at)}` : "No recent telemetry"),
+  );
+  return section;
+}
+
+function placementRows(job) {
+  const reservations = job.assignment?.reservations || [];
+  const rows = [["Request", resourceLabel(job)]];
+  reservations.forEach((reservation, index) => {
+    const label = reservations.length === 1 ? "Placement" : `Placement ${index + 1}`;
+    const gpuIds = reservation.gpu_ids || [];
+    const gpus = gpuIds.length ? `${gpuIds.length === 1 ? "GPU" : "GPUs"} ${gpuIds.join(", ")}` : "CPU only";
+    rows.push([label, `${reservation.node || "Unknown node"} · ${gpus}`]);
+    rows.push(["Reserved", `${reservation.cpus || 0} CPUs · ${reservation.memory_gb || 0} GB memory`]);
+  });
+  if (!reservations.length) rows.push(["Placement", "Not assigned"]);
+  return rows;
+}
+
+function jobOutput(job) {
+  const section = element("section", "job-output-section");
+  const heading = element("div", "job-output-heading");
+  heading.append(
+    element("h3", "", "Output"),
+    element("p", "", "Bounded, readable tails with live follow for active jobs."),
+  );
+  const actions = element("div", "job-output-actions");
+  actions.append(logButton(job, "stdout"), logButton(job, "stderr"));
+  section.append(heading, actions);
+  return section;
 }
 
 async function openJob(jobId) {
@@ -435,11 +478,17 @@ async function openJob(jobId) {
     byId("dialog-title").textContent = job.name || job.id;
     byId("dialog-project").textContent = `${job.project_id || "default"} // ${job.state}`;
     const sections = [
-      detailSection("Lifecycle", [["Job", job.id], ["State", job.state], ["Reason", job.reason], ["Runtime", formatDuration(job.started_at, job.finished_at)], ["Exit code", job.exit_code]]),
-      detailSection("Placement", [["Request", resourceLabel(job)], ["Assignment", JSON.stringify(job.assignment || "Not assigned")], ["Stdout", logPathButton(job, "stdout")], ["Stderr", logPathButton(job, "stderr")]]),
-      detailSection("Workflow", [["Workflow", job.workflow_id], ["Task", job.task_id], ["Explanation", explanation.explanation], ["Blockers", JSON.stringify(explanation.blockers || job.blockers || [])]]),
-      detailSection("Workload telemetry", scalarTelemetry(job.workload || {})),
+      jobOverview(job),
+      jobOutput(job),
+      detailSection("Lifecycle", [["Job ID", job.id], ["Reason", job.reason], ["Exit code", job.exit_code]]),
+      detailSection("Placement", placementRows(job)),
     ];
+    const blockers = explanation.blockers || job.blockers || [];
+    if (job.workflow_id || job.task_id || blockers.length) {
+      sections.push(detailSection("Workflow", [["Workflow", job.workflow_id], ["Task", job.task_id], ["Explanation", explanation.explanation], ["Blockers", blockers.length ? blockers.map((blocker) => blocker.task_id || blocker.job_id || blocker.reason || String(blocker)).join(" · ") : "None"]]));
+    }
+    const telemetry = scalarTelemetry(job.workload || {});
+    if (telemetry.length) sections.push(detailSection("Workload telemetry", telemetry));
     replace(byId("job-detail"), sections);
   } catch (error) {
     replace(byId("job-detail"), [empty(error.message)]);

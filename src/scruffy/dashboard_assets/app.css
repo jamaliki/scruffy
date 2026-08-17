@@ -237,6 +237,22 @@ button.legend-item.selected { box-shadow:inset 0 -2px 0 var(--project-color); }
 .icon-button.primary-action { border-color:var(--teal); color:var(--teal); }
 .icon-button.primary-action:hover { border-color:var(--teal); background:var(--teal); color:var(--deep); }
 .job-detail { padding:24px; display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.job-overview { grid-column:1/-1; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); overflow:hidden; border:1px solid var(--rule); background:linear-gradient(135deg,rgba(57,200,192,.07),rgba(255,103,72,.025)); }
+.job-overview .gpu-stat-value { font-size:18px; }
+.job-overview .gpu-stat.active .gpu-stat-value { color:var(--teal); }
+.job-overview .gpu-stat.success .gpu-stat-value { color:var(--success); }
+.job-overview .gpu-stat.warning .gpu-stat-value { color:var(--warning); }
+.job-overview .gpu-stat.danger .gpu-stat-value { color:var(--danger); }
+.job-output-section { grid-column:1/-1; overflow:hidden; border:1px solid var(--teal); background:rgba(57,200,192,.035); }
+.job-output-heading { padding:13px 16px; display:flex; align-items:baseline; justify-content:space-between; gap:20px; border-bottom:1px solid var(--rule); }
+.job-output-heading h3 { margin:0; color:var(--heading); font-family:var(--sans); font-size:12px; font-weight:650; }
+.job-output-heading p { margin:0; color:var(--muted); font-size:9px; }
+.job-output-actions { padding:10px; display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.job-output-button { min-width:0; padding:13px 14px; display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:12px; border:1px solid var(--rule); background:var(--deep); color:var(--ink); text-align:left; }
+.job-output-button:hover { border-color:var(--teal); background:var(--surface-alt); }
+.job-output-stream { color:var(--heading); font-family:var(--sans); font-size:10px; font-weight:650; text-transform:uppercase; }
+.job-output-path { min-width:0; overflow:hidden; color:var(--muted); font-family:var(--mono); font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
+.job-output-open { color:var(--teal); font-family:var(--sans); font-size:8px; font-weight:650; text-transform:uppercase; white-space:nowrap; }
 .detail-section { border:1px solid var(--rule); }
 .detail-section h3 { margin:0; padding:11px 13px; background:var(--surface-alt); border-bottom:1px solid var(--rule); color:var(--heading); font-family:var(--sans); font-size:10px; font-weight:650; text-transform:uppercase; }
 .detail-grid { margin:0; padding:13px; display:grid; grid-template-columns:105px minmax(0,1fr); gap:9px 13px; font-size:11px; }
@@ -268,8 +284,6 @@ button.legend-item.selected { box-shadow:inset 0 -2px 0 var(--project-color); }
 .gpu-job-label { color:var(--teal); font-family:var(--sans); font-size:8px; font-weight:650; letter-spacing:.1em; text-transform:uppercase; }
 .gpu-job-name { overflow:hidden; color:var(--heading); font-family:var(--sans); font-size:16px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
 .gpu-job-meta { color:var(--muted); font-family:var(--mono); font-size:9px; }
-.log-path { max-width:100%; padding:0 0 2px; border:0; border-bottom:1px solid var(--teal); background:transparent; color:var(--teal); font:inherit; text-align:left; overflow-wrap:anywhere; cursor:pointer; }
-.log-path:hover,.log-path:focus-visible { border-color:var(--accent); color:var(--accent); }
 .log-dialog { width:min(1180px,calc(100vw - 36px)); height:min(820px,calc(100vh - 36px)); max-height:none; overflow:hidden; }
 .log-dialog[open] { display:grid; grid-template-rows:auto auto minmax(0,1fr); }
 .log-toolbar { min-height:53px; padding:8px 18px; display:grid; grid-template-columns:auto minmax(170px,1fr) auto auto; align-items:center; gap:10px; border-bottom:1px solid var(--rule); background:var(--surface-alt); }
@@ -327,6 +341,10 @@ noscript { display:block; padding:30px; background:var(--danger); color:var(--de
   .project-legend { justify-content:flex-start; }
   .footer { flex-direction:column; }
   .job-dialog { max-height:94vh; }
+  .job-overview { grid-template-columns:1fr 1fr; }
+  .job-overview .gpu-stat:nth-child(2) { border-right:0; }
+  .job-overview .gpu-stat:nth-child(-n+2) { border-bottom:1px solid var(--rule); }
+  .job-output-actions { grid-template-columns:1fr; }
   #gpu-detail { grid-template-columns:1fr; }
   #gpu-detail .detail-section:last-child { grid-column:auto; }
   .gpu-stats { grid-template-columns:1fr 1fr; }
