@@ -26,9 +26,7 @@ def _allocation_error(controller: Controller, error: str | None) -> None:
     )
 
 
-def _job_error(
-    controller: Controller, job: dict[str, Any], error: str | None
-) -> None:
+def _job_error(controller: Controller, job: dict[str, Any], error: str | None) -> None:
     if job.get("reconciliation_error") == error:
         return
     if error is None:
@@ -58,7 +56,7 @@ def refresh_slurm_snapshot(controller: Controller, now: float) -> None:
         5
         if controller.slurm_query_error
         else 1
-        if job_needs_reconciliation or controller.health_step_id is None
+        if job_needs_reconciliation or len(controller.health_step_ids) != len(controller.inventory)
         else 10
     )
     if (
@@ -97,11 +95,7 @@ def _matching_step(controller: Controller, job: dict[str, Any]):
     step = matches[0]
     prefix = f"{controller.slurm_job_id}."
     suffix = step.step_id.removeprefix(prefix)
-    if (
-        not step.step_id.startswith(prefix)
-        or not suffix.isascii()
-        or not suffix.isdecimal()
-    ):
+    if not step.step_id.startswith(prefix) or not suffix.isascii() or not suffix.isdecimal():
         raise RuntimeError(f"invalid live step ID {step.step_id!r}")
     if not step.nodes:
         raise RuntimeError(f"step {step.step_id} has no node set")
@@ -143,8 +137,7 @@ def reconcile_slurm(
 
     _job_error(controller, job, None)
     if running.process is not None and (
-        running.exit_seen_at is None
-        or controller.slurm_snapshot_at < running.exit_seen_at
+        running.exit_seen_at is None or controller.slurm_snapshot_at < running.exit_seen_at
     ):
         return False
     if running.last_absence_snapshot_at != controller.slurm_snapshot_at:

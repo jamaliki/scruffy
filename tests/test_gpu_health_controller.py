@@ -139,11 +139,13 @@ class GpuHealthControllerTests(unittest.TestCase):
     @mock.patch("scruffy.controller.subprocess.Popen")
     def test_live_named_monitor_is_reattached_without_duplicate_srun(self, popen) -> None:
         controller = self.slurm_controller()
-        controller.slurm_steps = (SlurmStep("123.7", controller.health_step_name or "", "gpu-0"),)
+        controller.slurm_steps = (
+            SlurmStep("123.7", f"{controller.health_step_name}-gpu-0", "gpu-0"),
+        )
 
         _maintain_health_monitor(controller)
 
-        self.assertEqual("123.7", controller.health_step_id)
+        self.assertEqual({"gpu-0": "123.7"}, controller.health_step_ids)
         popen.assert_not_called()
 
     @mock.patch("scruffy.controller.subprocess.Popen")
@@ -163,6 +165,29 @@ class GpuHealthControllerTests(unittest.TestCase):
         self.assertIn("--allocation-incarnation-sha256", argv)
         self.assertIn(controller.allocation_incarnation.fingerprint_sha256, argv)
         self.assertEqual("starting", controller.state["gpu_health"]["monitor"]["status"])
+
+    @mock.patch("scruffy.controller.subprocess.Popen")
+    def test_multinode_monitor_launches_one_step_per_node(self, popen) -> None:
+        popen.return_value.poll.return_value = None
+        self.inventory = (
+            NodeInventory("gpu-0", (0,), 4, 16),
+            NodeInventory("gpu-1", (0,), 4, 16),
+        )
+        controller = self.slurm_controller()
+        controller.slurm_snapshot_at = 1
+
+        _maintain_health_monitor(controller)
+
+        self.assertEqual(2, popen.call_count)
+        commands = [call.args[0] for call in popen.call_args_list]
+        self.assertTrue(all("--nodes=1" in command for command in commands))
+        self.assertEqual(
+            {"--nodelist=gpu-0", "--nodelist=gpu-1"},
+            {
+                next(option for option in command if option.startswith("--nodelist="))
+                for command in commands
+            },
+        )
 
     def test_slurm_controller_rejects_a_sample_from_an_old_incarnation(self) -> None:
         controller = self.slurm_controller()

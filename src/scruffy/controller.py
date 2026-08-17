@@ -146,38 +146,23 @@ def _initialize_controller(
     health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
     bind_health_incarnation(
         health,
-        (
-            allocation_incarnation.fingerprint_sha256
-            if allocation_incarnation is not None
-            else None
-        ),
+        (allocation_incarnation.fingerprint_sha256 if allocation_incarnation is not None else None),
     )
-    active = [
-        job
-        for job in state.get("jobs", {}).values()
-        if job["state"] in ACTIVE_JOB_STATES
-    ]
+    active = [job for job in state.get("jobs", {}).values() if job["state"] in ACTIVE_JOB_STATES]
     previous = state.get("allocation") or {}
     if launcher == "slurm" and (
-        allocation_incarnation is None
-        or allocation_incarnation.slurm_job_id != slurm_job_id
+        allocation_incarnation is None or allocation_incarnation.slurm_job_id != slurm_job_id
     ):
         raise ValueError("Slurm allocation incarnation is missing or differs")
     previous_incarnation = None
     raw_previous_incarnation = previous.get("incarnation")
     if raw_previous_incarnation is not None:
         try:
-            previous_incarnation = AllocationIncarnation.from_dict(
-                raw_previous_incarnation
-            )
+            previous_incarnation = AllocationIncarnation.from_dict(raw_previous_incarnation)
         except (TypeError, ValueError) as exc:
-            raise UnsafeRecovery(
-                f"invalid persisted allocation incarnation: {exc}"
-            ) from exc
+            raise UnsafeRecovery(f"invalid persisted allocation incarnation: {exc}") from exc
         if previous.get("id") != previous_incarnation.slurm_job_id:
-            raise UnsafeRecovery(
-                "persisted allocation ID differs from its incarnation"
-            )
+            raise UnsafeRecovery("persisted allocation ID differs from its incarnation")
     same_slurm_allocation = (
         launcher == "slurm"
         and previous.get("id") == allocation_id
@@ -203,26 +188,20 @@ def _initialize_controller(
         )
     if same_slurm_allocation:
         try:
-            assignments = tuple(
-                Assignment.from_dict(job["assignment"]) for job in active
-            )
+            assignments = tuple(Assignment.from_dict(job["assignment"]) for job in active)
             assert_invariants(inventory, assignments)
         except (KeyError, ValueError, InvariantError) as exc:
             raise UnsafeRecovery(
                 f"invalid active Slurm assignments; refusing recovery: {exc}"
             ) from exc
         if active and any(not job.get("launch_token") for job in active):
-            raise UnsafeRecovery(
-                "active Slurm job has no launch token; refusing unsafe recovery"
-            )
+            raise UnsafeRecovery("active Slurm job has no launch token; refusing unsafe recovery")
         incarnation_sha256 = allocation_incarnation.fingerprint_sha256
         if active and any(
-            job.get("allocation_incarnation_sha256") != incarnation_sha256
-            for job in active
+            job.get("allocation_incarnation_sha256") != incarnation_sha256 for job in active
         ):
             raise UnsafeRecovery(
-                "active Slurm job allocation incarnation differs; "
-                "refusing unsafe recovery"
+                "active Slurm job allocation incarnation differs; refusing unsafe recovery"
             )
 
     journal = open_journal(root, int(state.get("journal_generation", 0)))
@@ -291,9 +270,7 @@ def _initialize_controller(
     metadata.update(
         {
             "state": "running",
-            "started_at": (
-                previous.get("started_at", now) if same_slurm_allocation else now
-            ),
+            "started_at": (previous.get("started_at", now) if same_slurm_allocation else now),
             "controller_started_at": now,
             "heartbeat_at": now,
         }
@@ -306,8 +283,10 @@ def _initialize_controller(
     if drain_before_end_seconds and isinstance(deadline_at, str):
         deadline = datetime.fromisoformat(deadline_at)
         metadata["automatic_drain_at"] = (
-            deadline - timedelta(seconds=drain_before_end_seconds)
-        ).astimezone(UTC).isoformat(timespec="seconds")
+            (deadline - timedelta(seconds=drain_before_end_seconds))
+            .astimezone(UTC)
+            .isoformat(timespec="seconds")
+        )
     drain_requested = bool(
         state.get(
             "drain_requested",
@@ -317,8 +296,7 @@ def _initialize_controller(
     # A drain belongs to one physical allocation incarnation. Slurm can reuse
     # the same job ID after requeue, but none of the old steps survive it.
     preserve_drain = drain_requested and (
-        same_slurm_allocation
-        or (launcher == "local" and previous.get("id") == allocation_id)
+        same_slurm_allocation or (launcher == "local" and previous.get("id") == allocation_id)
     )
     if preserve_drain:
         metadata["state"] = "draining"
@@ -327,27 +305,19 @@ def _initialize_controller(
     state["drain_requested"] = preserve_drain
     # Recovery owns existing steps but never admits additional work implicitly.
     # An operator must explicitly resume after checking the recovered snapshot.
-    state["launches_paused"] = (
-        same_slurm_allocation or legacy_slurm_allocation or start_paused
-    )
+    state["launches_paused"] = same_slurm_allocation or legacy_slurm_allocation or start_paused
     ineligible = [
         job["id"]
         for job in state["jobs"].values()
         if job["state"] in {"queued", "blocked"}
-        and not request_can_ever_fit(
-            inventory, ResourceRequest.from_dict(job["request"])
-        )
+        and not request_can_ever_fit(inventory, ResourceRequest.from_dict(job["request"]))
     ]
     if replacement:
         metadata["handover"] = {
             "previous_allocation_id": previous_allocation_id,
             "lost_jobs": len(active),
-            "queued_jobs": sum(
-                job["state"] == "queued" for job in state["jobs"].values()
-            ),
-            "blocked_jobs": sum(
-                job["state"] == "blocked" for job in state["jobs"].values()
-            ),
+            "queued_jobs": sum(job["state"] == "queued" for job in state["jobs"].values()),
+            "blocked_jobs": sum(job["state"] == "blocked" for job in state["jobs"].values()),
             "ineligible_jobs": len(ineligible),
         }
         if previous_incarnation is not None:
@@ -360,16 +330,10 @@ def _initialize_controller(
         data={
             "nodes": [item.to_dict() for item in inventory],
             "incarnation": (
-                allocation_incarnation.to_dict()
-                if allocation_incarnation is not None
-                else None
+                allocation_incarnation.to_dict() if allocation_incarnation is not None else None
             ),
-            "reattached_jobs": (
-                [job["id"] for job in active] if same_slurm_allocation else []
-            ),
-            "lost_jobs": (
-                [job["id"] for job in active] if lost_reason is not None else []
-            ),
+            "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
+            "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
             "lost_reason": lost_reason,
             **({"handover": metadata["handover"]} if replacement else {}),
         },
@@ -393,9 +357,7 @@ def _initialize_controller(
     return controller
 
 
-def _reattach_slurm_jobs(
-    controller: Controller, jobs: list[dict[str, Any]]
-) -> None:
+def _reattach_slurm_jobs(controller: Controller, jobs: list[dict[str, Any]]) -> None:
     """Restore ownership of persisted steps without their old local clients."""
 
     for job in jobs:
@@ -403,9 +365,7 @@ def _reattach_slurm_jobs(
         running = RunningProcess(None, str(job["launch_token"]))
         running.closed_streams.update({"stdout", "stderr"})
         for stream_name in ("stdout", "stderr"):
-            relative_name = job.get(
-                stream_name, f"jobs/{job['id']}/{stream_name}.log"
-            )
+            relative_name = job.get(stream_name, f"jobs/{job['id']}/{stream_name}.log")
             try:
                 size = (controller.root / relative_name).stat().st_size
             except FileNotFoundError:
@@ -482,9 +442,7 @@ def _resolution_workflow_jobs(
     return resolution_jobs
 
 
-def _storage_notice(
-    controller: Controller, operation: str, item: str, exc: Exception
-) -> None:
+def _storage_notice(controller: Controller, operation: str, item: str, exc: Exception) -> None:
     """Publish one contained storage failure without stopping the controller."""
 
     emit(
@@ -514,9 +472,7 @@ def _archived_workflow_jobs(
             ),
         )
     except TransientStorageError as exc:
-        _storage_notice(
-            controller, "read_workflow_archive", f"{project_id}/{workflow_id}", exc
-        )
+        _storage_notice(controller, "read_workflow_archive", f"{project_id}/{workflow_id}", exc)
         return None
 
 
@@ -545,9 +501,7 @@ def _stage_job(
     task_id = job.get("task_id")
     project_id = job_project(job)
     duplicate = (
-        select_task_attempts(prospective.values()).get(
-            (project_id, workflow_id, task_id)
-        )
+        select_task_attempts(prospective.values()).get((project_id, workflow_id, task_id))
         if isinstance(workflow_id, str) and isinstance(task_id, str)
         else None
     )
@@ -555,36 +509,29 @@ def _stage_job(
     if (
         duplicate is not None
         and not duplicate.get("workflow_invalid")
-        and (
-            duplicate_state not in TERMINAL_JOB_STATES
-            or duplicate_state == "succeeded"
-        )
+        and (duplicate_state not in TERMINAL_JOB_STATES or duplicate_state == "succeeded")
     ):
         _mark_workflow_rejected(
             job,
-            WorkflowError(
-                f"duplicate task_id {job.get('task_id')!r} in workflow "
-                f"{workflow_id!r}"
-            ),
+            WorkflowError(f"duplicate task_id {job.get('task_id')!r} in workflow {workflow_id!r}"),
         )
         return job
 
     if isinstance(workflow_id, str) and isinstance(task_id, str):
         prior_attempts = [
-            (
-                candidate["attempt"]
-                if type(candidate.get("attempt")) is int
-                else 1
-            )
+            (candidate["attempt"] if type(candidate.get("attempt")) is int else 1)
             for candidate in prospective.values()
             if job_project(candidate) == project_id
             and candidate.get("workflow_id") == workflow_id
             and candidate.get("task_id") == task_id
         ]
-        job["attempt"] = max(
-            prior_attempts,
-            default=0,
-        ) + 1
+        job["attempt"] = (
+            max(
+                prior_attempts,
+                default=0,
+            )
+            + 1
+        )
 
     if workflow_id is not None:
         candidates = [
@@ -612,9 +559,7 @@ def _resolved_dependency_ids(
     workflow_id = str(job.get("workflow_id") or "")
     result = []
     for need in job.get("needs") or []:
-        dependency = selected.get(
-            (project_id, workflow_id, str(need.get("task_id") or ""))
-        )
+        dependency = selected.get((project_id, workflow_id, str(need.get("task_id") or "")))
         if dependency is not None:
             result.append(
                 {
@@ -669,8 +614,7 @@ def _remember_condition(job: dict[str, Any], evidence: dict[str, Any]) -> bool:
     identity = (evidence["task_id"], evidence["artifact_id"])
     satisfactions = job.setdefault("condition_satisfactions", [])
     if any(
-        isinstance(item, dict)
-        and (item.get("task_id"), item.get("artifact_id")) == identity
+        isinstance(item, dict) and (item.get("task_id"), item.get("artifact_id")) == identity
         for item in satisfactions
     ):
         return False
@@ -724,15 +668,11 @@ def _satisfy_artifact_waiters(
     publication = artifact_publication(event["data"])
     workflow_id = producer.get("workflow_id")
     task_id = producer.get("task_id")
-    if publication is None or not isinstance(workflow_id, str) or not isinstance(
-        task_id, str
-    ):
+    if publication is None or not isinstance(workflow_id, str) or not isinstance(task_id, str):
         return
     project_id = job_project(producer)
     selected = select_task_attempts(
-        _resolution_workflow_jobs(
-            controller.state["jobs"].values(), project_id, workflow_id
-        )
+        _resolution_workflow_jobs(controller.state["jobs"].values(), project_id, workflow_id)
     ).get((project_id, workflow_id, task_id))
     if selected is None or selected.get("id") != producer.get("id"):
         return
@@ -834,9 +774,7 @@ def _stage_request(
 
     if spec is None:
         return (
-            _rejected_job(
-                {}, queue_order, request_id, ValueError("unreadable request spec")
-            ),
+            _rejected_job({}, queue_order, request_id, ValueError("unreadable request spec")),
             True,
         )
     if spec.get("job_id") != request_id:
@@ -872,9 +810,7 @@ def _finish_staged_request(
         _storage_notice(controller, "finish_request", job["id"], exc)
 
 
-def _atomic_specs(
-    submission_id: str, document: dict[str, Any]
-) -> list[dict[str, Any]]:
+def _atomic_specs(submission_id: str, document: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate an envelope's outer identity before staging any task."""
 
     if document.get("submission_id") != submission_id:
@@ -882,9 +818,8 @@ def _atomic_specs(
     if document.get("kind") != "workflow":
         raise ValueError("atomic submission kind must be 'workflow'")
     expected_digest = document.get("identity_sha256")
-    if (
-        not isinstance(expected_digest, str)
-        or expected_digest != submission_identity_digest(document)
+    if not isinstance(expected_digest, str) or expected_digest != submission_identity_digest(
+        document
     ):
         raise ValueError("submission identity digest does not match its content")
     specs = document.get("jobs")
@@ -937,16 +872,12 @@ def _stage_atomic_submission(
 
     workflow_id = str(document["workflow_id"])
     project_id = normalize_project_id(document.get("project_id"))
-    workflow_jobs = _resolution_workflow_jobs(
-        candidate_state.values(), project_id, workflow_id
-    )
+    workflow_jobs = _resolution_workflow_jobs(candidate_state.values(), project_id, workflow_id)
     validate_workflows(workflow_jobs)
     impossible = [
         str(job["task_id"])
         for job in staged
-        if not request_can_ever_fit(
-            controller.inventory, ResourceRequest.from_dict(job["request"])
-        )
+        if not request_can_ever_fit(controller.inventory, ResourceRequest.from_dict(job["request"]))
     ]
     if impossible:
         raise ValueError(f"tasks cannot fit this allocation: {impossible!r}")
@@ -1059,12 +990,7 @@ def _ingest_requests(controller: Controller) -> None:
         if archived is None:
             deferred_workflows.add((project_id, workflow_id))
             continue
-        prospective.update(
-            {
-                job["id"]: job
-                for job in archived
-            }
-        )
+        prospective.update({job["id"]: job for job in archived})
     prospective.update(known)
     atomic_job_ids: set[str] = set()
     for submission_id, document, atomic in submissions:
@@ -1084,11 +1010,15 @@ def _ingest_requests(controller: Controller) -> None:
                 _storage_notice(controller, "reject_submission", submission_id, exc)
             continue
         specs = document.get("jobs")
-        job_ids = {
-            str(spec.get("job_id"))
-            for spec in specs
-            if isinstance(specs, list) and isinstance(spec, dict)
-        } if isinstance(specs, list) else set()
+        job_ids = (
+            {
+                str(spec.get("job_id"))
+                for spec in specs
+                if isinstance(specs, list) and isinstance(spec, dict)
+            }
+            if isinstance(specs, list)
+            else set()
+        )
         atomic_job_ids.update(job_ids)
         if job_ids and job_ids <= set(known):
             _finish_atomic_submission(controller, submission_id, document)
@@ -1112,9 +1042,7 @@ def _ingest_requests(controller: Controller) -> None:
             if workflow_key in deferred_workflows:
                 continue
         next_order += 1
-        job, malformed_identity = _stage_request(
-            request_id, spec, next_order, prospective
-        )
+        job, malformed_identity = _stage_request(request_id, spec, next_order, prospective)
         staged.append((job, malformed_identity))
         prospective[request_id] = job
 
@@ -1215,9 +1143,7 @@ def _refresh_dependencies(controller: Controller) -> None:
             retry_invalid.add(workflow_key)
             continue
 
-        jobs_by_key = {
-            (project_id, workflow_id, job["task_id"]): job for job in blocked_jobs
-        }
+        jobs_by_key = {(project_id, workflow_id, job["task_id"]): job for job in blocked_jobs}
         # The batch resolver returns topological order, so predicted upstream
         # queued/skipped states become real before dependent events are emitted.
         for key, resolution in resolutions.items():
@@ -1229,9 +1155,7 @@ def _refresh_dependencies(controller: Controller) -> None:
                 job["state"] = "queued"
                 job["reason"] = None
                 job["blockers"] = []
-                job["resolved_dependencies"] = _resolved_dependency_ids(
-                    job, resolution_jobs
-                )
+                job["resolved_dependencies"] = _resolved_dependency_ids(job, resolution_jobs)
                 job["resolved_conditions"] = _resolved_condition_evidence(job)
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
@@ -1255,9 +1179,7 @@ def _refresh_dependencies(controller: Controller) -> None:
     }
 
 
-def _finish_missing_cancel(
-    controller: Controller, command: dict[str, Any], job_id: str
-) -> bool:
+def _finish_missing_cancel(controller: Controller, command: dict[str, Any], job_id: str) -> bool:
     """Emit an archived/unknown outcome; return false when it should retry."""
 
     if request_pending(controller.root, job_id):
@@ -1298,9 +1220,7 @@ def _ingest_commands(controller: Controller) -> None:
                 # Submit returns only after its request is durable. If command
                 # ingestion won a polling race, retain the cancel for next tick.
                 deferred = not _finish_missing_cancel(controller, command, job_id)
-            elif not request_cancellation(
-                controller, job, str(command.get("request_id") or "")
-            ):
+            elif not request_cancellation(controller, job, str(command.get("request_id") or "")):
                 emit(
                     controller,
                     "job.cancel_ignored",
@@ -1326,9 +1246,7 @@ def _ingest_commands(controller: Controller) -> None:
         elif kind == "resume":
             data = {"request_id": command.get("request_id")}
             was_draining = bool(controller.state["draining"])
-            if not was_draining and not controller.state.get(
-                "launches_paused", False
-            ):
+            if not was_draining and not controller.state.get("launches_paused", False):
                 emit(
                     controller,
                     "allocation.resume_ignored",
@@ -1411,9 +1329,7 @@ def _discard_journaled_reports(controller: Controller) -> None:
     legacy = {
         (str(document.get("job_id")), str(document.get("event_id"))): source
         for source, document in pending.values()
-        if isinstance(document, dict)
-        and document.get("job_id")
-        and document.get("event_id")
+        if isinstance(document, dict) and document.get("job_id") and document.get("event_id")
     }
     acknowledged = {}
     generation = int(controller.state.get("journal_generation", 0))
@@ -1492,9 +1408,7 @@ def _reject_report(
     controller.state.setdefault("report_acks", {})[report_id] = digest
 
 
-def _report_batch(
-    controller: Controller, limit: int
-) -> list[tuple[Path, object | None]]:
+def _report_batch(controller: Controller, limit: int) -> list[tuple[Path, object | None]]:
     """Round-robin pending reports so one noisy job cannot starve another."""
 
     if limit <= 0:
@@ -1536,9 +1450,7 @@ def _report_batch(
     return batch
 
 
-def _ingest_reports(
-    controller: Controller, limit: int = MAX_REPORTS_PER_TICK
-) -> None:
+def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -> None:
     """Validate and commit one bounded report batch with one state rewrite."""
 
     acknowledged: list[tuple[Path, str | None]] = []
@@ -1662,18 +1574,19 @@ def _set_health_monitor_status(
 ) -> bool:
     health = controller.state["gpu_health"]
     monitor = health.setdefault("monitor", {})
-    expected_step = controller.health_step_id
+    expected_steps = dict(sorted(controller.health_step_ids.items()))
     if (
         monitor.get("status") == status
         and monitor.get("error") == error
-        and monitor.get("slurm_step_id") == expected_step
+        and monitor.get("slurm_step_ids") == (expected_steps or None)
     ):
         return False
     monitor.update({"status": status, "error": error, "changed_at": utc_now()})
-    if controller.health_step_id:
-        monitor["slurm_step_id"] = controller.health_step_id
+    monitor.pop("slurm_step_id", None)
+    if expected_steps:
+        monitor["slurm_step_ids"] = expected_steps
     else:
-        monitor.pop("slurm_step_id", None)
+        monitor.pop("slurm_step_ids", None)
     return True
 
 
@@ -1718,69 +1631,93 @@ def _ingest_gpu_health(controller: Controller) -> None:
         if inventory_node.name in errors:
             del errors[inventory_node.name]
             durable_changed = True
-    monitor_status = "degraded" if errors else "running"
-    if sample_updated and _set_health_monitor_status(controller, monitor_status):
+    monitor_errors = controller.health_monitor_errors
+    monitor_status = "degraded" if errors or monitor_errors else "running"
+    monitor_error = (
+        "; ".join(f"{node}: {message}" for node, message in sorted(monitor_errors.items())) or None
+    )
+    if sample_updated and _set_health_monitor_status(
+        controller, monitor_status, error=monitor_error
+    ):
         durable_changed = True
     if transitions or durable_changed:
         _emit_gpu_health(controller, transitions)
 
 
-def _health_monitor_matches(controller: Controller) -> list[SlurmStep]:
+def _health_step_name(controller: Controller, node: str) -> str:
+    return f"{controller.health_step_name}-{node}"
+
+
+def _health_monitor_matches(controller: Controller, node: str) -> list[SlurmStep]:
+    known_id = controller.health_step_ids.get(node)
     matches = [
         step
         for step in controller.slurm_steps
-        if step.name == controller.health_step_name
-        or (controller.health_step_id and step.step_id == controller.health_step_id)
+        if step.name == _health_step_name(controller, node)
+        or (known_id and step.step_id == known_id)
     ]
     return list({step.step_id: step for step in matches}.values())
 
 
-def _health_monitor_error(controller: Controller, error: str) -> None:
-    controller.health_process = None
-    controller.health_step_id = None
-    controller.health_retry_at = time.monotonic() + 5
-    if _set_health_monitor_status(controller, "error", error=error):
+def _health_monitor_error(controller: Controller, node: str, error: str) -> None:
+    controller.health_processes.pop(node, None)
+    controller.health_step_ids.pop(node, None)
+    controller.health_monitor_errors[node] = error
+    controller.health_retry_at[node] = time.monotonic() + 5
+    detail = "; ".join(
+        f"{name}: {message}" for name, message in sorted(controller.health_monitor_errors.items())
+    )
+    if _set_health_monitor_status(controller, "error", error=detail):
         _emit_gpu_health(controller, [])
 
 
-def _attach_health_monitor(controller: Controller, step: SlurmStep) -> None:
-    controller.health_step_id = step.step_id
+def _attach_health_monitor(controller: Controller, node: str, step: SlurmStep) -> None:
+    controller.health_step_ids[node] = step.step_id
+    controller.health_monitor_errors.pop(node, None)
     current_status = controller.state["gpu_health"].get("monitor", {}).get("status", "starting")
     if current_status not in {"running", "degraded"}:
         current_status = "starting"
-    if _set_health_monitor_status(controller, str(current_status), error=None):
+    error = (
+        "; ".join(
+            f"{name}: {message}"
+            for name, message in sorted(controller.health_monitor_errors.items())
+        )
+        or None
+    )
+    if _set_health_monitor_status(controller, str(current_status), error=error):
         _emit_gpu_health(controller, [])
 
 
-def _reconcile_health_process(controller: Controller) -> bool:
+def _reconcile_health_process(controller: Controller, node: str) -> bool:
     """Return true when an existing client is still settling or was handled."""
 
-    process = controller.health_process
+    process = controller.health_processes.get(node)
     if process is None:
         return False
     if process.poll() is not None:
         _health_monitor_error(
             controller,
+            node,
             f"health monitor srun exited with status {process.returncode}",
         )
         return True
-    if controller.slurm_snapshot_at <= controller.health_launch_snapshot_at:
+    if controller.slurm_snapshot_at <= controller.health_launch_snapshot_at.get(node, 0):
         return True
     signal_process(process, signal.SIGTERM)
-    _health_monitor_error(controller, "Slurm no longer reports the health monitor step")
+    _health_monitor_error(controller, node, "Slurm no longer reports the health monitor step")
     return True
 
 
-def _launch_health_monitor(controller: Controller) -> None:
+def _launch_health_monitor(controller: Controller, node: str) -> None:
     health_root = controller.root / "health"
     health_root.mkdir(parents=True, exist_ok=True)
     try:
-        controller.health_process = subprocess.Popen(
+        controller.health_processes[node] = subprocess.Popen(
             build_health_srun_argv(
                 slurm_job_id=controller.slurm_job_id or "",
-                name=controller.health_step_name or "scruffy-health",
+                name=_health_step_name(controller, node),
                 root=controller.root,
-                node_names=[node.name for node in controller.inventory],
+                node_names=[node],
                 gpus_per_node=len(controller.inventory[0].gpu_ids),
                 interval=controller.gpu_health_interval,
                 allocation_incarnation_sha256=(
@@ -1795,9 +1732,10 @@ def _launch_health_monitor(controller: Controller) -> None:
             env=build_srun_environment(),
             start_new_session=True,
         )
-        controller.health_launch_snapshot_at = controller.slurm_snapshot_at
+        controller.health_launch_snapshot_at[node] = controller.slurm_snapshot_at
+        controller.health_monitor_errors.pop(node, None)
     except (OSError, ValueError) as exc:
-        _health_monitor_error(controller, str(exc))
+        _health_monitor_error(controller, node, str(exc))
         return
     if _set_health_monitor_status(controller, "starting"):
         _emit_gpu_health(controller, [])
@@ -1806,39 +1744,41 @@ def _launch_health_monitor(controller: Controller) -> None:
 def _maintain_health_monitor(controller: Controller) -> None:
     if controller.launcher != "slurm" or controller.gpu_health_mode == "off":
         return
-    matches = _health_monitor_matches(controller)
-    if len(matches) > 1:
-        _health_monitor_error(controller, "multiple health monitor steps are live")
-        return
-    if matches:
-        _attach_health_monitor(controller, matches[0])
-        return
-    if _reconcile_health_process(controller):
-        return
-    if (
-        controller.slurm_snapshot_at == 0
-        or controller.slurm_query_error
-        or time.monotonic() < controller.health_retry_at
-    ):
-        return
-    _launch_health_monitor(controller)
+    for inventory_node in controller.inventory:
+        node = inventory_node.name
+        matches = _health_monitor_matches(controller, node)
+        if len(matches) > 1:
+            _health_monitor_error(controller, node, "multiple health monitor steps are live")
+            continue
+        if matches:
+            _attach_health_monitor(controller, node, matches[0])
+            continue
+        if _reconcile_health_process(controller, node):
+            continue
+        if (
+            controller.slurm_snapshot_at == 0
+            or controller.slurm_query_error
+            or time.monotonic() < controller.health_retry_at.get(node, 0)
+        ):
+            continue
+        _launch_health_monitor(controller, node)
 
 
 def _stop_health_monitor(controller: Controller) -> None:
     if controller.launcher != "slurm" or controller.gpu_health_mode == "off":
         return
-    process = controller.health_process
-    if process is not None and process.poll() is None:
-        signal_process(process, signal.SIGTERM)
-    if controller.health_step_id:
+    for process in controller.health_processes.values():
+        if process.poll() is None:
+            signal_process(process, signal.SIGTERM)
+    for step_id in controller.health_step_ids.values():
         try:
-            cancel_step(controller.slurm_job_id or "", controller.health_step_id)
+            cancel_step(controller.slurm_job_id or "", step_id)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             if _set_health_monitor_status(controller, "error", error=str(exc)):
                 _emit_gpu_health(controller, [])
             return
-    controller.health_process = None
-    controller.health_step_id = None
+    controller.health_processes.clear()
+    controller.health_step_ids.clear()
     if _set_health_monitor_status(controller, "stopped"):
         _emit_gpu_health(controller, [])
 
@@ -1849,11 +1789,7 @@ def _drain_for_deadline(controller: Controller) -> None:
     if controller.state.get("draining"):
         return
     allocation = controller.state.get("allocation")
-    drain_at = (
-        allocation.get("automatic_drain_at")
-        if isinstance(allocation, dict)
-        else None
-    )
+    drain_at = allocation.get("automatic_drain_at") if isinstance(allocation, dict) else None
     if not isinstance(drain_at, str):
         return
     try:
@@ -1955,11 +1891,7 @@ def run_controller(
         raise ValueError(f"unknown GPU health mode {gpu_health_mode!r}")
     if gpu_isolation not in GPU_ISOLATION_MODES:
         raise ValueError(f"unknown GPU isolation mode {gpu_isolation!r}")
-    if (
-        poll_interval <= 0
-        or cancel_grace < 0
-        or drain_before_end_seconds < 0
-    ):
+    if poll_interval <= 0 or cancel_grace < 0 or drain_before_end_seconds < 0:
         raise ValueError(
             "poll interval must be positive; grace and drain window must be non-negative"
         )
@@ -1967,13 +1899,10 @@ def run_controller(
         raise ValueError("GPU health interval must be positive")
     if launcher == "local" and len(inventory) != 1:
         raise ValueError("the local launcher requires a one-node inventory")
-    if launcher == "slurm" and (
-        not slurm_job_id or allocation_id != slurm_job_id
-    ):
+    if launcher == "slurm" and (not slurm_job_id or allocation_id != slurm_job_id):
         raise ValueError("the Slurm allocation ID must equal its Slurm job ID")
     if launcher == "slurm" and (
-        allocation_incarnation is None
-        or allocation_incarnation.slurm_job_id != slurm_job_id
+        allocation_incarnation is None or allocation_incarnation.slurm_job_id != slurm_job_id
     ):
         raise ValueError("a matching Slurm allocation incarnation is required")
     if launcher == "local" and allocation_incarnation is not None:

@@ -39,9 +39,7 @@ class OutputNotifier:
             if key in self._queued:
                 return
             self._queued.add(key)
-            self._messages.put(
-                {"kind": "output_ready", "job_id": job_id, "stream": stream}
-            )
+            self._messages.put({"kind": "output_ready", "job_id": job_id, "stream": stream})
 
     def take(self, job_id: str, stream: str) -> tuple[int, int] | None:
         key = (job_id, stream)
@@ -54,9 +52,7 @@ class OutputNotifier:
             chunk_end = min(end, start + MAX_OUTPUT_EVENT_BYTES)
             if chunk_end < end:
                 self._pending[key] = (chunk_end, end)
-                self._messages.put(
-                    {"kind": "output_ready", "job_id": job_id, "stream": stream}
-                )
+                self._messages.put({"kind": "output_ready", "job_id": job_id, "stream": stream})
             else:
                 self._pending.pop(key)
                 self._queued.discard(key)
@@ -113,17 +109,16 @@ class Controller:
     last_slurm_query: float = 0.0
     slurm_query_error: str | None = None
     report_cursor: str | None = None
-    workflow_signatures: (
-        dict[tuple[str, str], tuple[tuple[str, object], ...]] | None
-    ) = None
+    workflow_signatures: dict[tuple[str, str], tuple[tuple[str, object], ...]] | None = None
     gpu_health_mode: str = "off"
     gpu_isolation: str = "node"
     gpu_health_interval: float = 10.0
-    health_process: subprocess.Popen[bytes] | None = None
+    health_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
     health_step_name: str | None = None
-    health_step_id: str | None = None
-    health_launch_snapshot_at: float = 0.0
-    health_retry_at: float = 0.0
+    health_step_ids: dict[str, str] = field(default_factory=dict)
+    health_launch_snapshot_at: dict[str, float] = field(default_factory=dict)
+    health_retry_at: dict[str, float] = field(default_factory=dict)
+    health_monitor_errors: dict[str, str] = field(default_factory=dict)
     health_ingest_errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -159,9 +154,7 @@ def copy_stream(
         )
     finally:
         source.close()
-        messages.put(
-            {"kind": "stream_closed", "job_id": job_id, "stream": stream_name}
-        )
+        messages.put({"kind": "stream_closed", "job_id": job_id, "stream": stream_name})
 
 
 def start_readers(
