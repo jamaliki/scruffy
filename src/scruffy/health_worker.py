@@ -19,7 +19,6 @@ from .storage import atomic_write_json
 
 IDENTITY_FIELDS = (
     "index",
-    "minor_number",
     "uuid",
     "pci.bus_id",
     "serial",
@@ -33,7 +32,6 @@ IDENTITY_FIELDS = (
 )
 IDENTITY_KEYS = (
     "nvidia_index",
-    "minor_number",
     "uuid",
     "pci_bus_id",
     "serial",
@@ -93,6 +91,15 @@ def _active(value: str) -> bool | None:
     return None
 
 
+def _minor_number(index: int) -> int | None:
+    """Return the Linux device minor without relying on NVIDIA query fields."""
+
+    try:
+        return os.minor(os.stat(f"/dev/nvidia{index}").st_rdev)
+    except (OSError, ValueError):
+        return None
+
+
 def _managed_devices(devices: list[dict[str, object]]) -> list[dict[str, object]]:
     visible = os.environ.get("SLURM_STEP_GPUS") or os.environ.get("CUDA_VISIBLE_DEVICES")
     if not visible:
@@ -120,7 +127,6 @@ def query_nvidia_gpus() -> tuple[list[dict[str, object]], str | None]:
         raise RuntimeError("nvidia-smi returned an unexpected identity row")
     numeric: dict[str, type[int | float]] = {
         "nvidia_index": int,
-        "minor_number": int,
         "temperature_c": int,
         "power_draw_w": float,
         "power_limit_w": float,
@@ -133,6 +139,8 @@ def query_nvidia_gpus() -> tuple[list[dict[str, object]], str | None]:
         }
         for row in raw
     ]
+    for device in devices:
+        device["minor_number"] = _minor_number(int(device["nvidia_index"]))
     thermal_error = None
     thermal_rows: list[list[str]] | None = None
     for fields in THERMAL_FIELD_SETS:

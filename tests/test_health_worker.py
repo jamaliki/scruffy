@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
-from scruffy.health_worker import probe_cuda, query_nvidia_gpus
+from scruffy.health_worker import _minor_number, probe_cuda, query_nvidia_gpus
 
 
 class HealthWorkerTests(unittest.TestCase):
+    def test_minor_number_comes_from_the_linux_device(self) -> None:
+        with patch("scruffy.health_worker.os.stat") as stat:
+            stat.return_value.st_rdev = os.makedev(195, 7)
+            self.assertEqual(7, _minor_number(2))
+            stat.assert_called_once_with("/dev/nvidia2")
+
+        with patch("scruffy.health_worker.os.stat", side_effect=FileNotFoundError):
+            self.assertIsNone(_minor_number(2))
+
     def test_nvidia_query_preserves_real_ids_and_thermal_state(self) -> None:
         identity = [
             [
                 "2",
-                "5",
                 "GPU-aaaa",
                 "00000000:17:00.0",
                 "SERIAL-A",
@@ -25,7 +34,10 @@ class HealthWorkerTests(unittest.TestCase):
             ]
         ]
         thermal = [["Active", "Not Active"]]
-        with patch("scruffy.health_worker._run_query", side_effect=[identity, thermal]):
+        with (
+            patch("scruffy.health_worker._run_query", side_effect=[identity, thermal]),
+            patch("scruffy.health_worker._minor_number", return_value=5),
+        ):
             devices, error = query_nvidia_gpus()
 
         self.assertIsNone(error)
@@ -37,7 +49,7 @@ class HealthWorkerTests(unittest.TestCase):
 
     def test_unsupported_thermal_fields_do_not_discard_identity(self) -> None:
         identity = [
-            ["0", "0", "GPU-a", "bus", "serial", "H100", "570", "96", "45", "N/A", "700", "0"]
+            ["0", "GPU-a", "bus", "serial", "H100", "570", "96", "45", "N/A", "700", "0"]
         ]
         with patch(
             "scruffy.health_worker._run_query",
@@ -56,7 +68,6 @@ class HealthWorkerTests(unittest.TestCase):
     def test_slurm_step_gpu_tokens_filter_unmanaged_physical_devices(self) -> None:
         identity = [
             [
-                str(index),
                 str(index),
                 f"GPU-{index}",
                 f"bus-{index}",
