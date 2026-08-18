@@ -22,7 +22,7 @@ from .storage import ConflictError
 try:
     __version__ = version("scruffy-gpu")
 except PackageNotFoundError:  # Running directly from a source checkout.
-    __version__ = "0.1.0"
+    __version__ = "0.1.1"
 
 __all__ = [
     "ConflictError",
