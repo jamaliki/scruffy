@@ -457,9 +457,9 @@ class SlurmReconciliationTests(unittest.TestCase):
     def test_completed_step_reads_the_exact_accounting_row(self) -> None:
         result = mock.Mock(
             stdout=(
-                "240292|RUNNING|0:0\n"
-                "240292.17|FAILED|2:0\n"
-                "240292.17.0|FAILED|2:0\n"
+                "240292|allocation|RUNNING|0:0\n"
+                "240292.17|scruffy-token|FAILED|2:0\n"
+                "240292.17.0|worker|FAILED|2:0\n"
             )
         )
         with mock.patch("scruffy.slurm.subprocess.run", return_value=result) as run:
@@ -468,13 +468,14 @@ class SlurmReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(step)
         self.assertEqual("FAILED", step.state)
         self.assertEqual(2, step.returncode)
+        self.assertEqual("scruffy-token", step.name)
         run.assert_called_once_with(
             [
                 "sacct",
                 "--noheader",
                 "--parsable2",
                 "--jobs=240292.17",
-                "--format=JobIDRaw,State,ExitCode",
+                "--format=JobIDRaw,JobName,State,ExitCode",
             ],
             check=True,
             capture_output=True,

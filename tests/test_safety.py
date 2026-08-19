@@ -2681,6 +2681,97 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
         self.assertEqual("succeeded", job["state"])
         self.assertNotIn("job-a", self.controller.running)
 
+    def test_short_step_authenticates_from_immutable_placement_and_accounting(
+        self,
+    ) -> None:
+        job = job_image("job-short", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-token",
+                "runtime_placement_contract": 1,
+                "runtime_placement_files": [
+                    "jobs/job-short/runtime-placement-0.json"
+                ],
+                "pending_returncode": 0,
+                "stdout": "jobs/job-short/stdout.log",
+                "stderr": "jobs/job-short/stderr.log",
+            }
+        )
+        self.controller.state.update(
+            {
+                "allocation": {"id": "240292", "state": "running"},
+                "jobs": {"job-short": job},
+            }
+        )
+        create_immutable_json(
+            self.controller.root / "jobs/job-short/runtime-placement-0.json",
+            {
+                "schema": 1,
+                "job_id": "job-short",
+                "node": "gpu-3",
+                "requested_gpus": 1,
+                "ledger_gpu_ids": [0],
+                "slurm_job_id": "240292",
+                "slurm_step_id": "17",
+                "slurm_step_gpus": ["5"],
+                "cuda_visible_devices": ["0"],
+                "cuda_device_order": None,
+            },
+        )
+
+        with mock.patch(
+            "scruffy.lifecycle.completed_step",
+            return_value=SlurmStepResult("COMPLETED", 0, "scruffy-token"),
+        ) as accounting:
+            _finish_job(self.controller, "job-short", RunningProcess(None, None), 0)
+
+        accounting.assert_called_once_with("240292.17")
+        self.assertEqual("succeeded", job["state"])
+        self.assertEqual("authenticated", job["runtime_placement_status"])
+        self.assertEqual("240292.17", job["slurm_step_id"])
+        self.assertEqual("COMPLETED", job["slurm_state"])
+
+    def test_short_step_rejects_wrong_accounting_launch_token(self) -> None:
+        job = job_image("job-short", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-token",
+                "runtime_placement_contract": 1,
+                "runtime_placement_files": [
+                    "jobs/job-short/runtime-placement-0.json"
+                ],
+                "pending_returncode": 0,
+                "stdout": "jobs/job-short/stdout.log",
+                "stderr": "jobs/job-short/stderr.log",
+            }
+        )
+        self.controller.state["jobs"] = {"job-short": job}
+        create_immutable_json(
+            self.controller.root / "jobs/job-short/runtime-placement-0.json",
+            {
+                "schema": 1,
+                "job_id": "job-short",
+                "node": "gpu-3",
+                "requested_gpus": 1,
+                "ledger_gpu_ids": [0],
+                "slurm_job_id": "240292",
+                "slurm_step_id": "17",
+                "slurm_step_gpus": ["5"],
+                "cuda_visible_devices": ["0"],
+                "cuda_device_order": None,
+            },
+        )
+
+        with mock.patch(
+            "scruffy.lifecycle.completed_step",
+            return_value=SlurmStepResult("COMPLETED", 0, "different-token"),
+        ):
+            _finish_job(self.controller, "job-short", RunningProcess(None, None), 0)
+
+        self.assertEqual("failed", job["state"])
+        self.assertEqual("runtime_placement_invalid", job["reason"])
+        self.assertIn("wrong launch token", job["runtime_placement_error"])
+
     def test_legacy_reattached_rc0_and_rc1_keep_process_results(self) -> None:
         for returncode, expected_state in ((0, "succeeded"), (1, "failed")):
             with self.subTest(returncode=returncode):

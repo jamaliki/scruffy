@@ -140,8 +140,37 @@ def _runtime_placement_authority(
         raise ValueError("runtime placement file registry has the wrong size")
     outer_job_id = controller.slurm_job_id or ""
     live_step_id = job.get("slurm_step_id")
-    if not outer_job_id or not isinstance(live_step_id, str):
-        raise ValueError("runtime placement has no reconciled Slurm step")
+    if not outer_job_id:
+        raise ValueError("runtime placement has no outer Slurm job")
+    if not isinstance(live_step_id, str):
+        candidate_steps = set()
+        for relative in relative_files:
+            document, _digest = read_immutable_json(controller.root / relative)
+            if not isinstance(document, Mapping):
+                raise ValueError("runtime placement record is not an object")
+            record_step = document.get("slurm_step_id")
+            if not isinstance(record_step, str) or not record_step:
+                raise ValueError("runtime placement has no Slurm step")
+            candidate_steps.add(
+                record_step
+                if record_step.startswith(f"{outer_job_id}.")
+                else f"{outer_job_id}.{record_step}"
+            )
+        if len(candidate_steps) != 1:
+            raise ValueError("runtime placement records disagree on Slurm step")
+        candidate_step = candidate_steps.pop()
+        accounted = completed_step(candidate_step)
+        if accounted is None:
+            raise ValueError("runtime placement step is absent from Slurm accounting")
+        if accounted.name != job.get("launch_token"):
+            raise ValueError("runtime placement step has the wrong launch token")
+        pending_returncode = job.get("pending_returncode")
+        if type(pending_returncode) is not int or accounted.returncode != pending_returncode:
+            raise ValueError("runtime placement step has a different return code")
+        live_step_id = candidate_step
+        job["slurm_step_id"] = live_step_id
+        job["slurm_state"] = accounted.state
+        emit(controller, "job.step_attached", job=job)
     result = []
     for index, reservation in enumerate(assignment.reservations):
         relative = f"jobs/{job['id']}/runtime-placement-{index}.json"

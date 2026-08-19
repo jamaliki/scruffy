@@ -67,6 +67,7 @@ class SlurmStep:
 class SlurmStepResult:
     state: str
     returncode: int
+    name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,7 +577,7 @@ def completed_step(step_id: str) -> SlurmStepResult | None:
             "--noheader",
             "--parsable2",
             f"--jobs={step_id}",
-            "--format=JobIDRaw,State,ExitCode",
+            "--format=JobIDRaw,JobName,State,ExitCode",
         ],
         check=True,
         capture_output=True,
@@ -586,6 +587,9 @@ def completed_step(step_id: str) -> SlurmStepResult | None:
     for line in result.stdout.splitlines():
         job_id, separator, remainder = line.partition("|")
         if not separator or job_id != step_id:
+            continue
+        name, separator, remainder = remainder.partition("|")
+        if not separator:
             continue
         state, separator, encoded_exit = remainder.partition("|")
         if not separator or state.split(maxsplit=1)[0] in {
@@ -608,6 +612,7 @@ def completed_step(step_id: str) -> SlurmStepResult | None:
         return SlurmStepResult(
             state=state,
             returncode=-signal_value if signal_value else int(code),
+            name=name,
         )
     return None
 
