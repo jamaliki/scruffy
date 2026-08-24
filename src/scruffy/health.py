@@ -304,6 +304,85 @@ def set_quarantine(
     }
 
 
+def _reprobe_evidence(
+    device: Mapping[str, object],
+    *,
+    now: datetime,
+    stale_seconds: float,
+) -> tuple[str, int]:
+    sample_at = device.get("last_sample_at")
+    if not isinstance(sample_at, str):
+        raise HealthError("GPU has no health sample to revalidate")
+    if _sample_is_stale(sample_at, now, stale_seconds):
+        raise HealthError("GPU health sample is stale")
+    reasons = device.get("last_reasons")
+    if isinstance(reasons, list) and reasons:
+        raise HealthError(f"latest GPU health sample is not clean: {reasons!r}")
+    if reasons is not None and not isinstance(reasons, list):
+        raise HealthError("GPU health sample has invalid reasons")
+    good_samples = device.get("good_samples")
+    if type(good_samples) is not int or good_samples < 1:
+        raise HealthError("GPU has no successful health sample to revalidate")
+    return sample_at, good_samples
+
+
+def reprobe_quarantine(
+    health: dict[str, Any],
+    *,
+    node: str,
+    uuid: str,
+    at: str,
+    now: datetime | None = None,
+    stale_seconds: float = DEFAULT_SAMPLE_STALE_SECONDS,
+) -> dict[str, Any]:
+    """Release an automatic quarantine after a recent clean monitor sample.
+
+    The node-local monitor already performs the CUDA and telemetry probe on a
+    fixed interval. Re-probing therefore means accepting its latest evidence,
+    rather than launching a second overlapping GPU probe from the controller.
+    Explicit operator quarantines remain sticky and require ``set_quarantine``
+    with ``quarantined=False``.
+    """
+
+    if stale_seconds <= 0:
+        raise HealthError("stale_seconds must be positive")
+    node_state = health.get("nodes", {}).get(node)
+    device = node_state.get("devices", {}).get(uuid) if isinstance(node_state, dict) else None
+    if not isinstance(device, dict):
+        raise HealthError(f"unknown GPU {uuid!r} on node {node!r}")
+    if device.get("status") != "quarantined":
+        raise HealthError(f"GPU {uuid!r} on node {node!r} is not quarantined")
+    if device.get("quarantine_source") != "automatic":
+        raise HealthError("GPU quarantine is operator-owned; use gpu-clear to override it")
+    current = now or _timestamp_value(_parse_timestamp(at))
+    sample_at, good_samples = _reprobe_evidence(
+        device,
+        now=current,
+        stale_seconds=stale_seconds,
+    )
+
+    previous = str(device.get("status"))
+    device["status"] = "healthy"
+    device["quarantined_at"] = None
+    device["quarantine_reason"] = None
+    device["quarantine_source"] = None
+    device["bad_samples"] = 0
+    device["last_reasons"] = []
+    return {
+        "node": node,
+        "uuid": uuid,
+        "slot": device.get("slot"),
+        "from": previous,
+        "to": device["status"],
+        "reasons": [],
+        "at": at,
+        "evidence": {
+            "sample_at": sample_at,
+            "good_samples": good_samples,
+        },
+    }
+
+
 def unavailable_gpu_ids(
     health: Mapping[str, object],
     inventory: Sequence[NodeInventory],
@@ -371,6 +450,7 @@ __all__ = [
     "empty_health_state",
     "ensure_health_state",
     "ingest_health_sample",
+    "reprobe_quarantine",
     "set_quarantine",
     "unavailable_gpu_ids",
 ]

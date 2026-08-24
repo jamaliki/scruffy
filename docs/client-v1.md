@@ -31,6 +31,7 @@ include the effects of returned events.
 | Resume after recovery | `scruffy resume` | `resume_queue(root)` |
 | Quarantine a GPU | `scruffy gpu-quarantine NODE UUID` | `quarantine_gpu(...)` |
 | Clear GPU quarantine | `scruffy gpu-clear NODE UUID` | `clear_gpu_quarantine(...)` |
+| Re-probe automatic GPU quarantine | `scruffy gpu-reprobe NODE UUID` | `reprobe_gpu(...)` |
 
 All operations use `--root ROOT` or `SCRUFFY_ROOT`. Every participant must see
 that directory at the same absolute path. CLI commands emit JSON except `logs`
@@ -292,8 +293,9 @@ assignment until launcher exit, output closure, and Slurm reconciliation prove
 release safe. Cancelling any terminal job, including an archived one, produces
 `job.cancel_ignored` rather than `command.rejected`.
 
-`quarantine_gpu` and `clear_gpu_quarantine` use the same immutable command
-inbox. Their correlated outcome is `resource.gpu_health_changed`; an unknown
+`quarantine_gpu`, `clear_gpu_quarantine`, and `reprobe_gpu` use the same
+immutable command inbox. Their correlated outcome is
+`resource.gpu_health_changed`; an unknown
 `(node, uuid)` produces `command.rejected`. Automatic quarantine requires three
 consecutive CUDA, thermal-slowdown, or uncorrectable-ECC failures and never
 clears itself after later good samples. A failed NVIDIA query produces no valid
@@ -302,6 +304,10 @@ the node from new GPU work.
 The default `observe` mode records and displays automatic health state without
 withholding capacity. An explicit operator quarantine always withholds the node
 until `gpu-clear`, regardless of monitor mode.
+`gpu-reprobe` uses the controller's latest clean, non-stale monitor sample to
+release an automatic quarantine and emits the same correlated health event. It
+rejects stale or failing evidence and never overrides an operator-owned
+quarantine; use `gpu-clear` for that explicit override.
 
 Drain disables new launches for the current allocation. Running jobs continue,
 queued jobs remain durable, and controller restarts preserve the drain. A

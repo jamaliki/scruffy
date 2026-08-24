@@ -21,6 +21,7 @@ from scruffy.mcp_server import (
 from scruffy.storage import (
     TransientStorageError,
     append_event,
+    list_commands,
     list_requests,
     load_state,
     open_journal,
@@ -680,6 +681,18 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.job_id = "job-mcp"
         _commit(self.root, [], jobs={self.job_id: _job(self.job_id)})
 
+    async def test_reprobe_gpu_submits_an_operational_command(self) -> None:
+        result = await dispatch_tool(
+            self.root,
+            "reprobe_gpu",
+            {"node": "gpu-0", "uuid": "GPU-aaaa"},
+        )
+
+        self.assertEqual("gpu_reprobe_requested", result["state"])
+        commands = list_commands(self.root)
+        self.assertEqual(1, len(commands))
+        self.assertEqual("gpu.reprobe", commands[0][1]["kind"])
+
     @staticmethod
     def structured(result) -> dict:
         if result.structuredContent is not None:
@@ -717,6 +730,7 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                     "resources",
                     "gpus",
                     "inspect_gpu",
+                    "reprobe_gpu",
                     "list_jobs",
                     "inspect_job",
                     "tail_job_output",
@@ -845,6 +859,7 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                     "resources",
                     "gpus",
                     "inspect_gpu",
+                    "reprobe_gpu",
                     "list_jobs",
                     "inspect_job",
                     "tail_job_output",

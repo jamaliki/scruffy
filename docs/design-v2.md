@@ -114,6 +114,8 @@ Read interfaces project the same authoritative state for different costs:
   never raw argv or environment values.
 - `gpus` and `inspect_gpu` expose physical identity, health evidence, scheduler
   withholding, and a Scientific Computing report without mutation.
+- `reprobe_gpu` is the guarded operational exception: it releases only an
+  automatic quarantine backed by recent clean controller evidence.
 - `tail_job_output` reads one job-owned stream with a hard 64 KiB bound.
 - `wait_job` composes the event cursor, terminal inspection, and optional stderr
   tail without adding controller state.

@@ -180,13 +180,15 @@ The default is `observe`: automatic failures become visible without changing
 placement. An explicit `gpu-quarantine` always withholds the node.
 In `enforce`, three consecutive bad samples make the affected UUID's
 quarantine sticky; missing or older-than-45-second samples fail closed. An
-operator must explicitly clear a quarantine after investigating it:
+operator can revalidate an automatic quarantine against the latest clean
+sample, or explicitly clear it after investigating:
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" gpus
 scruffy --root "$SCRUFFY_ROOT" gpu gpu-3 5
 scruffy --root "$SCRUFFY_ROOT" gpu-quarantine gpu-3 GPU-... \
   --reason "Scientific Computing ticket SC-1234"
+scruffy --root "$SCRUFFY_ROOT" gpu-reprobe gpu-3 GPU-...
 scruffy --root "$SCRUFFY_ROOT" gpu-clear gpu-3 GPU-...
 ```
 
@@ -393,6 +395,8 @@ Every server exposes focused monitoring tools:
 - `gpus()` returns every physical GPU mapping and its scheduler/health state.
 - `inspect_gpu(node, slot)` returns the copy-ready identity, CUDA probe, current
   evidence, quarantine reasons, and monitor policy for one Scruffy slot.
+- `reprobe_gpu(node, uuid)` requests asynchronous recovery of an automatic
+  quarantine after the controller validates recent clean health evidence.
 - `list_jobs(state=None, offset=0, limit=50)` returns lightweight job identity,
   name, state, and elapsed time for all jobs or another exact state such as
   `failed` or `succeeded`. Exact workflow, task, request, name-prefix, and

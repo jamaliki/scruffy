@@ -21,6 +21,7 @@ from .health import (
     bind_health_incarnation,
     ensure_health_state,
     ingest_health_sample,
+    reprobe_quarantine,
     set_quarantine,
 )
 from .lifecycle import (
@@ -1262,19 +1263,32 @@ def _ingest_commands(controller: Controller) -> None:
                     "allocation.launches_resumed",
                     data={**data, "cleared_drain": was_draining},
                 )
-        elif kind in {"gpu.quarantine", "gpu.clear"}:
+        elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
             request_id = command.get("request_id")
             try:
-                transition = set_quarantine(
-                    controller.state["gpu_health"],
-                    node=str(command.get("node") or ""),
-                    uuid=str(command.get("uuid") or ""),
-                    quarantined=kind == "gpu.quarantine",
-                    at=utc_now(),
-                    reason=(
-                        str(command["reason"]) if isinstance(command.get("reason"), str) else None
-                    ),
-                )
+                node = str(command.get("node") or "")
+                uuid = str(command.get("uuid") or "")
+                at = utc_now()
+                if kind == "gpu.reprobe":
+                    transition = reprobe_quarantine(
+                        controller.state["gpu_health"],
+                        node=node,
+                        uuid=uuid,
+                        at=at,
+                    )
+                else:
+                    transition = set_quarantine(
+                        controller.state["gpu_health"],
+                        node=node,
+                        uuid=uuid,
+                        quarantined=kind == "gpu.quarantine",
+                        at=at,
+                        reason=(
+                            str(command["reason"])
+                            if isinstance(command.get("reason"), str)
+                            else None
+                        ),
+                    )
             except HealthError as exc:
                 emit(
                     controller,

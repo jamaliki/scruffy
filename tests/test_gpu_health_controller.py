@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from scruffy.client import clear_gpu_quarantine
+from scruffy.client import clear_gpu_quarantine, reprobe_gpu
 from scruffy.controller import (
     _ingest_commands,
     _ingest_gpu_health,
@@ -119,6 +119,56 @@ class GpuHealthControllerTests(unittest.TestCase):
             if event.get("data", {}).get("request_id") == request["request_id"]
         )
         self.assertEqual("resource.gpu_health_changed", outcome["kind"])
+
+    def test_reprobe_accepts_recent_clean_automatic_quarantine(self) -> None:
+        controller = self.local_controller()
+        for offset in range(3):
+            self.write_sample(self.sample(offset, failed=True))
+            _ingest_gpu_health(controller)
+        self.write_sample(self.sample(3, failed=False))
+        _ingest_gpu_health(controller)
+        request = reprobe_gpu(self.root, "gpu-0", "GPU-aaaa")
+
+        with mock.patch(
+            "scruffy.controller.utc_now",
+            return_value=(self.at + timedelta(seconds=4)).isoformat(),
+        ):
+            _ingest_commands(controller)
+
+        device = controller.state["nodes"]["gpu-0"]["gpu_devices"][0]
+        self.assertEqual("healthy", device["status"])
+        outcome = next(
+            event
+            for event in read_events(self.root)
+            if event.get("data", {}).get("request_id") == request["request_id"]
+        )
+        self.assertEqual("resource.gpu_health_changed", outcome["kind"])
+        self.assertEqual("healthy", outcome["data"]["transitions"][0]["to"])
+
+    def test_reprobe_rejects_stale_health_evidence(self) -> None:
+        controller = self.local_controller()
+        for offset in range(3):
+            self.write_sample(self.sample(offset, failed=True))
+            _ingest_gpu_health(controller)
+        self.write_sample(self.sample(3, failed=False))
+        _ingest_gpu_health(controller)
+        request = reprobe_gpu(self.root, "gpu-0", "GPU-aaaa")
+
+        with mock.patch(
+            "scruffy.controller.utc_now",
+            return_value=(self.at + timedelta(seconds=49)).isoformat(),
+        ):
+            _ingest_commands(controller)
+
+        device = controller.state["nodes"]["gpu-0"]["gpu_devices"][0]
+        self.assertEqual("quarantined", device["status"])
+        outcome = next(
+            event
+            for event in read_events(self.root)
+            if event.get("data", {}).get("request_id") == request["request_id"]
+        )
+        self.assertEqual("command.rejected", outcome["kind"])
+        self.assertIn("stale", outcome["data"]["reason"])
 
     def slurm_controller(self):
         incarnation = AllocationIncarnation("123", 0, self.inventory)

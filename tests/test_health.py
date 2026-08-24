@@ -8,6 +8,7 @@ from scruffy.health import (
     bind_health_incarnation,
     empty_health_state,
     ingest_health_sample,
+    reprobe_quarantine,
     set_quarantine,
     unavailable_gpu_ids,
 )
@@ -181,6 +182,76 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual("healthy", transition["to"])
         self.assertEqual({}, unavailable_gpu_ids(health, self.inventory, now=self.at))
+
+    def test_reprobe_releases_automatic_quarantine_after_clean_sample(self) -> None:
+        health = empty_health_state(mode="enforce", isolation="node")
+        for offset in range(3):
+            ingest_health_sample(
+                health,
+                self.inventory,
+                self.sample(cuda_ok=False, at=self.at + timedelta(seconds=offset)),
+            )
+        clean_at = self.at + timedelta(seconds=3)
+        ingest_health_sample(health, self.inventory, self.sample(at=clean_at))
+
+        transitions = [
+            reprobe_quarantine(
+                health,
+                node="gpu-a",
+                uuid=uuid,
+                at=(clean_at + timedelta(seconds=1)).isoformat(),
+                now=clean_at + timedelta(seconds=1),
+            )
+            for uuid in ("GPU-aaaa", "GPU-bbbb")
+        ]
+
+        self.assertTrue(all(item["from"] == "quarantined" for item in transitions))
+        self.assertTrue(all(item["to"] == "healthy" for item in transitions))
+        self.assertTrue(
+            all(
+                item["status"] == "healthy"
+                for item in health["nodes"]["gpu-a"]["devices"].values()
+            )
+        )
+        health["nodes"]["gpu-a"]["last_received_at"] = clean_at.isoformat()
+        self.assertEqual({}, unavailable_gpu_ids(health, self.inventory, now=clean_at))
+
+    def test_reprobe_rejects_stale_or_operator_owned_evidence(self) -> None:
+        health = empty_health_state(mode="enforce", isolation="node")
+        ingest_health_sample(health, self.inventory, self.sample())
+        set_quarantine(
+            health,
+            node="gpu-a",
+            uuid="GPU-aaaa",
+            quarantined=True,
+            at=self.at.isoformat(),
+        )
+        with self.assertRaisesRegex(HealthError, "operator-owned"):
+            reprobe_quarantine(
+                health,
+                node="gpu-a",
+                uuid="GPU-aaaa",
+                at=(self.at + timedelta(seconds=1)).isoformat(),
+                now=self.at + timedelta(seconds=1),
+            )
+
+        health = empty_health_state(mode="enforce", isolation="node")
+        for offset in range(3):
+            ingest_health_sample(
+                health,
+                self.inventory,
+                self.sample(cuda_ok=False, at=self.at + timedelta(seconds=offset)),
+            )
+        clean_at = self.at + timedelta(seconds=3)
+        ingest_health_sample(health, self.inventory, self.sample(at=clean_at))
+        with self.assertRaisesRegex(HealthError, "stale"):
+            reprobe_quarantine(
+                health,
+                node="gpu-a",
+                uuid="GPU-aaaa",
+                at=(clean_at + timedelta(seconds=46)).isoformat(),
+                now=clean_at + timedelta(seconds=46),
+            )
 
     def test_enforcement_fails_closed_when_samples_are_missing_or_stale(self) -> None:
         health = empty_health_state(mode="enforce", isolation="node")

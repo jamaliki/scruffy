@@ -278,6 +278,27 @@ def clear_gpu_quarantine(root: Path, node: str, uuid: str) -> dict[str, Any]:
     }
 
 
+def reprobe_gpu(root: Path, node: str, uuid: str) -> dict[str, Any]:
+    """Asynchronously revalidate and release one automatic GPU quarantine."""
+
+    _validate_gpu_identity(node, uuid)
+    request_id = submit_command(
+        root,
+        {
+            "kind": "gpu.reprobe",
+            "node": node,
+            "uuid": uuid,
+            "submitted_at": utc_now(),
+        },
+    )
+    return {
+        "request_id": request_id,
+        "node": node,
+        "uuid": uuid,
+        "state": "gpu_reprobe_requested",
+    }
+
+
 def _validate_gpu_identity(node: str, uuid: str) -> None:
     if not isinstance(node, str) or not node or node.strip() != node:
         raise ValueError("node must be a non-empty trimmed string")

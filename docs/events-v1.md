@@ -109,7 +109,7 @@ fingerprint and physical `(node, NVIDIA UUID)` identity before accepting it.
 Periodic metric updates remain outside the journal.
 
 The controller emits `resource.gpu_health_changed` only for health status
-transitions and operator quarantine/clear actions. Its `data.transitions`
+transitions and operator quarantine/clear/reprobe actions. Its `data.transitions`
 contains the bounded changes and `data.gpu_health` contains the complete health
 projection required for replay. An operator-command outcome also includes the
 correlated `data.request_id`. Producers cannot publish this event kind or

@@ -21,6 +21,7 @@ from .client import (
     observe,
     publish_event,
     quarantine_gpu,
+    reprobe_gpu,
     resume_queue,
     status,
     submit_job,
@@ -353,6 +354,11 @@ def _gpu_quarantine(arguments: argparse.Namespace) -> int:
 
 def _gpu_clear(arguments: argparse.Namespace) -> int:
     _json(clear_gpu_quarantine(_root(arguments), arguments.node, arguments.uuid))
+    return 0
+
+
+def _gpu_reprobe(arguments: argparse.Namespace) -> int:
+    _json(reprobe_gpu(_root(arguments), arguments.node, arguments.uuid))
     return 0
 
 
@@ -738,6 +744,14 @@ def build_parser() -> argparse.ArgumentParser:
     clear_gpu.add_argument("node")
     clear_gpu.add_argument("uuid")
     clear_gpu.set_defaults(handler=_gpu_clear)
+
+    reprobe = commands.add_parser(
+        "gpu-reprobe",
+        help="revalidate a recent clean sample and release an automatic quarantine",
+    )
+    reprobe.add_argument("node")
+    reprobe.add_argument("uuid")
+    reprobe.set_defaults(handler=_gpu_reprobe)
 
     explain_parser = commands.add_parser(
         "explain",

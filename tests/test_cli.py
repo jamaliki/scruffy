@@ -429,6 +429,31 @@ class OperationalViewsCliTests(unittest.TestCase):
         self.assertEqual(2, payload["nodes"][0]["gpus_total"])
         self.assertNotIn("assignments", str(payload))
 
+    def test_gpu_reprobe_command_submits_node_uuid_request(self) -> None:
+        response = {
+            "request_id": "reprobe-1",
+            "node": "gpu-3",
+            "uuid": "GPU-aaaa",
+            "state": "gpu_reprobe_requested",
+        }
+        with (
+            mock.patch("scruffy.cli.reprobe_gpu", return_value=response) as reprobe,
+            mock.patch("scruffy.cli._json") as print_json,
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "gpu-reprobe",
+                    "gpu-3",
+                    "GPU-aaaa",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        reprobe.assert_called_once_with(self.root, "gpu-3", "GPU-aaaa")
+        print_json.assert_called_once_with(response)
+
 
 class ServeCliTests(unittest.TestCase):
     def setUp(self) -> None:
