@@ -8,6 +8,7 @@ from scruffy.health import (
     bind_health_incarnation,
     empty_health_state,
     ingest_health_sample,
+    nodes_requiring_exact_gpu_binding,
     reprobe_quarantine,
     set_quarantine,
     unavailable_gpu_ids,
@@ -286,6 +287,18 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(
             {"gpu-a": (0,)}, unavailable_gpu_ids(health, self.inventory, now=self.at)
         )
+        self.assertEqual(
+            {"gpu-a"}, nodes_requiring_exact_gpu_binding(health, self.inventory, now=self.at)
+        )
+
+    def test_healthy_gpu_isolation_nodes_do_not_require_exact_binding(self) -> None:
+        health = empty_health_state(mode="observe", isolation="gpu")
+        ingest_health_sample(health, self.inventory, self.sample())
+
+        self.assertEqual(
+            frozenset(),
+            nodes_requiring_exact_gpu_binding(health, self.inventory, now=self.at),
+        )
 
     def test_node_isolation_remains_a_conservative_fallback(self) -> None:
         health = empty_health_state(mode="observe", isolation="node")
@@ -300,6 +313,10 @@ class HealthTests(unittest.TestCase):
 
         self.assertEqual(
             {"gpu-a": (0, 1)}, unavailable_gpu_ids(health, self.inventory, now=self.at)
+        )
+        self.assertEqual(
+            frozenset(),
+            nodes_requiring_exact_gpu_binding(health, self.inventory, now=self.at),
         )
 
     def test_gpu_isolation_falls_back_to_node_when_slot_is_not_mappable(self) -> None:

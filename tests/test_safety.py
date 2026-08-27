@@ -1384,7 +1384,7 @@ class SlurmLaunchTests(unittest.TestCase):
             document["logs"],
         )
 
-    def test_worker_step_gets_exact_admitted_resource_shape(self) -> None:
+    def test_healthy_worker_step_uses_count_based_gpu_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = mock.Mock(
@@ -1410,12 +1410,57 @@ class SlurmLaunchTests(unittest.TestCase):
             )
 
         self.assertIn("--gpus-per-task=1", argv)
-        self.assertIn("--tres-bind=gres/gpu:mask:0x1", argv)
+        self.assertNotIn("--tres-bind=gres/gpu:mask:0x1", argv)
         self.assertNotIn("--gpu-bind=none", argv)
         self.assertIn("--cpus-per-task=14", argv)
         self.assertIn("--mem=128G", argv)
         self.assertNotIn("--overlap", argv)
         self.assertEqual(14, assigned.request.cpus_per_node)
+
+    def test_quarantine_sensitive_worker_step_gets_exact_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = mock.Mock(
+                inventory=(NodeInventory("gpu-3", (0, 1), 112, 1024),),
+                launcher="slurm",
+                slurm_job_id="240292",
+                gpu_isolation="gpu",
+                state={
+                    "gpu_health": {
+                        "mode": "observe",
+                        "isolation": "gpu",
+                        "nodes": {
+                            "gpu-3": {
+                                "devices": {
+                                    "GPU-bad": {
+                                        "status": "quarantined",
+                                        "quarantine_source": "operator",
+                                        "slot": 1,
+                                    }
+                                }
+                            }
+                        },
+                    }
+                },
+            )
+            request = ResourceRequest(1, 1, 14, 128)
+            assigned = Assignment(
+                "job-1",
+                request,
+                (NodeReservation("gpu-3", (0,), 14, 128),),
+            )
+
+            argv, _ = _launch_arguments(
+                controller,
+                {"launch_token": "scruffy-token"},
+                assigned,
+                root / "assignment.json",
+                root / "stdout.log",
+                root / "stderr.log",
+            )
+
+        self.assertIn("--gpus-per-task=1", argv)
+        self.assertIn("--tres-bind=gres/gpu:mask:0x1", argv)
 
     def test_start_job_passes_only_sanitized_environment_to_srun(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

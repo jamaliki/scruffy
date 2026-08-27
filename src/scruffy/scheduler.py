@@ -235,6 +235,7 @@ def choose_assignment(
     unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
     *,
     require_uniform_gpu_ids: bool = False,
+    exact_gpu_nodes: Collection[str] = (),
 ) -> Assignment | None:
     """Choose an atomic best-fit assignment, or return ``None`` if it must wait."""
 
@@ -247,6 +248,7 @@ def choose_assignment(
         _available_resources(inventory, assignments, unavailable_gpu_ids),
         job,
         require_uniform_gpu_ids=require_uniform_gpu_ids,
+        exact_gpu_nodes=exact_gpu_nodes,
     )
     if assignment is None:
         return None
@@ -260,6 +262,7 @@ def _candidate_assignment(
     job: QueuedJob,
     *,
     require_uniform_gpu_ids: bool = False,
+    exact_gpu_nodes: Collection[str] = (),
 ) -> Assignment | None:
     eligible = sorted(
         (node for node in free_nodes if _fits(node, job.request)),
@@ -268,13 +271,30 @@ def _candidate_assignment(
     if len(eligible) < job.request.nodes:
         return None
 
+    exact_nodes = set(exact_gpu_nodes)
+    selected = eligible[: job.request.nodes]
+    common_gpu_ids = None
     if require_uniform_gpu_ids and job.request.gpus_per_node:
         selected, common_gpu_ids = _uniform_gpu_candidate(eligible, job.request)
         if selected is None or common_gpu_ids is None:
             return None
-    else:
-        selected = eligible[: job.request.nodes]
-        common_gpu_ids = None
+    elif job.request.gpus_per_node and exact_nodes:
+        selected_exact_nodes = {
+            node.name for node in selected if node.name in exact_nodes
+        }
+        if selected_exact_nodes:
+            exact_selected, common_gpu_ids = _uniform_gpu_candidate(
+                eligible,
+                job.request,
+                required_nodes=selected_exact_nodes,
+            )
+            if exact_selected is not None and common_gpu_ids is not None:
+                selected = exact_selected
+            else:
+                healthy_only = [node for node in eligible if node.name not in exact_nodes]
+                if len(healthy_only) < job.request.nodes:
+                    return None
+                selected = healthy_only[: job.request.nodes]
     reservations = tuple(
         NodeReservation(
             node=node.name,
@@ -293,7 +313,10 @@ def _candidate_assignment(
 
 
 def _uniform_gpu_candidate(
-    eligible: Sequence[NodeAvailability], request: ResourceRequest
+    eligible: Sequence[NodeAvailability],
+    request: ResourceRequest,
+    *,
+    required_nodes: Collection[str] = (),
 ) -> tuple[list[NodeAvailability] | None, tuple[int, ...] | None]:
     """Find the best nodes sharing one exact GPU slot set.
 
@@ -302,6 +325,9 @@ def _uniform_gpu_candidate(
     common logical slot set when exact per-GPU binding is enabled.
     """
 
+    required = set(required_nodes)
+    if len(required) > request.nodes:
+        return None, None
     candidates: set[tuple[int, ...]] = set()
     for node in eligible:
         candidates.update(combinations(node.gpu_ids, request.gpus_per_node))
@@ -310,9 +336,15 @@ def _uniform_gpu_candidate(
         tuple[tuple[int, int, int, str], ...], tuple[int, ...], list[NodeAvailability]
     ] | None = None
     for gpu_ids in sorted(candidates):
-        selected = [
+        candidates_for_gpu_ids = [
             node for node in eligible if set(gpu_ids).issubset(node.gpu_ids)
-        ][: request.nodes]
+        ]
+        if not required.issubset({node.name for node in candidates_for_gpu_ids}):
+            continue
+        selected = (
+            [node for node in candidates_for_gpu_ids if node.name in required]
+            + [node for node in candidates_for_gpu_ids if node.name not in required]
+        )[: request.nodes]
         if len(selected) < request.nodes:
             continue
         key = (
@@ -334,6 +366,7 @@ def choose_first_fitting_job(
     unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
     *,
     require_uniform_gpu_ids: bool = False,
+    exact_gpu_nodes: Collection[str] = (),
 ) -> tuple[QueuedJob, Assignment] | None:
     """Return the first queued job that currently fits.
 
@@ -360,6 +393,7 @@ def choose_first_fitting_job(
             free_nodes,
             job,
             require_uniform_gpu_ids=require_uniform_gpu_ids,
+            exact_gpu_nodes=exact_gpu_nodes,
         )
         if assignment is not None:
             assert_invariants(inventory, (*assignments, assignment))

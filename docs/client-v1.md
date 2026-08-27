@@ -108,9 +108,10 @@ GPU scheduler states are `free`, `assigned`, `stopped`, `node_held`,
 `health_unknown`, and `quarantined_observed`. `stopped` identifies the
 quarantined UUID. `node_held` means the node is withheld because health evidence
 or the configured placement contract cannot safely isolate one physical GPU.
-With the default `gpu` isolation, healthy peers remain `free` and Slurm workers
-use an explicit physical-GPU mask; `node` isolation is the conservative
-fallback.
+With the default `gpu` isolation, healthy peers remain `free` and their Slurm
+workers use count-based allocation. A job placed on a node with a mappable
+quarantined GPU uses an explicit physical-GPU mask and verifies the physical
+mapping before exec; `node` isolation is the conservative fallback.
 
 Operational job views use scheduler-relevant order: running jobs are newest
 started first, blocked jobs are newest admitted first, and queued jobs are

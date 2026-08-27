@@ -446,6 +446,35 @@ def unavailable_gpu_ids(
     return unavailable
 
 
+def nodes_requiring_exact_gpu_binding(
+    health: Mapping[str, object],
+    inventory: Sequence[NodeInventory],
+    *,
+    now: datetime | None = None,
+    stale_seconds: float = DEFAULT_SAMPLE_STALE_SECONDS,
+) -> frozenset[str]:
+    """Return nodes where a GPU job must verify its physical Slurm mapping.
+
+    Count-based Slurm allocation is safe on healthy nodes.  Exact binding is
+    needed only when ``gpu`` isolation is actively excluding a subset of a
+    node's GPUs for quarantine; a whole-node hold cannot be assigned and an
+    unmappable quarantine is therefore intentionally excluded here.
+    """
+
+    if health.get("isolation") != "gpu":
+        return frozenset()
+    unavailable = unavailable_gpu_ids(
+        health, inventory, now=now, stale_seconds=stale_seconds
+    )
+    capacities = {node.name: set(node.gpu_ids) for node in inventory}
+    return frozenset(
+        node_name
+        for node_name, blocked in unavailable.items()
+        if node_name in capacities
+        and 0 < len(set(blocked)) < len(capacities[node_name])
+    )
+
+
 def _sample_is_stale(value: object, now: datetime, stale_seconds: float) -> bool:
     if not isinstance(value, str):
         return True
@@ -468,6 +497,7 @@ __all__ = [
     "empty_health_state",
     "ensure_health_state",
     "ingest_health_sample",
+    "nodes_requiring_exact_gpu_binding",
     "reprobe_quarantine",
     "set_quarantine",
     "unavailable_gpu_ids",

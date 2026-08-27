@@ -138,6 +138,45 @@ class SchedulerTests(unittest.TestCase):
             [item.gpu_ids for item in assignment.reservations],
         )
 
+    def test_exact_binding_is_scoped_to_selected_quarantine_nodes(self) -> None:
+        active = (
+            self.assignment_for("uses-zero", "gpu-b", (0,)),
+        )
+        job = QueuedJob("quarantine-sensitive", request(nodes=2, gpus=2))
+
+        assignment = choose_assignment(
+            self.inventory,
+            active,
+            job,
+            exact_gpu_nodes={"gpu-a"},
+        )
+
+        self.assertIsNotNone(assignment)
+        assert assignment is not None
+        self.assertEqual({"gpu-a", "gpu-b"}, {item.node for item in assignment.reservations})
+        self.assertEqual(
+            1,
+            len({item.gpu_ids for item in assignment.reservations}),
+        )
+
+    def test_healthy_nodes_keep_count_based_placement_when_exact_nodes_exist(self) -> None:
+        active = (
+            self.assignment_for("fills-a", "gpu-a", tuple(range(8))),
+        )
+        job = QueuedJob("healthy", request(gpus=2))
+
+        assignment = choose_assignment(
+            self.inventory,
+            active,
+            job,
+            exact_gpu_nodes={"gpu-a"},
+        )
+
+        self.assertIsNotNone(assignment)
+        assert assignment is not None
+        self.assertEqual("gpu-b", assignment.reservations[0].node)
+        self.assertEqual((0, 1), assignment.reservations[0].gpu_ids)
+
     def test_multi_node_request_returns_none_without_partial_reservation(self) -> None:
         before: tuple[Assignment, ...] = ()
         job = QueuedJob("too-large", request(nodes=3, gpus=8, cpus=112, memory_gb=1024))
