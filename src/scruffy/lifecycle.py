@@ -399,6 +399,21 @@ def schedule(controller: Controller) -> None:
         and not controller.state.get("launches_paused", False)
     ):
         jobs = controller.state["jobs"]
+        # Slurm chooses the physical GPUs for a new step from the allocation's
+        # currently free devices.  Until reconciliation observes that step, a
+        # second concurrent srun can race it and receive the device Scruffy
+        # reserved for the first job.  Serialize only exact-GPU admission;
+        # reconciled jobs continue running concurrently.
+        if (
+            controller.launcher == "slurm"
+            and controller.gpu_isolation == "gpu"
+            and any(
+                job["state"] == "starting"
+                and ResourceRequest.from_dict(job["request"]).gpus_per_node > 0
+                for job in jobs.values()
+            )
+        ):
+            return
         usage = project_gpu_usage(jobs.values())
         queued_images = sorted(
             (job for job in jobs.values() if job["state"] == "queued"),

@@ -601,7 +601,7 @@ class RecoverySafetyTests(unittest.TestCase):
         write_state(self.root, state)
         controller = _initialize_controller(
             root=self.root,
-            inventory=(NodeInventory("gpu-3", (0,), 2, 2),),
+            inventory=(NodeInventory("gpu-3", (0, 1), 2, 2),),
             launcher="slurm",
             allocation_id="240292",
             slurm_job_id="240292",
@@ -628,11 +628,16 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertEqual(requested["request_id"], resumed["data"]["request_id"])
 
         def mark_started(
-            _controller: Controller, job: dict[str, object], _assignment: Assignment
+            _controller: Controller, job: dict[str, object], assignment: Assignment
         ) -> None:
             job["state"] = "starting"
+            job["assignment"] = assignment.to_dict()
 
         with mock.patch("scruffy.lifecycle.start_job", side_effect=mark_started) as start:
+            schedule(controller)
+            self.assertEqual(1, start.call_count)
+            started = start.call_args.args[1]
+            started["state"] = "running"
             schedule(controller)
         self.assertEqual(2, start.call_count)
 
