@@ -183,7 +183,7 @@ def _serve(arguments: argparse.Namespace) -> int:
         start_paused=arguments.start_paused,
         drain_before_end_seconds=arguments.drain_before_end_seconds,
         gpu_health_mode=arguments.gpu_health,
-        gpu_isolation="node",
+        gpu_isolation=arguments.gpu_isolation,
         gpu_health_interval=arguments.gpu_health_interval,
     )
     return 0
@@ -581,6 +581,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=10,
         help="seconds between CUDA/thermal probes (default: 10)",
+    )
+    serve.add_argument(
+        "--gpu-isolation",
+        choices=("gpu", "node"),
+        default="gpu",
+        help=(
+            "quarantine one GPU when exact Slurm binding is available; use node "
+            "as the conservative fallback (default: gpu)"
+        ),
     )
     serve.set_defaults(handler=_serve)
 

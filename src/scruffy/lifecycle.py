@@ -83,6 +83,7 @@ def _placement_entry(
     requested: int,
     outer_job_id: str,
     live_step_id: str,
+    exact_gpu_binding: bool = False,
 ) -> dict[str, Any]:
     if set(document) != _RUNTIME_PLACEMENT_KEYS:
         raise ValueError("runtime placement record has invalid keys")
@@ -110,6 +111,10 @@ def _placement_entry(
         or not isinstance(record_step, str)
         or not record_step
         or full_step_id != live_step_id
+        or (
+            exact_gpu_binding
+            and set(step_gpus) != {str(gpu_id) for gpu_id in reservation.gpu_ids}
+        )
         or (
             device_order is not None
             and (not isinstance(device_order, str) or not device_order)
@@ -160,6 +165,7 @@ def _runtime_placement_authority(
                 requested=assignment.request.gpus_per_node,
                 outer_job_id=outer_job_id,
                 live_step_id=live_step_id,
+                exact_gpu_binding=job.get("gpu_binding") == "exact",
             )
         )
     return result
@@ -212,6 +218,10 @@ def _launch_arguments(
     stderr_file: Path,
 ) -> tuple[list[str], dict[str, str] | None]:
     if controller.launcher == "slurm":
+        exact_gpu_binding = (
+            getattr(controller, "gpu_isolation", "node") == "gpu"
+            and assignment.request.gpus_per_node > 0
+        )
         return (
             build_srun_argv(
                 slurm_job_id=controller.slurm_job_id or "",
@@ -223,6 +233,11 @@ def _launch_arguments(
                 gpus_per_node=assignment.request.gpus_per_node,
                 cpus_per_node=assignment.request.cpus_per_node,
                 memory_gb_per_node=assignment.request.memory_gb_per_node,
+                gpu_ids_per_node=(
+                    [item.gpu_ids for item in assignment.reservations]
+                    if exact_gpu_binding
+                    else None
+                ),
             ),
             build_srun_environment(),
         )
@@ -252,6 +267,11 @@ def start_job(
             f"jobs/{job['id']}/runtime-placement-{index}.json"
             for index, _ in enumerate(assignment.reservations)
         ]
+        job["gpu_binding"] = (
+            "exact"
+            if controller.gpu_isolation == "gpu" and assignment.request.gpus_per_node > 0
+            else "count"
+        )
 
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
@@ -292,6 +312,7 @@ def start_job(
             ],
             "slurm_managed_gpus": controller.launcher == "slurm",
             "gpus_per_node": assignment.request.gpus_per_node,
+            "gpu_binding": job.get("gpu_binding", "count"),
             # A Slurm worker owns its log descriptors so output survives the
             # controller and its local srun client. Local jobs keep using the
             # controller's pipes and reader threads.
@@ -392,6 +413,9 @@ def schedule(controller: Controller) -> None:
             active_assignments(controller.state),
             queued,
             unavailable_gpu_ids(controller.state.get("gpu_health", {}), controller.inventory),
+            require_uniform_gpu_ids=(
+                controller.launcher == "slurm" and controller.gpu_isolation == "gpu"
+            ),
         )
         if choice is None:
             return

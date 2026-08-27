@@ -273,6 +273,21 @@ class HealthTests(unittest.TestCase):
         self.assertEqual({}, unavailable_gpu_ids(health, self.inventory, now=self.at))
 
     def test_operator_quarantine_withholds_capacity_in_observe_mode(self) -> None:
+        health = empty_health_state(mode="observe", isolation="gpu")
+        ingest_health_sample(health, self.inventory, self.sample())
+        set_quarantine(
+            health,
+            node="gpu-a",
+            uuid="GPU-aaaa",
+            quarantined=True,
+            at=self.at.isoformat(),
+        )
+
+        self.assertEqual(
+            {"gpu-a": (0,)}, unavailable_gpu_ids(health, self.inventory, now=self.at)
+        )
+
+    def test_node_isolation_remains_a_conservative_fallback(self) -> None:
         health = empty_health_state(mode="observe", isolation="node")
         ingest_health_sample(health, self.inventory, self.sample())
         set_quarantine(
@@ -282,6 +297,22 @@ class HealthTests(unittest.TestCase):
             quarantined=True,
             at=self.at.isoformat(),
         )
+
+        self.assertEqual(
+            {"gpu-a": (0, 1)}, unavailable_gpu_ids(health, self.inventory, now=self.at)
+        )
+
+    def test_gpu_isolation_falls_back_to_node_when_slot_is_not_mappable(self) -> None:
+        health = empty_health_state(mode="observe", isolation="gpu")
+        ingest_health_sample(health, self.inventory, self.sample())
+        set_quarantine(
+            health,
+            node="gpu-a",
+            uuid="GPU-aaaa",
+            quarantined=True,
+            at=self.at.isoformat(),
+        )
+        health["nodes"]["gpu-a"]["devices"]["GPU-aaaa"]["slot"] = "unknown"
 
         self.assertEqual(
             {"gpu-a": (0, 1)}, unavailable_gpu_ids(health, self.inventory, now=self.at)

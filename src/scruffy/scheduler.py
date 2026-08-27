@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from itertools import combinations
 from typing import Any
 
 from .models import (
@@ -232,6 +233,8 @@ def choose_assignment(
     assignments: Sequence[Assignment],
     job: QueuedJob,
     unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
+    *,
+    require_uniform_gpu_ids: bool = False,
 ) -> Assignment | None:
     """Choose an atomic best-fit assignment, or return ``None`` if it must wait."""
 
@@ -241,7 +244,9 @@ def choose_assignment(
     if any(active.job_id == job.job_id for active in assignments):
         raise InvariantError(f"job {job.job_id!r} is already assigned")
     assignment = _candidate_assignment(
-        _available_resources(inventory, assignments, unavailable_gpu_ids), job
+        _available_resources(inventory, assignments, unavailable_gpu_ids),
+        job,
+        require_uniform_gpu_ids=require_uniform_gpu_ids,
     )
     if assignment is None:
         return None
@@ -251,7 +256,10 @@ def choose_assignment(
 
 
 def _candidate_assignment(
-    free_nodes: Sequence[NodeAvailability], job: QueuedJob
+    free_nodes: Sequence[NodeAvailability],
+    job: QueuedJob,
+    *,
+    require_uniform_gpu_ids: bool = False,
 ) -> Assignment | None:
     eligible = sorted(
         (node for node in free_nodes if _fits(node, job.request)),
@@ -260,11 +268,21 @@ def _candidate_assignment(
     if len(eligible) < job.request.nodes:
         return None
 
-    selected = eligible[: job.request.nodes]
+    if require_uniform_gpu_ids and job.request.gpus_per_node:
+        selected, common_gpu_ids = _uniform_gpu_candidate(eligible, job.request)
+        if selected is None or common_gpu_ids is None:
+            return None
+    else:
+        selected = eligible[: job.request.nodes]
+        common_gpu_ids = None
     reservations = tuple(
         NodeReservation(
             node=node.name,
-            gpu_ids=node.gpu_ids[: job.request.gpus_per_node],
+            gpu_ids=(
+                common_gpu_ids
+                if common_gpu_ids is not None
+                else node.gpu_ids[: job.request.gpus_per_node]
+            ),
             cpus=job.request.cpus_per_node,
             memory_gb=job.request.memory_gb_per_node,
         )
@@ -274,11 +292,48 @@ def _candidate_assignment(
     return assignment
 
 
+def _uniform_gpu_candidate(
+    eligible: Sequence[NodeAvailability], request: ResourceRequest
+) -> tuple[list[NodeAvailability] | None, tuple[int, ...] | None]:
+    """Find the best nodes sharing one exact GPU slot set.
+
+    Slurm's task-to-GRES mask is node-local and applies the same mask to the
+    lowest task on every node. A rectangular Scruffy job therefore needs one
+    common logical slot set when exact per-GPU binding is enabled.
+    """
+
+    candidates: set[tuple[int, ...]] = set()
+    for node in eligible:
+        candidates.update(combinations(node.gpu_ids, request.gpus_per_node))
+
+    best: tuple[
+        tuple[tuple[int, int, int, str], ...], tuple[int, ...], list[NodeAvailability]
+    ] | None = None
+    for gpu_ids in sorted(candidates):
+        selected = [
+            node for node in eligible if set(gpu_ids).issubset(node.gpu_ids)
+        ][: request.nodes]
+        if len(selected) < request.nodes:
+            continue
+        key = (
+            tuple(_best_fit_key(node, request) for node in selected),
+            gpu_ids,
+            selected,
+        )
+        if best is None or key[:2] < best[:2]:
+            best = key
+    if best is None:
+        return None, None
+    return best[2], best[1]
+
+
 def choose_first_fitting_job(
     inventory: Sequence[NodeInventory],
     assignments: Sequence[Assignment],
     queued_jobs: Sequence[QueuedJob],
     unavailable_gpu_ids: Mapping[str, Collection[int]] | None = None,
+    *,
+    require_uniform_gpu_ids: bool = False,
 ) -> tuple[QueuedJob, Assignment] | None:
     """Return the first queued job that currently fits.
 
@@ -301,7 +356,11 @@ def choose_first_fitting_job(
         inventory, assignments, unavailable_gpu_ids
     )
     for job in queued_jobs:
-        assignment = _candidate_assignment(free_nodes, job)
+        assignment = _candidate_assignment(
+            free_nodes,
+            job,
+            require_uniform_gpu_ids=require_uniform_gpu_ids,
+        )
         if assignment is not None:
             assert_invariants(inventory, (*assignments, assignment))
             return job, assignment

@@ -507,7 +507,7 @@ class ServeCliTests(unittest.TestCase):
             start_paused=True,
             drain_before_end_seconds=120,
             gpu_health_mode="observe",
-            gpu_isolation="node",
+            gpu_isolation="gpu",
             gpu_health_interval=10,
         )
 
@@ -597,7 +597,7 @@ class ServeCliTests(unittest.TestCase):
             start_paused=False,
             drain_before_end_seconds=900,
             gpu_health_mode="observe",
-            gpu_isolation="node",
+            gpu_isolation="gpu",
             gpu_health_interval=10,
         )
 

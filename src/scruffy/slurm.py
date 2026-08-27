@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -400,14 +400,18 @@ def build_srun_argv(
     cpus_per_node: int,
     memory_gb_per_node: int,
     wait_seconds: int = 0,
+    gpu_ids_per_node: Sequence[Sequence[int]] | None = None,
 ) -> list[str]:
     """Build one argv-only Slurm step for a rectangular multi-node job.
 
     Slurm owns the physical resources for every step. Scruffy chooses nodes and
     admission slots, while each worker task requests its exact GPUs, CPUs, and
     memory. Task-scoped GPU requests make Slurm bind a device set to every
-    worker and populate ``CUDA_VISIBLE_DEVICES``. ``--exact`` prevents a
-    partial step from inheriting the remaining outer-allocation resources.
+    worker and populate ``CUDA_VISIBLE_DEVICES``. When ``gpu_ids_per_node`` is
+    supplied, its common slot set is converted to an explicit Slurm GRES mask;
+    the worker validates the resulting physical mapping before exec.
+    ``--exact`` prevents a partial step from inheriting the remaining
+    outer-allocation resources.
     """
 
     if not slurm_job_id:
@@ -415,6 +419,19 @@ def build_srun_argv(
     if type(gpus_per_node) is not int or gpus_per_node < 0:
         raise ValueError("gpus_per_node must be a non-negative integer")
     nodes = len(node_names)
+    if gpu_ids_per_node is not None:
+        per_node = tuple(tuple(ids) for ids in gpu_ids_per_node)
+        if len(per_node) != nodes:
+            raise ValueError("GPU binding must provide one slot set per node")
+        if any(
+            any(type(gpu_id) is not int or gpu_id < 0 for gpu_id in ids)
+            or len(set(ids)) != len(ids)
+            or len(ids) != gpus_per_node
+            for ids in per_node
+        ):
+            raise ValueError("GPU binding does not match the requested GPU count")
+        if per_node and any(ids != per_node[0] for ids in per_node[1:]):
+            raise ValueError("exact GPU binding requires one common slot set per node")
     argv = [
         "srun",
         f"--jobid={slurm_job_id}",
@@ -434,6 +451,9 @@ def build_srun_argv(
         # that task rather than merely reserving node-level GRES: Slurm then
         # owns both exclusivity and the task-visible CUDA device mapping.
         argv.append(f"--gpus-per-task={gpus_per_node}")
+        if gpu_ids_per_node is not None:
+            mask = sum(1 << gpu_id for gpu_id in gpu_ids_per_node[0])
+            argv.append(f"--tres-bind=gres/gpu:mask:0x{mask:x}")
     argv.extend(
         [
             f"--cpus-per-task={cpus_per_node}",

@@ -87,10 +87,13 @@ cannot reuse healthy freshness from the previous physical execution.
 
 The durable key is `(node, NVIDIA UUID)`. Scheduler slot, NVIDIA index, Linux
 minor, and PCI bus ID are reportable mappings, not stable identity. Missing or
-stale evidence fails closed only in enforce mode. Because current job steps ask
-Slurm for GPU counts rather than exact UUIDs, one quarantined GPU withholds its
-entire node from new GPU placement. Existing leases remain owned and are not
-terminated implicitly.
+stale evidence fails closed only in enforce mode. The default `gpu` isolation
+maps a quarantined slot out of the scheduler and launches Slurm workers with an
+explicit GRES mask, so healthy peers remain usable. A multi-node exact step
+uses one common slot set on every node; when that contract cannot be
+represented, Scruffy does not construct the unsafe placement. `node` isolation
+remains available as an explicit conservative fallback. Existing leases remain
+owned and are not terminated implicitly.
 
 ### Workflow attempts
 

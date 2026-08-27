@@ -116,6 +116,28 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertTrue(all(len(item.gpu_ids) == 4 for item in assignment.reservations))
 
+    def test_exact_multinode_placement_uses_one_common_gpu_slot_set(self) -> None:
+        active = (
+            self.assignment_for("fills-b", "gpu-b", (0, 1, 2, 3), cpus=56, memory_gb=512),
+            self.assignment_for("uses-zero", "gpu-a", (0,)),
+            self.assignment_for("uses-one", "gpu-c", (1,)),
+        )
+        job = QueuedJob("exact", request(nodes=2, gpus=2, cpus=14, memory_gb=128))
+
+        assignment = choose_assignment(
+            self.inventory,
+            active,
+            job,
+            require_uniform_gpu_ids=True,
+        )
+
+        self.assertIsNotNone(assignment)
+        assert assignment is not None
+        self.assertEqual(
+            [(2, 3), (2, 3)],
+            [item.gpu_ids for item in assignment.reservations],
+        )
+
     def test_multi_node_request_returns_none_without_partial_reservation(self) -> None:
         before: tuple[Assignment, ...] = ()
         job = QueuedJob("too-large", request(nodes=3, gpus=8, cpus=112, memory_gb=1024))

@@ -111,7 +111,7 @@ class Controller:
     report_cursor: str | None = None
     workflow_signatures: dict[tuple[str, str], tuple[tuple[str, object], ...]] | None = None
     gpu_health_mode: str = "off"
-    gpu_isolation: str = "node"
+    gpu_isolation: str = "gpu"
     gpu_health_interval: float = 10.0
     health_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
     health_step_name: str | None = None

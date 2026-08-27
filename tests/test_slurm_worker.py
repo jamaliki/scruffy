@@ -22,7 +22,12 @@ from scruffy.slurm import (
     live_steps,
     load_inventory,
 )
-from scruffy.worker import current_node, execute_assignment, find_node_assignment
+from scruffy.worker import (
+    _slurm_gpu_environment,
+    current_node,
+    execute_assignment,
+    find_node_assignment,
+)
 
 
 class SlurmArgumentTests(unittest.TestCase):
@@ -40,6 +45,7 @@ class SlurmArgumentTests(unittest.TestCase):
             cpus_per_node=28,
             memory_gb_per_node=256,
             wait_seconds=45,
+            gpu_ids_per_node=[(2, 5), (2, 5)],
         )
 
         self.assertEqual(
@@ -53,6 +59,7 @@ class SlurmArgumentTests(unittest.TestCase):
                 "--ntasks=2",
                 "--ntasks-per-node=1",
                 "--gpus-per-task=2",
+                "--tres-bind=gres/gpu:mask:0x24",
                 "--cpus-per-task=28",
                 "--cpu-bind=none",
                 "--mem=256G",
@@ -100,6 +107,21 @@ class SlurmArgumentTests(unittest.TestCase):
 
         self.assertIn("--wait=0", argv)
         self.assertIn("--wait-for-children", argv)
+
+    def test_exact_gpu_binding_requires_a_common_slot_set(self) -> None:
+        with self.assertRaisesRegex(ValueError, "common slot set"):
+            build_srun_argv(
+                slurm_job_id="240292",
+                name="scruffy-token",
+                assignment_file=Path("assignment.json"),
+                stdout_file=Path("stdout.log"),
+                stderr_file=Path("stderr.log"),
+                node_names=["gpu-3", "gpu-5"],
+                gpus_per_node=2,
+                cpus_per_node=1,
+                memory_gb_per_node=1,
+                gpu_ids_per_node=[(0, 1), (1, 2)],
+            )
 
     def test_partial_step_requests_gpu_tres_without_overlap(self) -> None:
         argv = build_srun_argv(
@@ -732,6 +754,56 @@ class WorkerPlacementTests(unittest.TestCase):
                     execute_assignment(source)
                 second_exec.assert_not_called()
             self.assertEqual(original, placement_file.read_bytes())
+
+    def test_exact_slurm_worker_rejects_a_different_physical_mapping(self) -> None:
+        document = {
+            "job_id": "job-exact",
+            "launcher": "slurm",
+            "allocation_incarnation_sha256": "a" * 64,
+            "runtime_placement_contract": 1,
+            "slurm_job_id": "263105",
+            "gpus_per_node": 2,
+            "gpu_binding": "exact",
+        }
+        placement = {"node": "gpu-5", "gpu_ids": [4, 6]}
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "SLURM_STEP_GPUS": "2,7",
+                "SLURM_JOB_ID": "263105",
+                "SLURM_STEP_ID": "42",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "exact reservation"):
+                _slurm_gpu_environment(document, placement)
+
+    def test_exact_slurm_worker_accepts_the_bound_physical_mapping(self) -> None:
+        document = {
+            "job_id": "job-exact",
+            "launcher": "slurm",
+            "allocation_incarnation_sha256": "a" * 64,
+            "runtime_placement_contract": 1,
+            "slurm_job_id": "263105",
+            "gpus_per_node": 2,
+            "gpu_binding": "exact",
+        }
+        placement = {"node": "gpu-5", "gpu_ids": [4, 6]}
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "SLURM_STEP_GPUS": "4,6",
+                "SLURM_JOB_ID": "263105",
+                "SLURM_STEP_ID": "42",
+            },
+            clear=True,
+        ):
+            protected, record = _slurm_gpu_environment(document, placement)
+
+        self.assertEqual("0,1", protected["CUDA_VISIBLE_DEVICES"])
+        self.assertEqual(["4", "6"], record["slurm_step_gpus"])
 
     def test_cpu_only_slurm_worker_binds_empty_device_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

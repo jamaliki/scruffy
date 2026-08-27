@@ -177,7 +177,9 @@ Every 10 seconds, one task on each node records:
 
 Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
 The default is `observe`: automatic failures become visible without changing
-placement. An explicit `gpu-quarantine` always withholds the node.
+placement. GPU isolation defaults to `gpu`, so an explicit `gpu-quarantine`
+withholds only the selected slot when Slurm can bind it exactly. Use
+`--gpu-isolation=node` for conservative whole-node withholding.
 In `enforce`, three consecutive bad samples make the affected UUID's
 quarantine sticky; missing or older-than-45-second samples fail closed. An
 operator can revalidate an automatic quarantine against the latest clean
@@ -192,13 +194,15 @@ scruffy --root "$SCRUFFY_ROOT" gpu-reprobe gpu-3 GPU-...
 scruffy --root "$SCRUFFY_ROOT" gpu-clear gpu-3 GPU-...
 ```
 
-Current worker steps request GPU counts and Slurm chooses their physical
-devices. Scruffy therefore cannot safely reuse the healthy GPUs on a node while
-guaranteeing exclusion of one physical UUID. Enforced quarantine marks the bad
-GPU `STOPPED`, marks its healthy peers `NODE HELD`, and admits no new GPU job on
-that node. Existing jobs are not killed automatically; their assignment stays
-owned until normal exit or explicit cancellation. Exact healthy-peer reuse
-requires a separately validated Slurm GRES/device-isolation contract.
+GPU worker steps request their ledger-selected physical IDs with an explicit
+Slurm GRES mask, and the worker verifies `SLURM_STEP_GPUS` before executing user
+code. Enforced or operator quarantine therefore marks the bad GPU `STOPPED`
+while healthy peers remain schedulable. Multi-node exact steps use one common
+slot set on every node; if that cannot be represented, Scruffy refuses the
+unsafe placement rather than risk the quarantined GPU. Use
+`--gpu-isolation=node` when whole-node withholding is the required fallback.
+Existing jobs are not killed automatically; their assignment stays owned until
+normal exit or explicit cancellation.
 
 Latest samples are replaceable files under `health/samples/`; only status
 transitions and operator actions enter the durable journal. The dashboard makes

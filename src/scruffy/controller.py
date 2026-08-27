@@ -140,7 +140,7 @@ def _initialize_controller(
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
     gpu_health_mode: str = "observe",
-    gpu_isolation: str = "node",
+    gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
 ) -> Controller:
     state = load_recovered_state(root)
@@ -1893,7 +1893,7 @@ def run_controller(
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
     gpu_health_mode: str = "observe",
-    gpu_isolation: str = "node",
+    gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
 ) -> None:
     """Own a queue until interrupted, retrying transient storage failures."""

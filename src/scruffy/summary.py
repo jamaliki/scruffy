@@ -86,6 +86,7 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "allocation_incarnation_sha256": job.get(
             "allocation_incarnation_sha256"
         ),
+        "gpu_binding": job.get("gpu_binding"),
         "runtime_placement_contract": job.get("runtime_placement_contract"),
         "runtime_placement_files": list(job.get("runtime_placement_files") or []),
         "runtime_placements": list(job.get("runtime_placements") or []),

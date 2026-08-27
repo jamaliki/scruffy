@@ -79,6 +79,9 @@ def _slurm_gpu_environment(
         raise ValueError("gpus_per_node must be a non-negative integer")
     if len(placement["gpu_ids"]) != expected:
         raise ValueError("ledger GPU count differs from the requested Slurm step")
+    binding = document.get("gpu_binding", "count")
+    if binding not in {"count", "exact"}:
+        raise ValueError("unsupported Slurm GPU binding mode")
 
     inherited = os.environ
     visible_raw = inherited.get("CUDA_VISIBLE_DEVICES", "")
@@ -97,6 +100,10 @@ def _slurm_gpu_environment(
         step_gpus = _comma_values(step_raw, "SLURM_STEP_GPUS")
         if len(visible) != expected or len(step_gpus) != expected:
             raise ValueError("Slurm GPU mapping count differs from gpus_per_node")
+        if binding == "exact" and set(step_gpus) != {
+            str(gpu_id) for gpu_id in placement["gpu_ids"]
+        }:
+            raise ValueError("Slurm GPU mapping differs from Scruffy's exact reservation")
 
     step_id = inherited.get("SLURM_STEP_ID") or inherited.get("SLURM_STEPID")
     job_id = inherited.get("SLURM_JOB_ID") or inherited.get("SLURM_JOBID")

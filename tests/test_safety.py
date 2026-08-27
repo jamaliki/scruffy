@@ -1391,6 +1391,7 @@ class SlurmLaunchTests(unittest.TestCase):
                 inventory=(NodeInventory("gpu-3", (0,), 112, 1024),),
                 launcher="slurm",
                 slurm_job_id="240292",
+                gpu_isolation="gpu",
             )
             request = ResourceRequest(1, 1, 14, 128)
             assigned = Assignment(
@@ -1409,6 +1410,7 @@ class SlurmLaunchTests(unittest.TestCase):
             )
 
         self.assertIn("--gpus-per-task=1", argv)
+        self.assertIn("--tres-bind=gres/gpu:mask:0x1", argv)
         self.assertNotIn("--gpu-bind=none", argv)
         self.assertIn("--cpus-per-task=14", argv)
         self.assertIn("--mem=128G", argv)

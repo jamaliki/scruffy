@@ -11,7 +11,7 @@ from ._compat import UTC
 from .models import NodeInventory
 
 HEALTH_MODES = frozenset({"off", "observe", "enforce"})
-GPU_ISOLATION_MODES = frozenset({"node"})
+GPU_ISOLATION_MODES = frozenset({"gpu", "node"})
 DEFAULT_BAD_SAMPLES_TO_QUARANTINE = 3
 DEFAULT_SAMPLE_STALE_SECONDS = 45
 
@@ -422,9 +422,27 @@ def unavailable_gpu_ids(
         }
         if not quarantined:
             continue
-        # Count-based Slurm steps do not guarantee an exact physical UUID.
-        # Withhold the node until that placement contract is strengthened.
-        unavailable[inventory_node.name] = inventory_node.gpu_ids
+        if health.get("isolation") != "gpu":
+            unavailable[inventory_node.name] = inventory_node.gpu_ids
+            continue
+
+        quarantined_slots: set[int] = set()
+        unmappable = False
+        for device in devices:
+            if not isinstance(device, Mapping) or device.get("status") != "quarantined":
+                continue
+            slot = device.get("slot")
+            if type(slot) is not int or slot not in inventory_node.gpu_ids:
+                # A quarantine without a current logical-slot mapping cannot
+                # be safely expressed as a per-GPU Slurm reservation.
+                unmappable = True
+                break
+            quarantined_slots.add(slot)
+        unavailable[inventory_node.name] = (
+            inventory_node.gpu_ids
+            if unmappable
+            else tuple(sorted(quarantined_slots))
+        )
     return unavailable
 
 

@@ -106,8 +106,11 @@ that needs detail.
 
 GPU scheduler states are `free`, `assigned`, `stopped`, `node_held`,
 `health_unknown`, and `quarantined_observed`. `stopped` identifies the
-quarantined UUID. `node_held` means a healthy peer is withheld because current
-count-based Slurm steps cannot exclude one exact physical UUID.
+quarantined UUID. `node_held` means the node is withheld because health evidence
+or the configured placement contract cannot safely isolate one physical GPU.
+With the default `gpu` isolation, healthy peers remain `free` and Slurm workers
+use an explicit physical-GPU mask; `node` isolation is the conservative
+fallback.
 
 Operational job views use scheduler-relevant order: running jobs are newest
 started first, blocked jobs are newest admitted first, and queued jobs are
@@ -302,8 +305,12 @@ clears itself after later good samples. A failed NVIDIA query produces no valid
 sample; in `serve --gpu-health enforce`, missing or stale telemetry withholds
 the node from new GPU work.
 The default `observe` mode records and displays automatic health state without
-withholding capacity. An explicit operator quarantine always withholds the node
-until `gpu-clear`, regardless of monitor mode.
+withholding capacity. An explicit operator quarantine withholds only that GPU
+when `--gpu-isolation=gpu` (the default), or the whole node with
+`--gpu-isolation=node`, until `gpu-clear`, regardless of monitor mode. Exact
+multi-node GPU binding uses one common slot set on every node; if that cannot
+be represented, Scruffy does not guess. Start with `--gpu-isolation=node` when
+whole-node withholding is the required fallback.
 `gpu-reprobe` uses the controller's latest clean, non-stale monitor sample to
 release an automatic quarantine and emits the same correlated health event. It
 rejects stale or failing evidence and never overrides an operator-owned
