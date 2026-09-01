@@ -532,6 +532,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "evacuation": None,
                 "evacuation_requests": {},
                 "evacuation_history": {},
+                "evacuation_cancel_requests": {},
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -641,16 +642,70 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 request_id = data.get("request_id")
                 request = data.get("request")
                 if isinstance(evacuation, dict):
-                    state["evacuation"] = copy.deepcopy(evacuation)
                     evacuation_id = evacuation.get("request_id")
                     if isinstance(evacuation_id, str):
                         state.setdefault("evacuation_history", {})[
                             evacuation_id
                         ] = copy.deepcopy(evacuation)
-                if isinstance(request_id, str) and isinstance(request, dict):
-                    state.setdefault("evacuation_requests", {})[request_id] = copy.deepcopy(
-                        request
-                    )
+                        # Cancellation events correlate by their separate
+                        # command ID, while the operation remains keyed by
+                        # its original evacuation ID.
+                        if event.get("kind") in {
+                            "evacuation.cancelled",
+                            "evacuation.cancel_replayed",
+                        }:
+                            operation_id = data.get("evacuation_request_id")
+                            if operation_id != evacuation_id:
+                                operation_id = evacuation_id
+                            current = state.get("evacuation")
+                            if (
+                                not isinstance(current, dict)
+                                or current.get("request_id") == operation_id
+                            ):
+                                state["evacuation"] = copy.deepcopy(evacuation)
+                            if isinstance(request, dict):
+                                state.setdefault("evacuation_requests", {})[
+                                    operation_id
+                                ] = copy.deepcopy(request)
+                            cancel_request_id = data.get("cancel_request_id", request_id)
+                            cancel_request = data.get("cancel_request")
+                            if (
+                                isinstance(cancel_request_id, str)
+                                and isinstance(cancel_request, dict)
+                            ):
+                                state.setdefault("evacuation_cancel_requests", {})[
+                                    cancel_request_id
+                                ] = copy.deepcopy(cancel_request)
+                            if (
+                                data.get("cleared_drain") is True
+                                and (
+                                    not isinstance(current, dict)
+                                    or current.get("request_id") == operation_id
+                                )
+                            ):
+                                state["draining"] = False
+                                state["drain_requested"] = False
+                                if isinstance(state.get("allocation"), dict):
+                                    state["allocation"]["state"] = "running"
+                        else:
+                            state["evacuation"] = copy.deepcopy(evacuation)
+                            if isinstance(request_id, str) and isinstance(request, dict):
+                                state.setdefault("evacuation_requests", {})[request_id] = copy.deepcopy(
+                                    request
+                                )
+                            if event.get("kind") == "evacuation.requested":
+                                state["draining"] = True
+                                state["drain_requested"] = True
+                                if isinstance(state.get("allocation"), dict):
+                                    state["allocation"]["state"] = "draining"
+                            elif (
+                                event.get("kind") == "evacuation.complete"
+                                and evacuation.get("resume_after") is True
+                            ):
+                                state["draining"] = False
+                                state["drain_requested"] = False
+                                if isinstance(state.get("allocation"), dict):
+                                    state["allocation"]["state"] = "running"
         state["last_seq"] = max(int(state.get("last_seq", 0)), int(event["seq"]))
     state["journal_offset"] = journal_offset
     state.setdefault("report_acks", {})
@@ -673,4 +728,5 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     state.setdefault("evacuation", None)
     state.setdefault("evacuation_requests", {})
     state.setdefault("evacuation_history", {})
+    state.setdefault("evacuation_cancel_requests", {})
     return state

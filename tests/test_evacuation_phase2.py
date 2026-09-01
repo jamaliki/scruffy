@@ -14,6 +14,7 @@ from typing import Any
 from unittest import mock
 
 from scruffy.client import (
+    cancel_evacuation,
     publish_event,
     request_evacuation,
     status,
@@ -366,6 +367,143 @@ class EvacuationPhase2Tests(unittest.TestCase):
                         timeout=0.1,
                     )
                     self.assertTrue(acknowledged[0])
+            finally:
+                controller.journal.close()
+
+    def test_cancel_armed_evacuation_is_terminal_without_signalling_or_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("node", (0,), 4, 8),),
+                launcher="local",
+                allocation_id="local",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+                gpu_health_mode="off",
+            )
+            try:
+                _begin_evacuation(
+                    controller,
+                    {
+                        "request_id": "armed-cancel",
+                        "scope": {"project_id": "project-a", "workflow_id": "flow"},
+                        "resume_after": False,
+                        "trigger": {"task_id": "producer", "artifact_id": "missing"},
+                    },
+                )
+                response = cancel_evacuation(
+                    root, "armed-cancel", cancel_request_id="cancel-armed"
+                )
+                self.assertEqual("cancel-armed", response["request_id"])
+                with mock.patch("scruffy.controller.signal_process") as signal_process:
+                    _ingest_commands(controller)
+                    _advance_evacuation(controller)
+                self.assertEqual("cancelled", controller.state["evacuation"]["state"])
+                self.assertFalse(controller.state["draining"])
+                self.assertEqual({}, controller.state["evacuation"]["targets"])
+                signal_process.assert_not_called()
+                self.assertEqual(
+                    "evacuation.cancelled",
+                    [event for event in read_events(root) if event["kind"] == "evacuation.cancelled"][-1]["kind"],
+                )
+            finally:
+                controller.journal.close()
+
+    def test_cancel_active_preserves_drain_by_default_and_resume_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("node", (0,), 4, 8),),
+                launcher="local",
+                allocation_id="local",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+                gpu_health_mode="off",
+            )
+            try:
+                running_job = {"id": "running-target", "state": "running"}
+                controller.state["jobs"][running_job["id"]] = running_job
+                controller.running[running_job["id"]] = RunningProcess(
+                    mock.Mock(pid=100), "running-token"
+                )
+                original_job = dict(running_job)
+                _begin_evacuation(
+                    controller,
+                    {"request_id": "active-cancel", "scope": {}, "resume_after": False},
+                )
+                cancel_evacuation(root, "active-cancel", cancel_request_id="cancel-preserve")
+                with mock.patch("scruffy.controller.signal_process") as signal_process:
+                    _ingest_commands(controller)
+                    _advance_evacuation(controller)
+                self.assertTrue(controller.state["draining"])
+                signal_process.assert_not_called()
+                self.assertEqual("cancelled", controller.state["evacuation"]["state"])
+                self.assertEqual(original_job, controller.state["jobs"][running_job["id"]])
+
+                _begin_evacuation(
+                    controller,
+                    {"request_id": "active-resume", "scope": {}, "resume_after": False},
+                )
+                cancel_evacuation(
+                    root,
+                    "active-resume",
+                    cancel_request_id="cancel-resume",
+                    resume=True,
+                )
+                _ingest_commands(controller)
+                self.assertFalse(controller.state["draining"])
+                self.assertTrue(
+                    any(
+                        event["kind"] == "evacuation.cancelled"
+                        and event["data"]["cleared_drain"]
+                        for event in read_events(root)
+                    )
+                )
+            finally:
+                controller.journal.close()
+
+    def test_cancel_unknown_and_terminal_evacuation_fail_closed_and_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("node", (0,), 4, 8),),
+                launcher="local",
+                allocation_id="local",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+                gpu_health_mode="off",
+            )
+            try:
+                cancel_evacuation(root, "does-not-exist", cancel_request_id="cancel-unknown")
+                _ingest_commands(controller)
+                rejected = [
+                    event
+                    for event in read_events(root)
+                    if event["kind"] == "command.rejected"
+                ][-1]
+                self.assertEqual("cancel-unknown", rejected["data"]["request_id"])
+                _begin_evacuation(
+                    controller,
+                    {"request_id": "terminal-cancel", "scope": {}, "resume_after": False},
+                )
+                _advance_evacuation(controller)
+                self.assertEqual("complete", controller.state["evacuation"]["state"])
+                cancel_evacuation(root, "terminal-cancel", cancel_request_id="cancel-terminal")
+                _ingest_commands(controller)
+                self.assertEqual("complete", controller.state["evacuation"]["state"])
+                self.assertTrue(
+                    any(
+                        event["kind"] == "evacuation.cancel_replayed"
+                        and event["data"]["evacuation_request_id"] == "terminal-cancel"
+                        for event in read_events(root)
+                    )
+                )
             finally:
                 controller.journal.close()
     def test_slurm_signal_accepts_only_numeric_worker_steps(self) -> None:

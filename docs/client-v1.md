@@ -30,6 +30,7 @@ include the effects of returned events.
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
 | Resume after recovery | `scruffy resume` | `resume_queue(root)` |
 | Evacuate selected jobs | `scruffy evacuate ...` | `request_evacuation(root, ...)` |
+| Cancel an evacuation | `scruffy evacuate-cancel --request-id ID --cancel-request-id ID` | `cancel_evacuation(root, ...)` |
 | Quarantine a GPU | `scruffy gpu-quarantine NODE UUID` | `quarantine_gpu(...)` |
 | Clear GPU quarantine | `scruffy gpu-clear NODE UUID` | `clear_gpu_quarantine(...)` |
 | Re-probe automatic GPU quarantine | `scruffy gpu-reprobe NODE UUID` | `reprobe_gpu(...)` |
@@ -176,8 +177,22 @@ jobs use the owned process group; Slurm jobs use the exact numeric worker step,
 never the outer allocation or a stale PID. Each target is signalled at most
 once, with an immutable receipt closing the signal/crash window.
 
-The operation state is `requested`, `signalling`, `waiting`, `complete`, or
-`partial`. Target outcomes are `completed`, `checkpointed`, `retry_queued`,
+An in-progress operation can be cancelled with:
+
+```text
+scruffy --root ROOT evacuate-cancel --request-id ORIGINAL_ID \
+  --cancel-request-id STABLE_ID [--resume]
+```
+
+Cancellation is durable and idempotent by `STABLE_ID`. It transitions the
+operation to `cancelled` without signalling, changing, or fabricating anything
+for its target jobs. Drain state is preserved by default; `--resume` clears an
+existing evacuation drain explicitly. Cancelling a completed or partial
+operation replays its immutable terminal history rather than changing it.
+
+The operation state is `requested`, `signalling`, `waiting`, `complete`,
+`partial`, or `cancelled`. Target outcomes are `completed`, `checkpointed`,
+`retry_queued`,
 `not_restartable`, `timed_out`, and `lost`. A policy-enabled job that publishes
 a strict checkpoint after the request and exits 75 becomes `failed` with
 `reason=evacuated`; the controller admits at most one deterministic successor

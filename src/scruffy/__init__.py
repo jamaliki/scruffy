@@ -3,6 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from .client import (
+    cancel_evacuation,
     cancel_job,
     drain_queue,
     explain,
@@ -30,6 +31,7 @@ __all__ = [
     "ResourceRequest",
     "__version__",
     "cancel_job",
+    "cancel_evacuation",
     "drain_queue",
     "explain",
     "observe",

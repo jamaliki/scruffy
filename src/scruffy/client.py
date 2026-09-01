@@ -363,6 +363,51 @@ def request_evacuation(
     }
 
 
+def cancel_evacuation(
+    root: Path,
+    request_id: str,
+    *,
+    cancel_request_id: str | None = None,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Durably cancel one known evacuation without touching its jobs."""
+
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or "/" in request_id
+        or len(request_id) > 200
+    ):
+        raise ValueError("request_id must be a non-empty path-safe string")
+    if cancel_request_id is None:
+        cancel_request_id = f"evacuate-cancel-{uuid.uuid4().hex}"
+    if (
+        not isinstance(cancel_request_id, str)
+        or not cancel_request_id.strip()
+        or "/" in cancel_request_id
+        or len(cancel_request_id) > 200
+    ):
+        raise ValueError("cancel_request_id must be a non-empty path-safe string")
+    if not isinstance(resume, bool):
+        raise TypeError("resume must be a boolean")
+    submit_command(
+        root,
+        {
+            "kind": "evacuate_cancel",
+            "request_id": cancel_request_id,
+            "evacuation_request_id": request_id,
+            "resume": resume,
+        },
+    )
+    return {
+        "request_id": cancel_request_id,
+        "cancel_request_id": cancel_request_id,
+        "evacuation_request_id": request_id,
+        "state": "evacuation_cancel_requested",
+        "resume": resume,
+    }
+
+
 def wait_for_evacuation(
     root: Path, request_id: str, *, timeout: float | None = None
 ) -> dict[str, Any]:
@@ -407,12 +452,16 @@ def wait_for_evacuation(
                 else:
                     discovered_deadline = time.monotonic() + 1
                 deadline = discovered_deadline
-            if evacuation.get("state") in {"complete", "partial"}:
+            if evacuation.get("state") in {"complete", "partial", "cancelled"}:
                 return evacuation
         history = snapshot.get("evacuation_history")
         if isinstance(history, dict):
             previous = history.get(request_id)
-            if isinstance(previous, dict) and previous.get("state") in {"complete", "partial"}:
+            if isinstance(previous, dict) and previous.get("state") in {
+                "complete",
+                "partial",
+                "cancelled",
+            }:
                 return previous
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for evacuation {request_id}")

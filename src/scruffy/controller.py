@@ -139,6 +139,8 @@ COMMAND_OUTCOME_KINDS = {
     "evacuation.replayed",
     "evacuation.complete",
     "evacuation.partial",
+    "evacuation.cancelled",
+    "evacuation.cancel_replayed",
 }
 
 EVACUATION_TERMINAL_OUTCOMES = frozenset(
@@ -265,7 +267,7 @@ def _initialize_controller(
         )
         if (
             isinstance(evacuation, dict)
-            and evacuation.get("state") not in {"complete", "partial"}
+            and evacuation.get("state") not in {"complete", "partial", "cancelled"}
             and isinstance(request, dict)
         ):
             for target in evacuation.get("targets", {}).values():
@@ -803,6 +805,147 @@ def _evacuation_emit(
     )
 
 
+def _evacuation_cancel_emit(
+    controller: Controller,
+    evacuation: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    cancel_request_id: str,
+    kind: str,
+    cleared_drain: bool = False,
+    set_current: bool = True,
+    cancel_resume: bool | None = None,
+) -> None:
+    """Record an operator cancellation while retaining both request IDs."""
+
+    evacuation_id = evacuation["request_id"]
+    if set_current:
+        controller.state["evacuation"] = copy.deepcopy(evacuation)
+    controller.state.setdefault("evacuation_requests", {})[evacuation_id] = copy.deepcopy(
+        request
+    )
+    controller.state.setdefault("evacuation_history", {})[evacuation_id] = copy.deepcopy(
+        evacuation
+    )
+    if cancel_resume is None:
+        cancel_resume = bool(evacuation.get("cancel_resume", False))
+    controller.state.setdefault("evacuation_cancel_requests", {})[cancel_request_id] = {
+        "evacuation_request_id": evacuation_id,
+        "resume": cancel_resume,
+    }
+    emit(
+        controller,
+        kind,
+        data={
+            # Command outcomes are correlated by the cancellation command ID.
+            "request_id": cancel_request_id,
+            "cancel_request_id": cancel_request_id,
+            "evacuation_request_id": evacuation_id,
+            "cancel_request": {
+                "evacuation_request_id": evacuation_id,
+                "resume": cancel_resume,
+            },
+            "request": copy.deepcopy(request),
+            "evacuation": copy.deepcopy(evacuation),
+            "cleared_drain": cleared_drain,
+        },
+    )
+
+
+def _clear_evacuation_drain(controller: Controller) -> bool:
+    """Clear an evacuation drain, returning whether one was actually cleared."""
+
+    cleared = bool(controller.state.get("draining"))
+    if cleared:
+        controller.state["draining"] = False
+        controller.state["drain_requested"] = False
+        if isinstance(controller.state.get("allocation"), dict):
+            controller.state["allocation"]["state"] = "running"
+    return cleared
+
+
+def _evacuation_cancel(controller: Controller, command: dict[str, Any]) -> None:
+    """Cancel one known evacuation without touching any target job."""
+
+    cancel_request_id = command.get("request_id")
+    evacuation_id = command.get("evacuation_request_id")
+    if (
+        not isinstance(cancel_request_id, str)
+        or not cancel_request_id
+        or "/" in cancel_request_id
+        or len(cancel_request_id) > 200
+    ):
+        raise ValueError("evacuation cancellation request_id must be path-safe")
+    if (
+        not isinstance(evacuation_id, str)
+        or not evacuation_id
+        or "/" in evacuation_id
+        or len(evacuation_id) > 200
+    ):
+        raise ValueError("evacuation_request_id must be path-safe")
+    resume = command.get("resume", False)
+    if not isinstance(resume, bool):
+        raise TypeError("evacuation cancellation resume must be boolean")
+
+    cancel_identity = {
+        "evacuation_request_id": evacuation_id,
+        "resume": resume,
+    }
+    known_cancel = controller.state.setdefault("evacuation_cancel_requests", {}).get(
+        cancel_request_id
+    )
+    if known_cancel is not None and known_cancel != cancel_identity:
+        raise StorageError(f"conflicting evacuation cancellation request ID {cancel_request_id!r}")
+
+    request = controller.state.setdefault("evacuation_requests", {}).get(evacuation_id)
+    history = controller.state.setdefault("evacuation_history", {}).get(evacuation_id)
+    if not isinstance(request, dict) or not isinstance(history, dict):
+        raise StorageError(f"unknown evacuation request ID {evacuation_id!r}")
+    current = controller.state.get("evacuation")
+    if (
+        isinstance(current, dict)
+        and current.get("request_id") == evacuation_id
+        and current.get("state") not in {"complete", "partial", "cancelled"}
+    ):
+        cancelled = copy.deepcopy(current)
+        cancelled.update(
+            {
+                "state": "cancelled",
+                "cancelled_at": utc_now(),
+                "cancel_request_id": cancel_request_id,
+                "cancel_resume": resume,
+            }
+        )
+        cleared = _clear_evacuation_drain(controller) if resume else False
+        _evacuation_cancel_emit(
+            controller,
+            cancelled,
+            request,
+            cancel_request_id=cancel_request_id,
+            kind="evacuation.cancelled",
+            cleared_drain=cleared,
+        )
+        return
+
+    # A terminal operation is immutable. Replay its exact historical image;
+    # only an explicit --resume may clear a drain left by a partial operation.
+    if history.get("state") in {"complete", "partial", "cancelled"}:
+        _evacuation_cancel_emit(
+            controller,
+            copy.deepcopy(history),
+            request,
+            cancel_request_id=cancel_request_id,
+            kind="evacuation.cancel_replayed",
+            set_current=(
+                not isinstance(current, dict)
+                or current.get("request_id") == evacuation_id
+            ),
+            cancel_resume=resume,
+        )
+        return
+    raise StorageError(f"evacuation request ID {evacuation_id!r} is not cancellable")
+
+
 def _evacuation_targets(
     controller: Controller, request_id: str, scope: dict[str, str], requested_at: str
 ) -> dict[str, dict[str, Any]]:
@@ -947,7 +1090,11 @@ def _begin_evacuation(
             )
         return
     current = controller.state.get("evacuation")
-    if isinstance(current, dict) and current.get("state") not in {"complete", "partial"}:
+    if isinstance(current, dict) and current.get("state") not in {
+        "complete",
+        "partial",
+        "cancelled",
+    }:
         raise StorageError("another evacuation is already in progress")
     scope = request["scope"]
     if "job_id" in scope and scope["job_id"] not in controller.state["jobs"]:
@@ -1195,7 +1342,7 @@ def _advance_evacuation(controller: Controller) -> None:
     evacuation = controller.state.get("evacuation")
     if (
         not isinstance(evacuation, dict)
-        or evacuation.get("state") in {"armed", "complete", "partial"}
+        or evacuation.get("state") in {"armed", "complete", "partial", "cancelled"}
     ):
         return
     request_id = evacuation.get("request_id")
@@ -2387,6 +2534,19 @@ def _ingest_commands(controller: Controller) -> None:
                         "reason": str(exc),
                     },
                 )
+        elif kind in {"evacuate_cancel", "evacuate-cancel"}:
+            try:
+                _evacuation_cancel(controller, command)
+            except (StorageError, TypeError, ValueError) as exc:
+                emit(
+                    controller,
+                    "command.rejected",
+                    data={
+                        "request_id": command.get("request_id"),
+                        "evacuation_request_id": command.get("evacuation_request_id"),
+                        "reason": str(exc),
+                    },
+                )
         elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
             request_id = command.get("request_id")
             try:
@@ -2509,6 +2669,11 @@ def _discard_journaled_commands(controller: Controller) -> None:
             continue
         data = event.get("data")
         request_id = data.get("request_id") if isinstance(data, dict) else None
+        if (
+            event.get("kind") in {"evacuation.cancelled", "evacuation.cancel_replayed"}
+            and isinstance(data, dict)
+        ):
+            request_id = data.get("cancel_request_id", request_id)
         if not isinstance(request_id, str) or not request_id:
             continue
         item = pending.pop(request_id, None)

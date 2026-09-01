@@ -134,6 +134,14 @@ archived. Legacy jobs without a launch token retain the existing queue-root
 write trust boundary. A report never authenticates a different job or workflow
 by naming alone.
 
+Operator evacuation cancellation emits `evacuation.cancelled` with the stable
+cancel command ID in `data.request_id` and the original operation ID in
+`data.evacuation_request_id`. The event carries the resulting `data.evacuation`
+image and canonical `data.cancel_request`. `evacuation.cancel_replayed` reports
+an immutable terminal-history replay. Neither event changes target jobs;
+`data.cleared_drain` is true only when an in-progress cancellation explicitly
+requested resume.
+
 ## Authority
 
 Workload events update `job.workload` in the current snapshot. They cannot

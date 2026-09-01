@@ -14,6 +14,7 @@ from typing import Any
 
 from . import __version__
 from .client import (
+    cancel_evacuation,
     cancel_job,
     clear_gpu_quarantine,
     drain_queue,
@@ -539,6 +540,18 @@ def _evacuate(arguments: argparse.Namespace) -> int:
     return 0 if result.get("state") == "complete" else 1
 
 
+def _evacuate_cancel(arguments: argparse.Namespace) -> int:
+    _json(
+        cancel_evacuation(
+            _root(arguments),
+            arguments.request_id,
+            cancel_request_id=arguments.cancel_request_id,
+            resume=arguments.resume,
+        )
+    )
+    return 0
+
+
 def _dashboard(arguments: argparse.Namespace) -> int:
     run_dashboard(
         str(_root(arguments)),
@@ -939,6 +952,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="clear the drain only when every selected target completes or retries",
     )
     evacuate.set_defaults(handler=_evacuate)
+
+    evacuate_cancel = commands.add_parser(
+        "evacuate-cancel",
+        help="cancel an in-progress evacuation without signalling jobs",
+        description=(
+            "Cancel a known evacuation. Running jobs are left unchanged and "
+            "--resume is required to clear an existing drain."
+        ),
+    )
+    evacuate_cancel.add_argument(
+        "--request-id", required=True, help="original evacuation request ID"
+    )
+    evacuate_cancel.add_argument(
+        "--cancel-request-id", required=True, help="stable cancellation idempotency key"
+    )
+    evacuate_cancel.add_argument(
+        "--resume", action="store_true", help="clear the evacuation drain"
+    )
+    evacuate_cancel.set_defaults(handler=_evacuate_cancel)
 
     dashboard = commands.add_parser(
         "dashboard",
