@@ -114,6 +114,7 @@ def launch_record(
             "workflow_id",
             "task_id",
             "attempt",
+            "launch_token",
         )
         if key in job and job[key] is not None
     }

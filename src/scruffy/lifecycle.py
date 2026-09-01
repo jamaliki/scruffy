@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import queue
 import signal
 import subprocess
@@ -20,7 +22,7 @@ from .models import (
     ResourceRequest,
     job_project,
 )
-from .provenance import write_launch_record, write_result_record
+from .provenance import provenance_files, write_launch_record, write_result_record
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_first_fitting_job, project_gpu_usage, queue_priority_key
 from .slurm import (
@@ -266,16 +268,45 @@ def start_job(
 ) -> None:
     """Persist a reservation before launching, and never clear a live process."""
 
+    launch_file, _ = provenance_files(controller.root, str(job["id"]))
+    prior_launch: dict[str, Any] | None = None
+    if launch_file.exists():
+        prior_launch, _ = read_immutable_json(launch_file)
+        if not isinstance(prior_launch, dict):
+            raise StorageError(f"invalid launch record {launch_file}")
+        if prior_launch.get("assignment") != assignment.to_dict():
+            raise StorageError(f"launch assignment changed before admission {job['id']}")
     job["assignment"] = assignment.to_dict()
     job["state"] = "starting"
-    job["started_at"] = utc_now()
+    prior_job = prior_launch.get("job") if prior_launch else None
+    prior_started_at = prior_launch.get("started_at") if prior_launch else None
+    prior_token = prior_job.get("launch_token") if isinstance(prior_job, dict) else None
+    job["started_at"] = (
+        job.get("started_at")
+        or (prior_started_at if isinstance(prior_started_at, str) else None)
+        or utc_now()
+    )
     job["deadline_at"] = _job_deadline(
         job["started_at"], assignment.request.time_limit_seconds
     )
     if controller.launcher == "slurm":
         if controller.allocation_incarnation is None:
             raise RuntimeError("Slurm controller has no allocation incarnation")
-        job["launch_token"] = new_step_name()
+        identity = json.dumps(
+            {
+                "allocation_id": controller.allocation_id,
+                "attempt": job.get("attempt", 1),
+                "assignment": assignment.to_dict(),
+                "job_id": job["id"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        job["launch_token"] = job.get("launch_token") or prior_token or (
+            "scruffy-" + hashlib.sha256(identity).hexdigest()[:32]
+            if identity
+            else new_step_name()
+        )
         job["allocation_incarnation_sha256"] = (
             controller.allocation_incarnation.fingerprint_sha256
         )

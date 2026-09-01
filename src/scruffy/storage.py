@@ -649,6 +649,7 @@ _ARCHIVED_JOB_FIELDS = (
     "condition_satisfactions",
     "resolved_conditions",
     "artifact_evidence",
+    "artifact_condition_evidence",
     "workflow_invalid",
     "project_id",
 )

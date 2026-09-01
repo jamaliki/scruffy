@@ -77,6 +77,7 @@ from .storage import (
     accept_reports,
     accept_request,
     accept_submission,
+    archive_terminal_job,
     compact_report_receipts,
     controller_lock,
     create_job_id,
@@ -253,7 +254,12 @@ def _initialize_controller(
         # launches remain paused below until an operator audits the old work.
         for job in active:
             job["state"] = "lost"
-            job["finished_at"] = utc_now()
+            job["finished_at"] = (
+                job.get("finished_at")
+                or job.get("started_at")
+                or job.get("submitted_at")
+                or utc_now()
+            )
             job["reason"] = active_lost_reason
             _mark_retry_exhaustion(job, active_lost_reason)
             job["last_assignment"] = job.get("assignment")
@@ -863,6 +869,23 @@ def _artifact_evidence(producer: dict[str, Any]) -> Iterable[dict[str, Any]]:
             "producer_event_id": item.get("producer_event_id"),
             "occurred_at": item.get("occurred_at"),
         }
+    for item in reversed(list(producer.get("artifact_condition_evidence") or [])):
+        if not isinstance(item, dict):
+            continue
+        publication = item.get("publication")
+        if not isinstance(publication, dict):
+            continue
+        try:
+            publication = artifact_publication({"publication": publication})
+        except ValueError:
+            continue
+        if publication is None:
+            continue
+        yield {
+            "publication": publication,
+            "producer_event_id": item.get("producer_event_id"),
+            "occurred_at": item.get("occurred_at"),
+        }
     workload = producer.get("workload")
     artifacts = workload.get("latest_artifacts") if isinstance(workload, dict) else None
     for item in reversed(artifacts if isinstance(artifacts, list) else []):
@@ -959,6 +982,64 @@ def _satisfy_artifact_waiters(
                 durable=False,
                 snapshot=False,
             )
+
+
+def _has_artifact_wait_reference(
+    controller: Controller, producer: dict[str, Any], artifact_id: str
+) -> bool:
+    """Check hot and cold workflow declarations before retaining exact evidence."""
+
+    project_id = job_project(producer)
+    workflow_id = producer.get("workflow_id")
+    task_id = producer.get("task_id")
+    if not isinstance(workflow_id, str) or not isinstance(task_id, str):
+        return False
+    candidates: list[dict[str, Any]] = list(controller.state["jobs"].values())
+    archived = _archived_workflow_jobs(controller, project_id, workflow_id)
+    if archived:
+        candidates.extend(archived)
+    for candidate in candidates:
+        if (
+            candidate.get("id") == producer.get("id")
+            or candidate.get("workflow_invalid")
+            or candidate.get("workflow_id") != workflow_id
+        ):
+            continue
+        try:
+            matches = job_project(candidate) == project_id and (
+                task_id,
+                artifact_id,
+            ) in artifact_conditions(candidate)
+        except (TypeError, ValueError):
+            matches = False
+        if matches:
+            return True
+    return False
+
+
+def _retain_exact_artifact_evidence(
+    controller: Controller,
+    producer: dict[str, Any],
+    event: dict[str, Any],
+    publication: dict[str, Any],
+) -> None:
+    """Retain publications referenced by declared workflow conditions."""
+
+    if not _has_artifact_wait_reference(controller, producer, publication["artifact_id"]):
+        return
+    evidence = [
+        item
+        for item in list(producer.get("artifact_condition_evidence") or [])
+        if item.get("producer_event_id") != event["event_id"]
+    ]
+    evidence.append(
+        {
+            "publication": copy.deepcopy(publication),
+            "producer_event_id": event["event_id"],
+            "occurred_at": event["occurred_at"],
+        }
+    )
+    producer["artifact_condition_evidence"] = evidence
 
 
 def _initial_job_event(
@@ -1777,20 +1858,50 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
             new_report_ids.append(_report_id(source))
             continue
         job = controller.state["jobs"].get(job_id)
+        archived_job = None
         if job is None:
             # A worker cannot start before its job is known, but an external
             # publisher may win the controller's request-ingestion poll.
             if request_pending(controller.root, job_id):
                 continue
-            _reject_report(
-                controller,
-                source,
-                f"unknown job {job_id}",
-                digest=digest,
+            try:
+                archived_job = find_archived_job(controller.root, job_id)
+            except (OSError, StorageError) as exc:
+                _storage_notice(controller, "read_archived_report_job", job_id, exc)
+                continue
+            if archived_job is not None:
+                publication = (
+                    artifact_publication(event["data"])
+                    if event["kind"] == "workload.artifact"
+                    else None
+                )
+                if publication is None:
+                    _reject_report(
+                        controller,
+                        source,
+                        "archived jobs accept strict artifact publications only",
+                        digest=digest,
+                    )
+                    acknowledged.append((source, digest))
+                    new_report_ids.append(_report_id(source))
+                    continue
+                job = copy.deepcopy(archived_job)
+            else:
+                _reject_report(
+                    controller,
+                    source,
+                    f"unknown job {job_id}",
+                    digest=digest,
+                )
+                acknowledged.append((source, digest))
+                new_report_ids.append(_report_id(source))
+                continue
+        if archived_job is not None:
+            apply_workload_event(job, event, recorded_at=utc_now())
+            _retain_exact_artifact_evidence(
+                controller, job, event, publication
             )
-            acknowledged.append((source, digest))
-            new_report_ids.append(_report_id(source))
-            continue
+            archive_terminal_job(controller.root, job)
         journal_event = emit(
             controller,
             event["kind"],
@@ -1804,7 +1915,14 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
             durable=False,
             snapshot=False,
         )
-        apply_workload_event(job, event, recorded_at=journal_event["recorded_at"])
+        if archived_job is None:
+            apply_workload_event(job, event, recorded_at=journal_event["recorded_at"])
+            if event["kind"] == "workload.artifact":
+                publication = artifact_publication(event["data"])
+                if publication is not None:
+                    _retain_exact_artifact_evidence(
+                        controller, job, event, publication
+                    )
         if event["kind"] == "workload.artifact":
             _satisfy_artifact_waiters(
                 controller,
