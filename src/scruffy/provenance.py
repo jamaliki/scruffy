@@ -123,6 +123,7 @@ def launch_record(
         "job": {"project_id": job_project(job), **identity},
         "request_sha256": (job.get("provenance") or {}).get("request_sha256"),
         "allocation_id": allocation_id,
+        "allocation_incarnation_sha256": job.get("allocation_incarnation_sha256"),
         "submitted_at": job.get("submitted_at"),
         "started_at": job.get("started_at"),
         "deadline_at": job.get("deadline_at"),
@@ -193,3 +194,15 @@ def write_result_record(root: Path, job: Mapping[str, Any]) -> Path:
     else:
         _write_immutable_record(result_file, record)
     return result_file
+
+
+def read_result_record(root: Path, job_id: str) -> dict[str, Any] | None:
+    """Read an existing immutable terminal record for replay repair."""
+
+    result_file = provenance_files(root, str(job_id))[1]
+    if not result_file.exists():
+        return None
+    record, _ = read_immutable_json(result_file)
+    if not isinstance(record, dict) or record.get("job_id") != job_id:
+        raise StorageError(f"invalid result record {result_file}")
+    return record

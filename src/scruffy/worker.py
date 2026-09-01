@@ -246,6 +246,8 @@ def execute_assignment(source: Path) -> None:
     environment["SCRUFFY_PROJECT"] = job_project(document)
     environment["SCRUFFY_EVENT_DIR"] = str(Path(root) / "reports" / job_id)
     environment["SCRUFFY_NODE"] = str(placement["node"])
+    if isinstance(document.get("launch_token"), str):
+        environment["SCRUFFY_LAUNCH_TOKEN"] = document["launch_token"]
     for name in _SCRUFFY_GPU_ENVIRONMENT:
         environment.pop(name, None)
     if document.get("launcher") == "slurm":

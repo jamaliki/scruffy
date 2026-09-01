@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import queue
 import signal
 import subprocess
@@ -22,7 +20,12 @@ from .models import (
     ResourceRequest,
     job_project,
 )
-from .provenance import provenance_files, write_launch_record, write_result_record
+from .provenance import (
+    provenance_files,
+    read_result_record,
+    write_launch_record,
+    write_result_record,
+)
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_first_fitting_job, project_gpu_usage, queue_priority_key
 from .slurm import (
@@ -176,6 +179,11 @@ def _runtime_placement_authority(
 def _fail_unlaunched(
     controller: Controller, job: dict[str, Any], assignment: Assignment, exc: Exception
 ) -> None:
+    prior = _replayable_result(controller, job)
+    if prior is not None:
+        _apply_result_record(job, prior)
+        emit(controller, f"job.{job['state']}", job=job)
+        return
     job.update(
         {
             "state": "failed",
@@ -188,6 +196,41 @@ def _fail_unlaunched(
     )
     write_result_record(controller.root, job)
     emit(controller, "job.failed", job=job)
+
+
+def _replayable_result(
+    controller: Controller, job: dict[str, Any]
+) -> Mapping[str, Any] | None:
+    """Return a prior result only for a modern identity-bearing job."""
+
+    prior = read_result_record(controller.root, str(job["id"]))
+    if prior is None:
+        return None
+    if type(job.get("attempt")) is int:
+        return prior
+    launch_sha256 = (job.get("provenance") or {}).get("launch_sha256")
+    if isinstance(launch_sha256, str) and prior.get("launch_sha256") == launch_sha256:
+        return prior
+    return None
+
+
+def _apply_result_record(job: dict[str, Any], record: Mapping[str, Any]) -> None:
+    """Restore terminal fields from a result written before its lifecycle event."""
+
+    job.update(
+        {
+            "state": record.get("state"),
+            "reason": record.get("reason"),
+            "error": record.get("error"),
+            "exit_code": record.get("exit_code"),
+            "signal": record.get("signal"),
+            "finished_at": record.get("finished_at"),
+            "last_assignment": record.get("assignment"),
+            "assignment": None,
+            "stdout_bytes": record.get("stdout_bytes"),
+            "stderr_bytes": record.get("stderr_bytes"),
+        }
+    )
 
 
 def _job_deadline(started_at: str, seconds: int | None) -> str | None:
@@ -268,14 +311,56 @@ def start_job(
 ) -> None:
     """Persist a reservation before launching, and never clear a live process."""
 
+    prior_result = _replayable_result(controller, job)
+    if prior_result is not None:
+        _apply_result_record(job, prior_result)
+        emit(controller, f"job.{job['state']}", job=job)
+        return
     launch_file, _ = provenance_files(controller.root, str(job["id"]))
     prior_launch: dict[str, Any] | None = None
-    if launch_file.exists():
-        prior_launch, _ = read_immutable_json(launch_file)
-        if not isinstance(prior_launch, dict):
-            raise StorageError(f"invalid launch record {launch_file}")
-        if prior_launch.get("assignment") != assignment.to_dict():
-            raise StorageError(f"launch assignment changed before admission {job['id']}")
+    try:
+        if launch_file.exists():
+            prior_launch, _ = read_immutable_json(launch_file)
+            if not isinstance(prior_launch, dict):
+                raise StorageError(f"invalid launch record {launch_file}")
+            if prior_launch.get("assignment") != assignment.to_dict():
+                raise StorageError(
+                    f"launch assignment changed before admission {job['id']}"
+                )
+            prior_job = prior_launch.get("job")
+            if not isinstance(prior_job, dict):
+                raise StorageError(f"launch record has no job identity {job['id']}")
+            for key in (
+                "project_id",
+                "id",
+                "request_id",
+                "name",
+                "workflow_id",
+                "task_id",
+                "attempt",
+            ):
+                if prior_job.get(key) != job.get(key):
+                    raise StorageError(f"launch identity changed before admission {job['id']}")
+            if (
+                job.get("launch_token") is not None
+                and prior_job.get("launch_token") != job.get("launch_token")
+            ):
+                raise StorageError(f"launch token changed before admission {job['id']}")
+            if prior_launch.get("allocation_id") != controller.allocation_id:
+                raise StorageError(f"launch allocation changed before admission {job['id']}")
+            if controller.launcher == "slurm":
+                current_fingerprint = (
+                    controller.allocation_incarnation.fingerprint_sha256
+                    if controller.allocation_incarnation is not None
+                    else None
+                )
+                if prior_launch.get("allocation_incarnation_sha256") != current_fingerprint:
+                    raise StorageError(
+                        f"launch record belongs to a different allocation incarnation {job['id']}"
+                    )
+    except (OSError, StorageError, TypeError, ValueError) as exc:
+        _fail_unlaunched(controller, job, assignment, exc)
+        return
     job["assignment"] = assignment.to_dict()
     job["state"] = "starting"
     prior_job = prior_launch.get("job") if prior_launch else None
@@ -292,21 +377,7 @@ def start_job(
     if controller.launcher == "slurm":
         if controller.allocation_incarnation is None:
             raise RuntimeError("Slurm controller has no allocation incarnation")
-        identity = json.dumps(
-            {
-                "allocation_id": controller.allocation_id,
-                "attempt": job.get("attempt", 1),
-                "assignment": assignment.to_dict(),
-                "job_id": job["id"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        job["launch_token"] = job.get("launch_token") or prior_token or (
-            "scruffy-" + hashlib.sha256(identity).hexdigest()[:32]
-            if identity
-            else new_step_name()
-        )
+        job["launch_token"] = job.get("launch_token") or prior_token or new_step_name()
         job["allocation_incarnation_sha256"] = (
             controller.allocation_incarnation.fingerprint_sha256
         )
@@ -336,6 +407,7 @@ def start_job(
             "attempt": job.get("attempt"),
             "launcher": controller.launcher,
             "slurm_job_id": controller.slurm_job_id,
+            "launch_token": job.get("launch_token"),
             "allocation_incarnation_sha256": job.get(
                 "allocation_incarnation_sha256"
             ),
@@ -479,6 +551,11 @@ def request_cancellation(
 ) -> bool:
     data = {"request_id": request_id} if request_id else None
     if job["state"] in {"queued", "blocked"}:
+        prior = _replayable_result(controller, job)
+        if prior is not None:
+            _apply_result_record(job, prior)
+            emit(controller, f"job.{job['state']}", job=job)
+            return True
         job["state"] = "cancelled"
         job["finished_at"] = utc_now()
         job["reason"] = "cancelled_before_start"
@@ -580,17 +657,23 @@ def _finish_job(
                 placement_error = str(exc)
                 if state == "succeeded":
                     state, reason = "failed", "runtime_placement_invalid"
-    job.update(
-        {
-            "state": state,
-            "finished_at": utc_now(),
-            "exit_code": returncode if returncode >= 0 else None,
-            "signal": -returncode if returncode < 0 else None,
-            "reason": reason,
-            "last_assignment": job["assignment"],
-            "assignment": None,
-        }
-    )
+    prior = _replayable_result(controller, job)
+    if prior is not None:
+        _apply_result_record(job, prior)
+        state = job["state"]
+        reason = job.get("reason")
+    else:
+        job.update(
+            {
+                "state": state,
+                "finished_at": utc_now(),
+                "exit_code": returncode if returncode >= 0 else None,
+                "signal": -returncode if returncode < 0 else None,
+                "reason": reason,
+                "last_assignment": job["assignment"],
+                "assignment": None,
+            }
+        )
     if runtime_placements is not None:
         job["runtime_placements"] = runtime_placements
         job.pop("runtime_placement_error", None)

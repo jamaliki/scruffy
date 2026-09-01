@@ -650,6 +650,8 @@ _ARCHIVED_JOB_FIELDS = (
     "resolved_conditions",
     "artifact_evidence",
     "artifact_condition_evidence",
+    "launch_token",
+    "allocation_incarnation_sha256",
     "workflow_invalid",
     "project_id",
 )

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import queue
 import signal
 import subprocess
@@ -44,7 +46,7 @@ from .models import (
     validate_inventory,
 )
 from .protocol import artifact_publication, validate_event
-from .provenance import write_request_record, write_result_record
+from .provenance import read_result_record, write_request_record, write_result_record
 from .runtime import (
     Controller,
     OutputNotifier,
@@ -247,26 +249,59 @@ def _initialize_controller(
             active_lost_reason = "allocation_incarnation_changed"
         else:
             active_lost_reason = "allocation_replaced"
-        if active:
-            lost_reason = active_lost_reason
+        lost_active: list[dict[str, Any]] = []
+        recovered_terminal: list[dict[str, Any]] = []
         # A replaced or restarted Slurm incarnation cannot retain its old
         # steps. Legacy active records are not upgraded to a new incarnation;
         # launches remain paused below until an operator audits the old work.
         for job in active:
+            prior = read_result_record(root, str(job["id"]))
+            # A persisted loss result is the first half of the loss
+            # transaction, not a completed workflow outcome.  Replay must
+            # retain its immutable timestamp/assignment while still emitting
+            # job.lost and admitting the deterministic successor.
+            if (
+                prior is not None
+                and prior.get("state") in TERMINAL_JOB_STATES
+                and prior.get("state") != "lost"
+                and type(job.get("attempt")) is int
+            ):
+                job.update(
+                    {
+                        "state": prior["state"],
+                        "finished_at": prior.get("finished_at"),
+                        "exit_code": prior.get("exit_code"),
+                        "signal": prior.get("signal"),
+                        "reason": prior.get("reason"),
+                        "error": prior.get("error"),
+                        "last_assignment": prior.get("assignment"),
+                        "assignment": None,
+                    }
+                )
+                recovered_terminal.append(job)
+                continue
+            lost_active.append(job)
             job["state"] = "lost"
             job["finished_at"] = (
-                job.get("finished_at")
+                (prior.get("finished_at") if prior is not None else None)
+                or job.get("finished_at")
                 or job.get("started_at")
                 or job.get("submitted_at")
                 or utc_now()
             )
             job["reason"] = active_lost_reason
             _mark_retry_exhaustion(job, active_lost_reason)
-            job["last_assignment"] = job.get("assignment")
+            job["last_assignment"] = (
+                prior.get("assignment") if prior is not None else job.get("assignment")
+            )
             job["assignment"] = None
             write_result_record(root, job)
-        for job in active:
+        if lost_active:
+            lost_reason = active_lost_reason
+        for job in lost_active:
             emit(controller, "job.lost", job=job, snapshot=False)
+        for job in recovered_terminal:
+            emit(controller, f"job.{job['state']}", job=job, snapshot=False)
         if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
             _recover_lost_workflow_jobs(controller, active_lost_reason)
 
@@ -691,6 +726,16 @@ def _stage_job(
         _mark_workflow_rejected(job, exc)
         return job
 
+    if _late_artifact_wait_is_unavailable(job, prospective):
+        _mark_workflow_rejected(
+            job,
+            WorkflowError(
+                "artifact waits must be declared before publication; "
+                "exact evidence is no longer retained"
+            ),
+        )
+        return job
+
     workflow_id = job.get("workflow_id")
     task_id = job.get("task_id")
     project_id = job_project(job)
@@ -847,6 +892,31 @@ def _artifact_attempts(
         ),
         reverse=True,
     )
+
+
+def _late_artifact_wait_is_unavailable(
+    job: dict[str, Any], prospective: dict[str, dict[str, Any]]
+) -> bool:
+    """Reject a consumer attached after terminal evidence has expired."""
+
+    workflow_id = job.get("workflow_id")
+    if not isinstance(workflow_id, str):
+        return False
+    for task_id, artifact_id in artifact_conditions(job):
+        attempts = _artifact_attempts(
+            prospective.values(), job_project(job), workflow_id, task_id
+        )
+        if not attempts:
+            continue
+        if any(
+            item["publication"].get("artifact_id") == artifact_id
+            for producer in attempts
+            for item in _artifact_evidence(producer)
+        ):
+            continue
+        if attempts[0].get("state") in TERMINAL_JOB_STATES:
+            return True
+    return False
 
 
 def _artifact_evidence(producer: dict[str, Any]) -> Iterable[dict[str, Any]]:
@@ -1027,19 +1097,65 @@ def _retain_exact_artifact_evidence(
 
     if not _has_artifact_wait_reference(controller, producer, publication["artifact_id"]):
         return
-    evidence = [
-        item
-        for item in list(producer.get("artifact_condition_evidence") or [])
-        if item.get("producer_event_id") != event["event_id"]
-    ]
+    publication_digest = _publication_digest(publication)
+    evidence = list(producer.get("artifact_condition_evidence") or [])
+    for item in evidence:
+        item_publication = item.get("publication") if isinstance(item, dict) else None
+        if not isinstance(item_publication, dict) or item_publication.get("artifact_id") != publication["artifact_id"]:
+            continue
+        existing_digest = item.get("publication_sha256") or _publication_digest(
+            item_publication
+        )
+        if existing_digest != publication_digest:
+            raise StorageError(
+                f"conflicting publications for artifact {publication['artifact_id']}"
+            )
+        return
     evidence.append(
         {
             "publication": copy.deepcopy(publication),
+            "publication_sha256": publication_digest,
             "producer_event_id": event["event_id"],
             "occurred_at": event["occurred_at"],
         }
     )
     producer["artifact_condition_evidence"] = evidence
+
+
+def _publication_digest(publication: dict[str, Any]) -> str:
+    """Hash one normalized publication independent of report event identity."""
+
+    payload = json.dumps(
+        publication, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _check_artifact_condition_conflict(
+    producer: dict[str, Any], publication: dict[str, Any]
+) -> None:
+    """Reject a conflicting immutable publication before state mutation."""
+
+    digest = _publication_digest(publication)
+    for item in list(producer.get("artifact_condition_evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        existing = item.get("publication")
+        if not isinstance(existing, dict) or existing.get("artifact_id") != publication["artifact_id"]:
+            continue
+        existing_digest = item.get("publication_sha256") or _publication_digest(existing)
+        if existing_digest != digest:
+            raise StorageError(
+                f"conflicting publications for artifact {publication['artifact_id']}"
+            )
+
+
+def _report_capability_valid(job: dict[str, Any], event: dict[str, Any]) -> bool:
+    """Verify a worker capability when present; queue-root access is legacy trust."""
+
+    expected = job.get("launch_token")
+    supplied = event.get("source", {}).get("launch_token")
+    return not isinstance(expected, str) or supplied in {None, expected}
 
 
 def _initial_job_event(
@@ -1859,6 +1975,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
             continue
         job = controller.state["jobs"].get(job_id)
         archived_job = None
+        publication = None
         if job is None:
             # A worker cannot start before its job is known, but an external
             # publisher may win the controller's request-ingestion poll.
@@ -1896,6 +2013,21 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                 acknowledged.append((source, digest))
                 new_report_ids.append(_report_id(source))
                 continue
+        if event["kind"] == "workload.artifact":
+            publication = artifact_publication(event["data"])
+            if publication is not None:
+                try:
+                    _check_artifact_condition_conflict(job, publication)
+                except StorageError as exc:
+                    _reject_report(controller, source, str(exc), digest=digest)
+                    acknowledged.append((source, digest))
+                    new_report_ids.append(_report_id(source))
+                    continue
+        if not _report_capability_valid(job, event):
+            _reject_report(controller, source, "invalid launch capability", digest=digest)
+            acknowledged.append((source, digest))
+            new_report_ids.append(_report_id(source))
+            continue
         if archived_job is not None:
             apply_workload_event(job, event, recorded_at=utc_now())
             _retain_exact_artifact_evidence(

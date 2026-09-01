@@ -28,6 +28,13 @@ Every report is one JSON object with exactly these keys:
 }
 ```
 
+Reports emitted by a running Scruffy worker should include the `launch_token`
+in `source`; the worker receives it as `SCRUFFY_LAUNCH_TOKEN`. The controller
+verifies a supplied token against the admitted launch identity for hot and
+archived jobs. Reports without a token remain supported for external observers
+because queue-root write access is the legacy trust boundary; a job ID alone is
+not an authentication credential.
+
 Allowed kinds are:
 
 - `workload.phase`
@@ -65,6 +72,11 @@ syncing the immutable artifact. A matching `wait_for` condition is scoped to
 the producer task's project and workflow. Scruffy records the exact evidence on
 the consumer and emits `condition.satisfied`; it never reads or hashes artifact
 bytes in the controller loop.
+
+Complete atomic workflows must declare artifact waits before publication. Scruffy
+retains exact truth for those declared conditions, but it is not an unbounded
+catalog for arbitrary future late-attached consumers after bounded observations
+expire.
 
 `event_id` is an idempotency key scoped to one job. Reusing it with the same
 job, kind, source, and data is safe; the first occurrence timestamp is retained,

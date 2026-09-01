@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -193,6 +194,10 @@ def publish_event(
 ) -> dict[str, Any]:
     """Spool an event; ``event_id`` deduplicates across retained generations."""
 
+    report_source = {} if source is None else dict(source)
+    launch_token = os.environ.get("SCRUFFY_LAUNCH_TOKEN")
+    if launch_token is not None:
+        report_source.setdefault("launch_token", launch_token)
     document = validate_event(
         {
             "v": 1,
@@ -202,7 +207,7 @@ def publish_event(
             "job_id": job_id,
             "occurred_at": utc_now() if occurred_at is None else occurred_at,
             "kind": kind,
-            "source": {} if source is None else source,
+            "source": report_source,
             "data": data,
         }
     )
