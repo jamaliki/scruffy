@@ -182,9 +182,62 @@ class HealthTests(unittest.TestCase):
             ingest_health_sample(health, self.inventory, sample)
 
         device = health["nodes"]["gpu-a"]["devices"]["GPU-aaaa"]
-        self.assertEqual("healthy", device["status"])
+        self.assertEqual("unknown", device["status"])
         self.assertEqual(0, device["bad_samples"])
-        self.assertEqual(3, device["good_samples"])
+        self.assertEqual(0, device["good_samples"])
+
+    def test_assigned_gpu_software_thermal_slowdown_is_observational(self) -> None:
+        health = empty_health_state(mode="enforce", isolation="gpu")
+        for offset in range(3):
+            sample = self.sample(at=self.at + timedelta(seconds=offset))
+            sample["gpus"][0]["software_thermal_slowdown"] = True  # type: ignore[index]
+            sample["gpus"][0]["thermal_slowdown"] = True  # type: ignore[index]
+            sample["cuda_probe"] = {  # type: ignore[assignment]
+                "ok": True,
+                "init_ok": True,
+                "inconclusive": True,
+                "devices": [
+                    {
+                        "nvidia_index": 0,
+                        "uuid": "GPU-aaaa",
+                        "ok": True,
+                        "skipped": True,
+                        "inconclusive": True,
+                    }
+                ],
+            }
+            ingest_health_sample(health, self.inventory, sample)
+
+        device = health["nodes"]["gpu-a"]["devices"]["GPU-aaaa"]
+        self.assertEqual("unknown", device["status"])
+        self.assertEqual(0, device["bad_samples"])
+        self.assertEqual(0, device["good_samples"])
+
+    def test_bad_sample_streak_resets_after_a_long_gap(self) -> None:
+        health = empty_health_state(mode="enforce", isolation="node")
+        for at in (
+            self.at,
+            self.at + timedelta(minutes=10),
+            self.at + timedelta(minutes=20),
+        ):
+            ingest_health_sample(health, self.inventory, self.sample(cuda_ok=False, at=at))
+
+        device = health["nodes"]["gpu-a"]["devices"]["GPU-aaaa"]
+        self.assertEqual("suspect", device["status"])
+        self.assertEqual(1, device["bad_samples"])
+        self.assertEqual(
+            (self.at + timedelta(minutes=20)).isoformat(timespec="milliseconds"),
+            device["bad_streak_started_at"],
+        )
+
+    def test_future_sample_is_rejected(self) -> None:
+        health = empty_health_state(mode="observe", isolation="node")
+        with self.assertRaisesRegex(HealthError, "future"):
+            ingest_health_sample(
+                health,
+                self.inventory,
+                self.sample(at=datetime.now(UTC) + timedelta(seconds=31)),
+            )
 
     def test_operator_clear_releases_a_healthy_device(self) -> None:
         health = empty_health_state(mode="enforce", isolation="node")

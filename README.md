@@ -175,18 +175,25 @@ Every 10 seconds, one task on each node records:
   probe for idle visible GPUs. GPUs currently assigned by Scruffy are retained
   in passive telemetry but are not given a competing context probe. A context
   probe that races a newly busy GPU and returns `CUDA_ERROR_OUT_OF_MEMORY` is
-  recorded as inconclusive rather than as a hardware failure; definite CUDA,
-  ECC, and thermal failures retain their normal quarantine behavior.
+  recorded as inconclusive rather than as a hardware failure. Assigned GPUs'
+  software thermal throttling is observational; uncorrectable ECC and hardware
+  thermal faults remain actionable. Each sample carries the exact health-worker
+  fingerprint and reservation-snapshot provenance, and samples from another
+  worker/allocation are rejected.
 
 Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
 The default is `observe`: automatic failures become visible without changing
 placement. GPU isolation defaults to `gpu`, so an explicit `gpu-quarantine`
 withholds only the selected slot when Slurm can bind it exactly. Use
 `--gpu-isolation=node` for conservative whole-node withholding.
-In `enforce`, three consecutive bad samples make the affected UUID's
-quarantine sticky; missing or older-than-45-second samples fail closed. An
-operator can revalidate an automatic quarantine against the latest clean
-sample, or explicitly clear it after investigating:
+In `enforce`, three consecutive bad samples within the bounded sampling window
+make the affected UUID's quarantine sticky; inconclusive samples do not count,
+and missing or older-than-45-second samples fail closed. Samples more than 30
+seconds ahead of the controller clock are rejected. A controller upgrade
+replaces only health-monitor steps whose worker fingerprint is stale; workload
+steps and the outer allocation are never targeted. An operator can revalidate
+an automatic quarantine against the latest clean sample, or explicitly clear
+it after investigating:
 
 ```bash
 scruffy --root "$SCRUFFY_ROOT" gpus

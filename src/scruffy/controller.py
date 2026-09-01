@@ -27,6 +27,7 @@ from .health import (
     reprobe_quarantine,
     set_quarantine,
 )
+from .health_worker import health_worker_release_sha256 as _health_worker_release_sha256
 from .lifecycle import (
     begin_shutdown,
     drain_messages,
@@ -169,6 +170,7 @@ def _initialize_controller(
     controller_release = _normalize_controller_release(controller_release)
     state = load_recovered_state(root)
     health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
+    worker_release = _health_worker_release_sha256()
     bind_health_incarnation(
         health,
         (allocation_incarnation.fingerprint_sha256 if allocation_incarnation is not None else None),
@@ -249,8 +251,9 @@ def _initialize_controller(
         gpu_health_mode=gpu_health_mode,
         gpu_isolation=gpu_isolation,
         gpu_health_interval=gpu_health_interval,
+        health_worker_release_sha256=worker_release,
         health_step_name=(
-            f"scruffy-health-{allocation_incarnation.fingerprint_sha256[:12]}"
+            f"scruffy-health-{allocation_incarnation.fingerprint_sha256[:12]}-{worker_release[:12]}"
             if launcher == "slurm"
             and gpu_health_mode != "off"
             and allocation_incarnation is not None
@@ -2981,8 +2984,32 @@ def _ingest_gpu_health(controller: Controller) -> None:
                 and document.get("allocation_incarnation_sha256") != expected_incarnation
             ):
                 raise HealthError("health sample belongs to another allocation incarnation")
+            if document.get("health_worker_release_sha256") != controller.health_worker_release_sha256:
+                raise HealthError("health sample belongs to another worker release")
+            provenance = document.get("reservation_snapshot")
+            if (
+                not isinstance(provenance, dict)
+                or provenance.get("source") != "state.json"
+                or provenance.get("node") != inventory_node.name
+                or type(provenance.get("available")) is not bool
+            ):
+                raise HealthError("health sample has invalid reservation snapshot provenance")
+            provenance_incarnation = provenance.get("allocation_incarnation_sha256")
+            if (
+                expected_incarnation is not None
+                and provenance_incarnation is not None
+                and provenance_incarnation != expected_incarnation
+            ):
+                raise HealthError("reservation snapshot belongs to another allocation incarnation")
             before = health.get("nodes", {}).get(inventory_node.name, {}).get("last_sample_at")
-            transitions.extend(ingest_health_sample(health, controller.inventory, document))
+            transitions.extend(
+                ingest_health_sample(
+                    health,
+                    controller.inventory,
+                    document,
+                    sample_interval_seconds=controller.gpu_health_interval,
+                )
+            )
             after = health["nodes"][inventory_node.name].get("last_sample_at")
             if after != before:
                 health["nodes"][inventory_node.name]["last_received_at"] = utc_now()
@@ -3014,14 +3041,26 @@ def _health_step_name(controller: Controller, node: str) -> str:
 
 
 def _health_monitor_matches(controller: Controller, node: str) -> list[SlurmStep]:
-    known_id = controller.health_step_ids.get(node)
     matches = [
         step
         for step in controller.slurm_steps
         if step.name == _health_step_name(controller, node)
-        or (known_id and step.step_id == known_id)
     ]
     return list({step.step_id: step for step in matches}.values())
+
+
+def _stale_health_monitor_matches(controller: Controller, node: str) -> list[SlurmStep]:
+    prefix = f"scruffy-health-{controller.allocation_incarnation.fingerprint_sha256[:12]}-"
+    expected = _health_step_name(controller, node)
+    return list(
+        {
+            step.step_id: step
+            for step in controller.slurm_steps
+            if step.name.startswith(prefix)
+            and step.name.endswith(f"-{node}")
+            and step.name != expected
+        }.values()
+    )
 
 
 def _health_monitor_error(controller: Controller, node: str, error: str) -> None:
@@ -3038,6 +3077,8 @@ def _health_monitor_error(controller: Controller, node: str, error: str) -> None
 
 def _attach_health_monitor(controller: Controller, node: str, step: SlurmStep) -> None:
     controller.health_step_ids[node] = step.step_id
+    controller.health_absence_confirmations[node] = 0
+    controller.health_replaced_step_ids.pop(node, None)
     controller.health_monitor_errors.pop(node, None)
     current_status = controller.state["gpu_health"].get("monitor", {}).get("status", "starting")
     if current_status not in {"running", "degraded"}:
@@ -3068,6 +3109,9 @@ def _reconcile_health_process(controller: Controller, node: str) -> bool:
         return True
     if controller.slurm_snapshot_at <= controller.health_launch_snapshot_at.get(node, 0):
         return True
+    if controller.health_absence_confirmations.get(node, 0) < 1:
+        controller.health_absence_confirmations[node] = 1
+        return True
     signal_process(process, signal.SIGTERM)
     _health_monitor_error(controller, node, "Slurm no longer reports the health monitor step")
     return True
@@ -3090,6 +3134,7 @@ def _launch_health_monitor(controller: Controller, node: str) -> None:
                     if controller.allocation_incarnation is not None
                     else ""
                 ),
+                worker_release_sha256=controller.health_worker_release_sha256,
             ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -3098,6 +3143,8 @@ def _launch_health_monitor(controller: Controller, node: str) -> None:
             start_new_session=True,
         )
         controller.health_launch_snapshot_at[node] = controller.slurm_snapshot_at
+        controller.health_absence_confirmations[node] = 0
+        controller.health_replaced_step_ids.pop(node, None)
         controller.health_monitor_errors.pop(node, None)
     except (OSError, ValueError) as exc:
         _health_monitor_error(controller, node, str(exc))
@@ -3117,6 +3164,21 @@ def _maintain_health_monitor(controller: Controller) -> None:
             continue
         if matches:
             _attach_health_monitor(controller, node, matches[0])
+            continue
+        stale_matches = _stale_health_monitor_matches(controller, node)
+        if stale_matches:
+            replaced = controller.health_replaced_step_ids.setdefault(node, set())
+            try:
+                for step in stale_matches:
+                    if step.step_id not in replaced:
+                        cancel_step(controller.slurm_job_id or "", step.step_id)
+                        replaced.add(step.step_id)
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                _health_monitor_error(controller, node, str(exc))
+                continue
+            controller.health_step_ids.pop(node, None)
+            controller.health_retry_at[node] = time.monotonic() + 5
+            controller.health_monitor_errors[node] = "replacing stale health monitor step"
             continue
         if _reconcile_health_process(controller, node):
             continue

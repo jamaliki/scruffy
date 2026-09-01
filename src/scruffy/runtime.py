@@ -114,11 +114,14 @@ class Controller:
     gpu_health_mode: str = "off"
     gpu_isolation: str = "gpu"
     gpu_health_interval: float = 10.0
+    health_worker_release_sha256: str = ""
     health_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
     health_step_name: str | None = None
     health_step_ids: dict[str, str] = field(default_factory=dict)
     health_launch_snapshot_at: dict[str, float] = field(default_factory=dict)
     health_retry_at: dict[str, float] = field(default_factory=dict)
+    health_absence_confirmations: dict[str, int] = field(default_factory=dict)
+    health_replaced_step_ids: dict[str, set[str]] = field(default_factory=dict)
     health_monitor_errors: dict[str, str] = field(default_factory=dict)
     health_ingest_errors: dict[str, str] = field(default_factory=dict)
 

@@ -82,10 +82,23 @@ thermal/ECC telemetry, plus CUDA Driver API context probes for GPUs not
 currently assigned by Scruffy. The controller alone turns those observations
 into `healthy`, `suspect`, or sticky `quarantined` state. Assigned GPUs remain
 passively observed, and context OOM races are explicitly inconclusive rather
-than failures. High-rate metrics stay in replaceable samples and the current
-snapshot; only state transitions and operator commands enter the journal.
+than failures; assigned software thermal throttling is observational while
+uncorrectable ECC and hardware thermal faults remain actionable. Every sample
+also carries the exact health-worker fingerprint and reservation-snapshot
+provenance, so a controller rejects samples from a stale worker or allocation.
+High-rate metrics stay in replaceable samples and the current snapshot; only
+state transitions and operator commands enter the journal.
 Samples are bound to the outer allocation-incarnation fingerprint, so a requeue
 cannot reuse healthy freshness from the previous physical execution.
+
+The health monitor step name includes the worker fingerprint. On controller
+upgrade, a live monitor with an older fingerprint is replaced only after its
+step identity is matched to the current allocation and node; workload steps
+and the outer allocation are never cancelled. Health-step absence requires
+bounded consecutive Slurm observations before a live monitor is treated as
+gone. Quarantine debounce requires three bad samples within the sampling
+window; inconclusive observations neither increment bad streaks nor count as
+clean evidence, and materially future-dated samples are rejected.
 
 The durable key is `(node, NVIDIA UUID)`. Scheduler slot, NVIDIA index, Linux
 minor, and PCI bus ID are reportable mappings, not stable identity. Missing or

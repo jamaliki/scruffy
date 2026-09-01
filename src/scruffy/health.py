@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ._compat import UTC
@@ -14,6 +14,7 @@ HEALTH_MODES = frozenset({"off", "observe", "enforce"})
 GPU_ISOLATION_MODES = frozenset({"gpu", "node"})
 DEFAULT_BAD_SAMPLES_TO_QUARANTINE = 3
 DEFAULT_SAMPLE_STALE_SECONDS = 45
+MAX_FUTURE_SAMPLE_SKEW_SECONDS = 30
 
 
 class HealthError(ValueError):
@@ -100,11 +101,19 @@ def _identity(row: Mapping[str, object], *, node: str, slot: int) -> dict[str, A
     }
 
 
-def _reasons(row: Mapping[str, object], cuda_failed: bool) -> list[str]:
+def _reasons(
+    row: Mapping[str, object], cuda_failed: bool, *, assigned: bool = False
+) -> list[str]:
     reasons: list[str] = []
     if cuda_failed:
         reasons.append("cuda_probe_failed")
-    if row.get("thermal_slowdown") is True:
+    if row.get("hardware_thermal_slowdown") is True:
+        reasons.append("hardware_thermal_slowdown")
+    elif (
+        row.get("thermal_slowdown") is True
+        and not assigned
+        and row.get("software_thermal_slowdown") is not True
+    ):
         reasons.append("thermal_slowdown")
     ecc = row.get("uncorrectable_ecc_errors")
     if type(ecc) is int and ecc > 0:
@@ -133,6 +142,8 @@ def _new_device(identity: dict[str, Any]) -> dict[str, Any]:
         "status": "unknown",
         "bad_samples": 0,
         "good_samples": 0,
+        "bad_streak_started_at": None,
+        "last_bad_sample_at": None,
         "quarantined_at": None,
         "quarantine_reason": None,
         "quarantine_source": None,
@@ -145,6 +156,7 @@ def ingest_health_sample(
     document: Mapping[str, object],
     *,
     bad_samples_to_quarantine: int = DEFAULT_BAD_SAMPLES_TO_QUARANTINE,
+    sample_interval_seconds: float = 10.0,
 ) -> list[dict[str, Any]]:
     """Project one monitor sample and return durable status transitions.
 
@@ -155,11 +167,21 @@ def ingest_health_sample(
 
     if type(bad_samples_to_quarantine) is not int or bad_samples_to_quarantine < 1:
         raise HealthError("bad_samples_to_quarantine must be positive")
+    if (
+        isinstance(sample_interval_seconds, bool)
+        or not isinstance(sample_interval_seconds, (int, float))
+        or sample_interval_seconds <= 0
+    ):
+        raise HealthError("sample_interval_seconds must be positive")
     node_name = _nonempty(document.get("node"), "node")
     nodes = {item.name: item for item in inventory}
     if node_name not in nodes:
         raise HealthError(f"health sample names unknown node {node_name!r}")
     recorded_at = _parse_timestamp(document.get("recorded_at"))
+    if _timestamp_value(recorded_at) > datetime.now(UTC) + timedelta(
+        seconds=MAX_FUTURE_SAMPLE_SKEW_SECONDS
+    ):
+        raise HealthError("recorded_at is materially in the future")
     raw_devices = document.get("gpus")
     if isinstance(raw_devices, (str, bytes)) or not isinstance(raw_devices, Sequence):
         raise HealthError("gpus must be a sequence")
@@ -200,6 +222,34 @@ def ingest_health_sample(
         and item.get("inconclusive") is not True
         and isinstance(item.get("uuid"), str)
     }
+    inconclusive_cuda_indices = {
+        item.get("nvidia_index")
+        for item in cuda_devices
+        if isinstance(item, Mapping)
+        and item.get("inconclusive") is True
+        and type(item.get("nvidia_index")) is int
+    }
+    inconclusive_cuda_uuids = {
+        str(item.get("uuid")).lower()
+        for item in cuda_devices
+        if isinstance(item, Mapping)
+        and item.get("inconclusive") is True
+        and isinstance(item.get("uuid"), str)
+    }
+    assigned_cuda_uuids = {
+        str(item.get("uuid")).lower()
+        for item in cuda_devices
+        if isinstance(item, Mapping)
+        and item.get("skipped") is True
+        and isinstance(item.get("uuid"), str)
+    }
+    assigned_cuda_indices = {
+        item.get("nvidia_index")
+        for item in cuda_devices
+        if isinstance(item, Mapping)
+        and item.get("skipped") is True
+        and type(item.get("nvidia_index")) is int
+    }
     cuda_device_count = cuda_probe.get("device_count")
     count_mismatch = type(cuda_device_count) is int and cuda_device_count != len(rows)
     global_cuda_failure = (
@@ -207,6 +257,13 @@ def ingest_health_sample(
         or count_mismatch
         or (not cuda_ok and not cuda_devices and cuda_probe.get("inconclusive") is not True)
     )
+    global_inconclusive = cuda_probe.get("inconclusive") is True
+    reservation_snapshot = document.get("reservation_snapshot")
+    busy_indices = {
+        item
+        for item in reservation_snapshot.get("busy_gpu_indices", [])
+        if type(item) is int
+    } if isinstance(reservation_snapshot, Mapping) else set()
     node_state = health.setdefault("nodes", {}).setdefault(node_name, {"devices": {}})
     previous_sample_at = node_state.get("last_sample_at")
     if isinstance(previous_sample_at, str) and _timestamp_value(recorded_at) <= _timestamp_value(
@@ -226,12 +283,44 @@ def ingest_health_sample(
         reasons = _reasons(
             row,
             global_cuda_failure
+            and identity["uuid"].lower() not in assigned_cuda_uuids
+            and identity["nvidia_index"] not in assigned_cuda_indices
+            and identity["nvidia_index"] not in busy_indices
             or identity["uuid"].lower() in failed_cuda_uuids
-            or (not failed_cuda_uuids and identity["nvidia_index"] in failed_cuda_indices),
+            or (
+                not failed_cuda_uuids
+                and identity["nvidia_index"] in failed_cuda_indices
+                and identity["uuid"].lower() not in assigned_cuda_uuids
+                and identity["nvidia_index"] not in assigned_cuda_indices
+                and identity["nvidia_index"] not in busy_indices
+            ),
+            assigned=(
+                identity["uuid"].lower() in assigned_cuda_uuids
+                or identity["nvidia_index"] in assigned_cuda_indices
+                or identity["nvidia_index"] in busy_indices
+            ),
         )
         quarantined = device.get("quarantined_at") is not None
+        inconclusive = (
+            global_inconclusive
+            or identity["uuid"].lower() in inconclusive_cuda_uuids
+            or identity["nvidia_index"] in inconclusive_cuda_indices
+        )
         if reasons:
+            previous_bad_at = device.get("last_bad_sample_at")
+            gap_limit = max(
+                DEFAULT_SAMPLE_STALE_SECONDS,
+                float(sample_interval_seconds) * 2,
+            )
+            if isinstance(previous_bad_at, str) and (
+                _timestamp_value(recorded_at) - _timestamp_value(previous_bad_at)
+            ).total_seconds() > gap_limit:
+                device["bad_samples"] = 0
+                device["bad_streak_started_at"] = recorded_at
+            elif int(device.get("bad_samples", 0)) == 0:
+                device["bad_streak_started_at"] = recorded_at
             device["bad_samples"] = int(device.get("bad_samples", 0)) + 1
+            device["last_bad_sample_at"] = recorded_at
             device["good_samples"] = 0
             if quarantined or device["bad_samples"] >= bad_samples_to_quarantine:
                 device["status"] = "quarantined"
@@ -241,9 +330,16 @@ def ingest_health_sample(
                     device["quarantine_source"] = "automatic"
             else:
                 device["status"] = "suspect"
+        elif inconclusive:
+            device["bad_samples"] = 0
+            device["bad_streak_started_at"] = None
+            device["last_bad_sample_at"] = None
+            device["status"] = prior_status
         else:
             device["bad_samples"] = 0
             device["good_samples"] = int(device.get("good_samples", 0)) + 1
+            device["bad_streak_started_at"] = None
+            device["last_bad_sample_at"] = None
             device["status"] = "quarantined" if quarantined else "healthy"
         device["last_sample_at"] = recorded_at
         device["last_reasons"] = reasons

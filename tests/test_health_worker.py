@@ -10,6 +10,7 @@ from scruffy.health_worker import (
     _busy_gpu_indices,
     _minor_number,
     collect_sample,
+    health_worker_release_sha256,
     probe_cuda,
     query_nvidia_gpus,
 )
@@ -188,6 +189,19 @@ class HealthWorkerTests(unittest.TestCase):
         self.assertFalse(result["devices"][0]["ok"])
         self.assertIn("cuCtxCreate_v2: CUDA_ERROR_UNKNOWN (999)", str(result["devices"][0]["error"]))
 
+    def test_uuid_lookup_failure_is_inconclusive(self) -> None:
+        library = _FakeCuda()
+        library.cuDeviceGetUuid_v2 = _FakeCudaFunction(
+            lambda *_: library._record("cuDeviceGetUuid_v2", 999)
+        )
+        with patch("scruffy.health_worker.ctypes.CDLL", return_value=library):
+            result = probe_cuda()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["inconclusive"])
+        self.assertTrue(result["devices"][0]["inconclusive"])
+        self.assertIsNone(result["devices"][0]["uuid"])
+
     def test_busy_snapshot_uses_active_reservations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -237,6 +251,18 @@ class HealthWorkerTests(unittest.TestCase):
                 collect_sample("gpu-a", "a" * 64, root=root)
 
         probe.assert_called_once_with(skip_indices=frozenset({1}))
+
+    def test_collect_sample_records_worker_and_reservation_provenance(self) -> None:
+        with (
+            patch("scruffy.health_worker.query_nvidia_gpus", return_value=([], None)),
+            patch("scruffy.health_worker.probe_cuda", return_value={}),
+        ):
+            sample = collect_sample("gpu-a", "a" * 64, root=Path("/missing"))
+
+        self.assertEqual(64, len(sample["health_worker_release_sha256"]))
+        self.assertEqual("state.json", Path(sample["reservation_snapshot"]["path"]).name)
+        self.assertFalse(sample["reservation_snapshot"]["available"])
+        self.assertEqual(health_worker_release_sha256(), sample["health_worker_release_sha256"])
 
 
 if __name__ == "__main__":

@@ -510,6 +510,7 @@ def build_health_srun_argv(
     gpus_per_node: int,
     interval: float,
     allocation_incarnation_sha256: str,
+    worker_release_sha256: str,
 ) -> list[str]:
     """Build one overlapping, allocation-wide GPU health monitor step."""
 
@@ -521,6 +522,8 @@ def build_health_srun_argv(
         raise ValueError("health interval must be positive")
     if len(allocation_incarnation_sha256) != 64:
         raise ValueError("health monitoring requires an allocation fingerprint")
+    if len(worker_release_sha256) != 64:
+        raise ValueError("health monitoring requires a worker fingerprint")
     nodes = len(node_names)
     return [
         "srun",
@@ -550,6 +553,8 @@ def build_health_srun_argv(
         str(interval),
         "--allocation-incarnation-sha256",
         allocation_incarnation_sha256,
+        "--worker-release-sha256",
+        worker_release_sha256,
     ]
 
 

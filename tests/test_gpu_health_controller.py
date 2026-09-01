@@ -13,6 +13,7 @@ from scruffy.controller import (
     _initialize_controller,
     _maintain_health_monitor,
 )
+from scruffy.health_worker import health_worker_release_sha256
 from scruffy.models import NodeInventory
 from scruffy.slurm import AllocationIncarnation, SlurmStep
 from scruffy.state import load_recovered_state
@@ -34,6 +35,12 @@ class GpuHealthControllerTests(unittest.TestCase):
             "v": 1,
             "node": "gpu-0",
             "recorded_at": (self.at + timedelta(seconds=offset)).isoformat(),
+            "health_worker_release_sha256": health_worker_release_sha256(),
+            "reservation_snapshot": {
+                "source": "state.json",
+                "node": "gpu-0",
+                "available": True,
+            },
             "cuda_probe": {
                 "ok": not failed,
                 "init_ok": True,
@@ -214,6 +221,8 @@ class GpuHealthControllerTests(unittest.TestCase):
         self.assertIn("--gpus-per-task=1", argv)
         self.assertIn("--allocation-incarnation-sha256", argv)
         self.assertIn(controller.allocation_incarnation.fingerprint_sha256, argv)
+        self.assertIn("--worker-release-sha256", argv)
+        self.assertIn(controller.health_worker_release_sha256, argv)
         self.assertEqual("starting", controller.state["gpu_health"]["monitor"]["status"])
 
     @mock.patch("scruffy.controller.subprocess.Popen")
@@ -250,6 +259,53 @@ class GpuHealthControllerTests(unittest.TestCase):
         error = controller.state["gpu_health"]["sample_errors"]["gpu-0"]
         self.assertIn("another allocation incarnation", error)
         self.assertNotIn("gpu-0", controller.state["gpu_health"]["nodes"])
+
+    def test_slurm_controller_rejects_a_sample_from_an_old_worker_release(self) -> None:
+        controller = self.slurm_controller()
+        sample = self.sample(0, failed=False)
+        sample["allocation_incarnation_sha256"] = (
+            controller.allocation_incarnation.fingerprint_sha256
+        )
+        sample["health_worker_release_sha256"] = "f" * 64
+        self.write_sample(sample)
+
+        _ingest_gpu_health(controller)
+
+        error = controller.state["gpu_health"]["sample_errors"]["gpu-0"]
+        self.assertIn("another worker release", error)
+        self.assertNotIn("gpu-0", controller.state["gpu_health"]["nodes"])
+
+    @mock.patch("scruffy.controller.cancel_step")
+    @mock.patch("scruffy.controller.subprocess.Popen")
+    def test_stale_health_monitor_is_replaced_without_launching_duplicate(
+        self, popen, cancel_step
+    ) -> None:
+        controller = self.slurm_controller()
+        controller.slurm_snapshot_at = 1
+        old_name = f"scruffy-health-{controller.allocation_incarnation.fingerprint_sha256[:12]}-gpu-0"
+        controller.slurm_steps = (SlurmStep("123.7", old_name, "gpu-0"),)
+
+        _maintain_health_monitor(controller)
+
+        cancel_step.assert_called_once_with("123", "123.7")
+        popen.assert_not_called()
+        self.assertNotIn("gpu-0", controller.health_step_ids)
+
+    @mock.patch("scruffy.controller.signal_process")
+    def test_health_monitor_absence_requires_two_snapshots(self, signal_process) -> None:
+        controller = self.slurm_controller()
+        process = mock.Mock()
+        process.poll.return_value = None
+        controller.health_processes["gpu-0"] = process
+        controller.health_launch_snapshot_at["gpu-0"] = 1
+        controller.slurm_snapshot_at = 2
+
+        _maintain_health_monitor(controller)
+        signal_process.assert_not_called()
+        self.assertEqual(1, controller.health_absence_confirmations["gpu-0"])
+
+        _maintain_health_monitor(controller)
+        signal_process.assert_called_once_with(process, mock.ANY)
 
     def test_unchanged_status_samples_do_not_grow_the_journal(self) -> None:
         controller = self.local_controller()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import hashlib
 import os
 import socket
 import subprocess
@@ -61,6 +62,10 @@ CUDA_ERROR_NAMES = {
     2: "CUDA_ERROR_OUT_OF_MEMORY",
     999: "CUDA_ERROR_UNKNOWN",
 }
+def health_worker_release_sha256() -> str:
+    """Return the content identity of this exact worker implementation."""
+
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def _run_query(fields: tuple[str, ...]) -> list[list[str]]:
@@ -238,7 +243,8 @@ def probe_cuda(*, skip_indices: Collection[int] | None = ()) -> dict[str, object
             if code == 0:
                 device_uuid = f"GPU-{uuid_module.UUID(bytes=bytes(uuid_bytes))}"
         skipped_busy = code == 0 and (skip_all or index in skipped)
-        inconclusive = skipped_busy
+        uuid_lookup_failed = device_uuid is None and operation.startswith("cuDeviceGetUuid")
+        inconclusive = skipped_busy or uuid_lookup_failed
         if code == 0 and not skipped_busy:
             context = ctypes.c_void_p()
             operation = "cuCtxCreate_v2"
@@ -285,7 +291,9 @@ def probe_cuda(*, skip_indices: Collection[int] | None = ()) -> dict[str, object
     }
 
 
-def _busy_gpu_indices(root: Path, node: str) -> frozenset[int] | None:
+def _reservation_snapshot(
+    root: Path, node: str
+) -> tuple[frozenset[int] | None, dict[str, object]]:
     """Return active Scruffy reservations for ``node``.
 
     ``state.json`` is atomically replaced by the controller.  ``None`` means
@@ -293,25 +301,49 @@ def _busy_gpu_indices(root: Path, node: str) -> frozenset[int] | None:
     for this sample while retaining passive telemetry.
     """
 
+    provenance: dict[str, object] = {
+        "source": "state.json",
+        "path": str(root / "state.json"),
+        "node": node,
+    }
     try:
         state = load_state(root)
     except (OSError, StorageError, TypeError, ValueError):
-        return None
+        provenance["available"] = False
+        return None, provenance
     if state is None:
-        return frozenset()
+        provenance["available"] = True
+        provenance["state_present"] = False
+        return frozenset(), provenance
+    provenance["available"] = True
+    provenance["state_present"] = True
+    if isinstance(state.get("updated_at"), str):
+        provenance["state_updated_at"] = state["updated_at"]
+    allocation = state.get("allocation")
+    if isinstance(allocation, Mapping):
+        incarnation = allocation.get("incarnation")
+        if isinstance(incarnation, Mapping) and isinstance(
+            incarnation.get("fingerprint_sha256"), str
+        ):
+            provenance["allocation_incarnation_sha256"] = incarnation[
+                "fingerprint_sha256"
+            ]
     jobs = state.get("jobs")
     if not isinstance(jobs, Mapping):
-        return None
+        provenance["available"] = False
+        return None, provenance
     busy: set[int] = set()
     for job in jobs.values():
         if not isinstance(job, Mapping) or job.get("state") not in ACTIVE_JOB_STATES:
             continue
         assignment = job.get("assignment")
         if not isinstance(assignment, Mapping):
-            return None
+            provenance["available"] = False
+            return None, provenance
         reservations = assignment.get("reservations")
         if not isinstance(reservations, list):
-            return None
+            provenance["available"] = False
+            return None, provenance
         for reservation in reservations:
             if not isinstance(reservation, Mapping) or reservation.get("node") != node:
                 continue
@@ -319,16 +351,36 @@ def _busy_gpu_indices(root: Path, node: str) -> frozenset[int] | None:
             if not isinstance(gpu_ids, list) or any(
                 type(gpu_id) is not int or gpu_id < 0 for gpu_id in gpu_ids
             ):
-                return None
+                provenance["available"] = False
+                return None, provenance
             busy.update(gpu_ids)
-    return frozenset(busy)
+    provenance["busy_gpu_indices"] = sorted(busy)
+    return frozenset(busy), provenance
+
+
+def _busy_gpu_indices(root: Path, node: str) -> frozenset[int] | None:
+    """Return active Scruffy reservations for ``node``."""
+
+    return _reservation_snapshot(root, node)[0]
 
 
 def collect_sample(
-    node: str, allocation_incarnation_sha256: str, *, root: Path | None = None
+    node: str,
+    allocation_incarnation_sha256: str,
+    *,
+    root: Path | None = None,
+    worker_release_sha256: str | None = None,
 ) -> dict[str, object]:
     devices, thermal_error = query_nvidia_gpus()
-    busy_indices = _busy_gpu_indices(root, node) if root is not None else frozenset()
+    if root is None:
+        busy_indices = frozenset()
+        reservation_provenance: dict[str, object] = {
+            "source": "unavailable",
+            "available": False,
+            "node": node,
+        }
+    else:
+        busy_indices, reservation_provenance = _reservation_snapshot(root, node)
     probe = probe_cuda(skip_indices=busy_indices)
     if busy_indices is None:
         probe["inconclusive"] = True
@@ -338,6 +390,9 @@ def collect_sample(
         "node": node,
         "recorded_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
         "allocation_incarnation_sha256": allocation_incarnation_sha256,
+        "health_worker_release_sha256": worker_release_sha256
+        or health_worker_release_sha256(),
+        "reservation_snapshot": reservation_provenance,
         "cuda_probe": probe,
         "thermal_query_error": thermal_error,
         "gpus": devices,
@@ -353,12 +408,15 @@ def run(
     *,
     interval: float,
     allocation_incarnation_sha256: str,
+    worker_release_sha256: str,
     once: bool = False,
 ) -> None:
     if interval <= 0:
         raise ValueError("interval must be positive")
     if len(allocation_incarnation_sha256) != 64:
         raise ValueError("allocation incarnation fingerprint must have 64 characters")
+    if len(worker_release_sha256) != 64:
+        raise ValueError("health worker release fingerprint must have 64 characters")
     node = _node_name()
     if not node or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
@@ -372,7 +430,12 @@ def run(
         started = time.monotonic()
         atomic_write_json(
             target,
-            collect_sample(node, allocation_incarnation_sha256, root=root),
+            collect_sample(
+                node,
+                allocation_incarnation_sha256,
+                root=root,
+                worker_release_sha256=worker_release_sha256,
+            ),
         )
         if once:
             return
@@ -384,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--interval", type=float, default=10.0)
     parser.add_argument("--allocation-incarnation-sha256", required=True)
+    parser.add_argument("--worker-release-sha256", required=True)
     parser.add_argument("--once", action="store_true")
     arguments = parser.parse_args(argv)
     try:
@@ -391,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             Path(arguments.root).expanduser().resolve(),
             interval=arguments.interval,
             allocation_incarnation_sha256=arguments.allocation_incarnation_sha256,
+            worker_release_sha256=arguments.worker_release_sha256,
             once=arguments.once,
         )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
