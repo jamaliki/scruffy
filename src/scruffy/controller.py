@@ -466,7 +466,11 @@ def _recovery_successor_spec(
         "job_id": successor_id,
         "request_id": request_id,
         "name": predecessor.get("name", predecessor["task_id"]),
-        "submitted_at": utc_now(),
+        # The predecessor loss event is durable before recovery admission, so
+        # it provides a stable timestamp across a crash/replay window.
+        "submitted_at": predecessor.get("finished_at")
+        or predecessor.get("submitted_at")
+        or utc_now(),
         "argv": copy.deepcopy(predecessor["argv"]),
         "cwd": predecessor["cwd"],
         "env": copy.deepcopy(predecessor.get("env", {})),
@@ -508,6 +512,25 @@ def _recovery_candidate(
     return successor_attempt, request_id, create_job_id(request_id, project_id=project_id)
 
 
+def _link_recovery_predecessor(
+    controller: Controller,
+    predecessor: dict[str, Any],
+    successor_id: str,
+    reason: str,
+) -> None:
+    """Repair and durably publish a predecessor's reverse lineage pointer."""
+
+    if predecessor.get("successor_job_id") == successor_id:
+        return
+    predecessor["successor_job_id"] = successor_id
+    emit(
+        controller,
+        "job.recovery_linked",
+        job=predecessor,
+        data={"successor_job_id": successor_id, "retry_reason": reason},
+    )
+
+
 def _admit_recovery_successor(
     controller: Controller,
     predecessor: dict[str, Any],
@@ -527,6 +550,15 @@ def _admit_recovery_successor(
             "retry_reason": reason,
         }
     )
+    if predecessor.get("dependency_gate_passed") is True:
+        for key in (
+            "dependency_gate_passed",
+            "condition_satisfactions",
+            "resolved_dependencies",
+            "resolved_conditions",
+        ):
+            if key in predecessor:
+                successor[key] = copy.deepcopy(predecessor[key])
     prospective[successor_id] = successor
     event_kind = _initial_job_event(controller, successor, prospective)
     write_request_record(controller.root, successor)
@@ -539,13 +571,7 @@ def _admit_recovery_successor(
         job=successor,
         data={"predecessor_job_id": predecessor["id"], "retry_reason": reason},
     )
-    predecessor["successor_job_id"] = successor_id
-    emit(
-        controller,
-        "job.recovery_linked",
-        job=predecessor,
-        data={"successor_job_id": successor_id, "retry_reason": reason},
-    )
+    _link_recovery_predecessor(controller, predecessor, successor_id, reason)
     record_request_receipt(controller.root, successor_id, job_identity_digest(spec))
 
 
@@ -570,7 +596,7 @@ def _recover_lost_workflow_jobs(controller: Controller, reason: str) -> None:
                 _storage_notice(controller, "read_recovery_receipt", successor_id, exc)
                 continue
         if existing is not None or predecessor.get("successor_job_id") == successor_id:
-            predecessor["successor_job_id"] = successor_id
+            _link_recovery_predecessor(controller, predecessor, successor_id, reason)
             continue
         _admit_recovery_successor(
             controller,
@@ -784,38 +810,106 @@ def _remember_condition(job: dict[str, Any], evidence: dict[str, Any]) -> bool:
     return True
 
 
+def _artifact_attempts(
+    workflow_jobs: Iterable[dict[str, Any]],
+    project_id: str,
+    workflow_id: str,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Return every valid logical producer attempt, newest evidence first."""
+
+    attempts = [
+        candidate
+        for candidate in workflow_jobs
+        if (
+            not candidate.get("workflow_invalid")
+            and job_project(candidate) == project_id
+            and candidate.get("workflow_id") == workflow_id
+            and candidate.get("task_id") == task_id
+        )
+    ]
+    return sorted(
+        attempts,
+        key=lambda candidate: (
+            int(candidate.get("attempt", 1))
+            if type(candidate.get("attempt")) is int
+            else 1,
+            int(candidate.get("queue_order", 0))
+            if type(candidate.get("queue_order")) is int
+            else 0,
+            str(candidate.get("id", "")),
+        ),
+        reverse=True,
+    )
+
+
+def _artifact_evidence(producer: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    """Yield durable and legacy artifact projections for one producer."""
+
+    for item in reversed(list(producer.get("artifact_evidence") or [])):
+        if not isinstance(item, dict):
+            continue
+        publication = item.get("publication")
+        if not isinstance(publication, dict):
+            continue
+        try:
+            publication = artifact_publication({"publication": publication})
+        except ValueError:
+            continue
+        if publication is None:
+            continue
+        yield {
+            "publication": publication,
+            "producer_event_id": item.get("producer_event_id"),
+            "occurred_at": item.get("occurred_at"),
+        }
+    workload = producer.get("workload")
+    artifacts = workload.get("latest_artifacts") if isinstance(workload, dict) else None
+    for item in reversed(artifacts if isinstance(artifacts, list) else []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            publication = artifact_publication(item)
+        except ValueError:
+            continue
+        if publication is not None:
+            yield {
+                "publication": publication,
+                "producer_event_id": item.get("event_id"),
+                "occurred_at": item.get("occurred_at"),
+            }
+
+
 def _satisfy_from_current_artifacts(
     job: dict[str, Any], workflow_jobs: Iterable[dict[str, Any]]
 ) -> None:
-    """Resolve a newly admitted wait from the producer's bounded live view."""
+    """Resolve a newly admitted wait from any valid producer attempt."""
 
-    selected = select_task_attempts(workflow_jobs)
+    workflow_jobs = list(workflow_jobs)
     project_id = job_project(job)
     workflow_id = str(job.get("workflow_id") or "")
     for task_id, artifact_id in artifact_conditions(job):
-        producer = selected.get((project_id, workflow_id, task_id))
-        workload = producer.get("workload") if producer is not None else None
-        artifacts = workload.get("latest_artifacts") if isinstance(workload, dict) else None
-        if not isinstance(artifacts, list):
-            continue
-        for item in reversed(artifacts):
-            if not isinstance(item, dict):
+        for producer in _artifact_attempts(workflow_jobs, project_id, workflow_id, task_id):
+            for item in _artifact_evidence(producer):
+                publication = item["publication"]
+                if publication.get("artifact_id") != artifact_id:
+                    continue
+                producer_event_id = item.get("producer_event_id")
+                occurred_at = item.get("occurred_at")
+                if not isinstance(producer_event_id, str) or not isinstance(occurred_at, str):
+                    continue
+                _remember_condition(
+                    job,
+                    _condition_evidence(
+                        producer=producer,
+                        publication=publication,
+                        producer_event_id=producer_event_id,
+                        occurred_at=occurred_at,
+                    ),
+                )
+                break
+            else:
                 continue
-            try:
-                publication = artifact_publication(item)
-            except ValueError:
-                continue
-            if publication is None or publication["artifact_id"] != artifact_id:
-                continue
-            _remember_condition(
-                job,
-                _condition_evidence(
-                    producer=producer,
-                    publication=publication,
-                    producer_event_id=str(item.get("event_id") or "unknown"),
-                    occurred_at=str(item.get("occurred_at") or "unknown"),
-                ),
-            )
             break
 
 
@@ -833,10 +927,12 @@ def _satisfy_artifact_waiters(
     if publication is None or not isinstance(workflow_id, str) or not isinstance(task_id, str):
         return
     project_id = job_project(producer)
-    selected = select_task_attempts(
-        _resolution_workflow_jobs(controller.state["jobs"].values(), project_id, workflow_id)
-    ).get((project_id, workflow_id, task_id))
-    if selected is None or selected.get("id") != producer.get("id"):
+    if (
+        producer.get("workflow_invalid")
+        or producer.get("workflow_id") != workflow_id
+        or producer.get("task_id") != task_id
+        or job_project(producer) != project_id
+    ):
         return
     for job in controller.state["jobs"].values():
         if (
@@ -884,10 +980,18 @@ def _initial_job_event(
     if job.get("workflow_id") is None:
         return "job.queued"
 
+    all_workflow_jobs = [
+        candidate
+        for candidate in prospective.values()
+        if (
+            job_project(candidate) == job_project(job)
+            and candidate.get("workflow_id") == job["workflow_id"]
+        )
+    ]
+    _satisfy_from_current_artifacts(job, all_workflow_jobs)
     workflow_jobs = _resolution_workflow_jobs(
-        prospective.values(), job_project(job), job["workflow_id"]
+        all_workflow_jobs, job_project(job), job["workflow_id"]
     )
-    _satisfy_from_current_artifacts(job, workflow_jobs)
     resolution = resolve_dependencies(job, workflow_jobs)
     job["blockers"] = resolution["blockers"]
     if resolution["decision"] == "ready":
@@ -1018,6 +1122,17 @@ def _stage_atomic_submission(
     specs = _atomic_specs(submission_id, document)
     staged: list[dict[str, Any]] = []
     candidate_state = dict(prospective)
+    project_id = normalize_project_id(document.get("project_id"))
+    workflow_id = str(document["workflow_id"])
+    archived = _archived_workflow_jobs(controller, project_id, workflow_id)
+    if archived is None:
+        raise TransientStorageError(
+            f"workflow history unavailable for {project_id}/{workflow_id}"
+        )
+    candidate_state = {
+        **{job["id"]: job for job in archived},
+        **candidate_state,
+    }
     for offset, spec in enumerate(specs, start=1):
         job_id = str(spec["job_id"])
         if (
@@ -1032,8 +1147,6 @@ def _stage_atomic_submission(
         staged.append(job)
         candidate_state[job_id] = job
 
-    workflow_id = str(document["workflow_id"])
-    project_id = normalize_project_id(document.get("project_id"))
     workflow_jobs = _resolution_workflow_jobs(candidate_state.values(), project_id, workflow_id)
     validate_workflows(workflow_jobs)
     impossible = [

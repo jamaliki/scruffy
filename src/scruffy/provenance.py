@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from .models import Assignment, job_project
-from .storage import atomic_write_json
+from .storage import (
+    StorageError,
+    atomic_write_json,
+    create_immutable_json,
+    read_immutable_json,
+)
 
 
 def _digest(value: object) -> str:
@@ -32,6 +37,21 @@ def provenance_files(root: Path, job_id: str) -> tuple[Path, Path]:
 
     directory = root / "provenance" / job_id
     return directory / "launch.json", directory / "result.json"
+
+
+def _write_immutable_record(path: Path, record: dict[str, Any]) -> str:
+    """Create a provenance record once, accepting only an identical replay."""
+
+    try:
+        stored, digest = read_immutable_json(path)
+    except FileNotFoundError:
+        try:
+            return create_immutable_json(path, record)
+        except FileExistsError:
+            stored, digest = read_immutable_json(path)
+    if stored != record:
+        raise StorageError(f"conflicting immutable provenance record {path}")
+    return digest
 
 
 def write_request_record(root: Path, job: dict[str, Any]) -> Path:
@@ -66,7 +86,7 @@ def write_request_record(root: Path, job: dict[str, Any]) -> Path:
         "wait_for": list(job.get("wait_for") or []),
     }
     digest = _digest(record)
-    atomic_write_json(request_file, record, mode=0o444)
+    _write_immutable_record(request_file, record)
     job["provenance"] = {
         **(job.get("provenance") or {}),
         "request": str(request_file.relative_to(root)),
@@ -134,7 +154,7 @@ def write_launch_record(
         job=job,
         assignment=assignment,
     )
-    atomic_write_json(launch_file, record, mode=0o444)
+    _write_immutable_record(launch_file, record)
     job["provenance"] = {
         **(job.get("provenance") or {}),
         "launch": str(launch_file.relative_to(root)),
@@ -164,5 +184,11 @@ def write_result_record(root: Path, job: Mapping[str, Any]) -> Path:
         "stdout_bytes": job.get("stdout_bytes"),
         "stderr_bytes": job.get("stderr_bytes"),
     }
-    atomic_write_json(result_file, record, mode=0o444)
+    # Records without an attempt or authenticated launch belong to legacy job
+    # images, which may be reused by old callers. They have no immutable
+    # execution identity to protect; modern admitted jobs take the strict path.
+    if type(job.get("attempt")) is not int and record["launch_sha256"] is None:
+        atomic_write_json(result_file, record, mode=0o444)
+    else:
+        _write_immutable_record(result_file, record)
     return result_file

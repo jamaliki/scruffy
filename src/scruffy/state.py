@@ -16,7 +16,7 @@ from .models import (
     NodeInventory,
     job_project,
 )
-from .protocol import EVENT_KINDS
+from .protocol import EVENT_KINDS, artifact_publication
 from .runtime import Controller
 from .scheduler import available_resources
 from .storage import (
@@ -138,6 +138,29 @@ def apply_workload_event(
             key=lambda item: _event_key(item["occurred_at"], item["event_id"])
         )
         workload["latest_artifacts"] = artifacts[-8:]
+        try:
+            publication = artifact_publication(data)
+        except ValueError:
+            publication = None
+        if publication is not None:
+            evidence = [
+                item
+                for item in list(job.get("artifact_evidence") or [])
+                if item.get("producer_event_id") != event["event_id"]
+            ]
+            evidence.append(
+                {
+                    "publication": publication,
+                    "producer_event_id": event["event_id"],
+                    "occurred_at": event["occurred_at"],
+                }
+            )
+            evidence.sort(
+                key=lambda item: _event_key(
+                    item["occurred_at"], item["producer_event_id"]
+                )
+            )
+            job["artifact_evidence"] = evidence[-8:]
     elif kind == "workload.notice" and _is_newer(event, workload, "notice"):
         workload["last_notice"] = {
             **data,
