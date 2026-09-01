@@ -127,6 +127,13 @@ projection required for replay. An operator-command outcome also includes the
 correlated `data.request_id`. Producers cannot publish this event kind or
 directly change quarantine state.
 
+Evacuation-capable launch records carry a per-launch `launch_token`; the worker
+runtime copies it into the report `source`, and the controller requires an
+exact match before accepting reports for that modern job, including after it is
+archived. Legacy jobs without a launch token retain the existing queue-root
+write trust boundary. A report never authenticates a different job or workflow
+by naming alone.
+
 ## Authority
 
 Workload events update `job.workload` in the current snapshot. They cannot

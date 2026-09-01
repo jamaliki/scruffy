@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +245,114 @@ def resume_queue(root: Path) -> dict[str, Any]:
     return {"request_id": request_id, "state": "resume_requested"}
 
 
+def request_evacuation(
+    root: Path,
+    *,
+    job_id: str | None = None,
+    project_id: str | None = None,
+    workflow_id: str | None = None,
+    request_id: str | None = None,
+    resume_after: bool = False,
+) -> dict[str, Any]:
+    """Durably request one scoped allocation evacuation."""
+
+    if job_id is not None and (project_id is not None or workflow_id is not None):
+        raise ValueError("--job cannot be combined with project or workflow")
+    if workflow_id is not None and project_id is None:
+        raise ValueError("workflow evacuation requires a project")
+    scope: dict[str, str] = {}
+    if job_id is not None:
+        if not isinstance(job_id, str) or not job_id.strip() or "/" in job_id:
+            raise ValueError("job_id must be a non-empty path-safe string")
+        scope["job_id"] = job_id
+    if project_id is not None:
+        scope["project_id"] = normalize_project_id(project_id)
+    if workflow_id is not None:
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            raise ValueError("workflow_id must be a non-empty string")
+        scope["workflow_id"] = workflow_id
+    if request_id is None:
+        request_id = f"evacuate-{uuid.uuid4().hex}"
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or "/" in request_id
+        or len(request_id) > 200
+    ):
+        raise ValueError("request_id must be a non-empty path-safe string")
+    if not isinstance(resume_after, bool):
+        raise TypeError("resume_after must be a boolean")
+    submit_command(
+        root,
+        {
+            "kind": "evacuate",
+            "request_id": request_id,
+            "scope": scope,
+            "resume_after": resume_after,
+        },
+    )
+    return {
+        "request_id": request_id,
+        "state": "evacuation_requested",
+        "scope": scope,
+        "resume_after": resume_after,
+    }
+
+
+def wait_for_evacuation(
+    root: Path, request_id: str, *, timeout: float | None = None
+) -> dict[str, Any]:
+    """Wait for one evacuation request to reach a terminal operation state."""
+
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("request_id must be a non-empty string")
+    deadline = None if timeout is None else time.monotonic() + max(timeout, 0)
+    discovered_deadline: float | None = None
+    while True:
+        snapshot = status(root)
+        evacuation = snapshot.get("evacuation")
+        if isinstance(evacuation, dict) and evacuation.get("request_id") == request_id:
+            if deadline is None:
+                target_deadlines = [
+                    item.get("deadline_at")
+                    for item in (evacuation.get("targets") or {}).values()
+                    if isinstance(item, dict)
+                ]
+                parsed = []
+                for value in target_deadlines:
+                    if isinstance(value, str):
+                        try:
+                            parsed_at = datetime.fromisoformat(value)
+                            parsed.append(
+                                time.monotonic()
+                                + max(
+                                    0,
+                                    (
+                                        parsed_at - datetime.now(parsed_at.tzinfo)
+                                    ).total_seconds(),
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                if parsed:
+                    discovered_deadline = max(parsed) + 1
+                elif evacuation.get("state") == "requested":
+                    discovered_deadline = time.monotonic() + 60
+                else:
+                    discovered_deadline = time.monotonic() + 1
+                deadline = discovered_deadline
+            if evacuation.get("state") in {"complete", "partial"}:
+                return evacuation
+        history = snapshot.get("evacuation_history")
+        if isinstance(history, dict):
+            previous = history.get(request_id)
+            if isinstance(previous, dict) and previous.get("state") in {"complete", "partial"}:
+                return previous
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for evacuation {request_id}")
+        time.sleep(0.2)
+
+
 def quarantine_gpu(
     root: Path, node: str, uuid: str, *, reason: str | None = None
 ) -> dict[str, Any]:
@@ -434,6 +543,8 @@ def status(
             "draining": False,
             "drain_requested": False,
             "launches_paused": False,
+            "evacuation": None,
+            "evacuation_history": {},
         }
     state.pop("report_acks", None)
     state.pop("report_ack_v", None)

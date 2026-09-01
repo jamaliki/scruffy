@@ -491,6 +491,9 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "draining": False,
                 "drain_requested": False,
                 "launches_paused": False,
+                "evacuation": None,
+                "evacuation_requests": {},
+                "evacuation_history": {},
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -573,6 +576,23 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
             state["launches_paused"] = False
             if isinstance(state.get("allocation"), dict):
                 state["allocation"]["state"] = "running"
+        if event.get("kind", "").startswith("evacuation."):
+            data = event.get("data")
+            if isinstance(data, dict):
+                evacuation = data.get("evacuation")
+                request_id = data.get("request_id")
+                request = data.get("request")
+                if isinstance(evacuation, dict):
+                    state["evacuation"] = copy.deepcopy(evacuation)
+                    evacuation_id = evacuation.get("request_id")
+                    if isinstance(evacuation_id, str):
+                        state.setdefault("evacuation_history", {})[
+                            evacuation_id
+                        ] = copy.deepcopy(evacuation)
+                if isinstance(request_id, str) and isinstance(request, dict):
+                    state.setdefault("evacuation_requests", {})[request_id] = copy.deepcopy(
+                        request
+                    )
         state["last_seq"] = max(int(state.get("last_seq", 0)), int(event["seq"]))
     state["journal_offset"] = journal_offset
     state.setdefault("report_acks", {})
@@ -592,4 +612,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
         }
     state.setdefault("drain_requested", False)
     state.setdefault("launches_paused", False)
+    state.setdefault("evacuation", None)
+    state.setdefault("evacuation_requests", {})
+    state.setdefault("evacuation_history", {})
     return state

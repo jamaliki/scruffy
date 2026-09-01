@@ -99,6 +99,7 @@ class Controller:
     journal: TextIO
     messages: MessageQueue
     output: OutputNotifier
+    evacuate_before_end_seconds: float = 0.0
     allocation_incarnation: AllocationIncarnation | None = None
     running: dict[str, RunningProcess] = field(default_factory=dict)
     stopping: bool = False

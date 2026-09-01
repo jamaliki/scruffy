@@ -62,6 +62,7 @@ from .slurm import (
     build_health_srun_argv,
     build_srun_environment,
     cancel_step,
+    signal_step,
 )
 from .state import (
     apply_workload_event,
@@ -82,6 +83,7 @@ from .storage import (
     archive_terminal_job,
     compact_report_receipts,
     controller_lock,
+    create_immutable_json,
     create_job_id,
     ensure_layout,
     find_archived_job,
@@ -93,6 +95,7 @@ from .storage import (
     list_submissions,
     open_journal,
     read_events,
+    read_immutable_json,
     read_json,
     record_request_receipt,
     recovery_request_id,
@@ -130,7 +133,15 @@ COMMAND_OUTCOME_KINDS = {
     "allocation.launches_resumed",
     "allocation.resume_ignored",
     "resource.gpu_health_changed",
+    "evacuation.requested",
+    "evacuation.replayed",
+    "evacuation.complete",
+    "evacuation.partial",
 }
+
+EVACUATION_TERMINAL_OUTCOMES = frozenset(
+    {"completed", "retry_queued", "not_restartable", "timed_out", "lost"}
+)
 
 
 def _initialize_controller(
@@ -145,6 +156,7 @@ def _initialize_controller(
     allocation_incarnation: AllocationIncarnation | None = None,
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
+    evacuate_before_end_seconds: float = 0,
     gpu_health_mode: str = "observe",
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
@@ -223,6 +235,7 @@ def _initialize_controller(
         poll_interval=poll_interval,
         cancel_grace=cancel_grace,
         drain_before_end_seconds=drain_before_end_seconds,
+        evacuate_before_end_seconds=evacuate_before_end_seconds,
         state=state,
         journal=journal,
         messages=messages,
@@ -238,6 +251,24 @@ def _initialize_controller(
             else None
         ),
     )
+
+    if replacement:
+        evacuation = state.get("evacuation")
+        request = (
+            state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
+            if isinstance(evacuation, dict)
+            else None
+        )
+        if (
+            isinstance(evacuation, dict)
+            and evacuation.get("state") not in {"complete", "partial"}
+            and isinstance(request, dict)
+        ):
+            for target in evacuation.get("targets", {}).values():
+                if isinstance(target, dict) and target.get("outcome") not in EVACUATION_TERMINAL_OUTCOMES:
+                    target.update({"outcome": "lost", "reason": "allocation_replaced"})
+            evacuation["state"] = "partial"
+            _evacuation_emit(controller, evacuation, request, "evacuation.partial")
 
     lost_reason = None
     if same_slurm_allocation:
@@ -332,6 +363,13 @@ def _initialize_controller(
         deadline = datetime.fromisoformat(deadline_at)
         metadata["automatic_drain_at"] = (
             (deadline - timedelta(seconds=drain_before_end_seconds))
+            .astimezone(UTC)
+            .isoformat(timespec="seconds")
+        )
+    if evacuate_before_end_seconds and isinstance(deadline_at, str):
+        deadline = datetime.fromisoformat(deadline_at)
+        metadata["automatic_evacuate_at"] = (
+            (deadline - timedelta(seconds=evacuate_before_end_seconds))
             .astimezone(UTC)
             .isoformat(timespec="seconds")
         )
@@ -535,7 +573,7 @@ def _recovery_candidate(
     task_id = predecessor.get("task_id")
     policy = _recovery_policy(predecessor)
     if (
-        predecessor.get("state") != "lost"
+        predecessor.get("state") not in {"lost", "failed"}
         or not isinstance(workflow_id, str)
         or not isinstance(task_id, str)
         or policy is None
@@ -653,6 +691,369 @@ def _recover_lost_workflow_jobs(controller: Controller, reason: str) -> None:
     controller.state["next_queue_order"] = max(
         int(controller.state.get("next_queue_order", 0)), next_order
     )
+
+
+def _evacuation_request(
+    command: dict[str, Any], *, automatic: bool = False
+) -> tuple[str, dict[str, Any], bool]:
+    """Validate and canonicalize one evacuation command."""
+
+    request_id = command.get("request_id")
+    if not isinstance(request_id, str) or not request_id or "/" in request_id:
+        raise ValueError("evacuation request_id must be a path-safe string")
+    raw_scope = command.get("scope", {})
+    if not isinstance(raw_scope, dict):
+        raise TypeError("evacuation scope must be an object")
+    if set(raw_scope) - {"job_id", "project_id", "workflow_id"}:
+        raise ValueError("evacuation scope has unknown fields")
+    scope = {
+        key: value
+        for key, value in raw_scope.items()
+        if value is not None
+    }
+    if "job_id" in scope and ("project_id" in scope or "workflow_id" in scope):
+        raise ValueError("job scope cannot include project or workflow")
+    if "workflow_id" in scope and "project_id" not in scope:
+        raise ValueError("workflow scope requires project_id")
+    for key, value in scope.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"evacuation {key} must be a non-empty string")
+    if "project_id" in scope:
+        scope["project_id"] = normalize_project_id(scope["project_id"])
+    resume_after = command.get("resume_after", False)
+    if not isinstance(resume_after, bool):
+        raise TypeError("evacuation resume_after must be boolean")
+    request = {
+        "scope": scope,
+        "resume_after": resume_after,
+        "automatic": automatic,
+    }
+    return request_id, request, resume_after
+
+
+def _evacuation_matches_scope(job: dict[str, Any], scope: dict[str, str]) -> bool:
+    if "job_id" in scope:
+        return job.get("id") == scope["job_id"]
+    if "project_id" in scope and job_project(job) != scope["project_id"]:
+        return False
+    return "workflow_id" not in scope or job.get("workflow_id") == scope["workflow_id"]
+
+
+def _evacuation_emit(
+    controller: Controller,
+    evacuation: dict[str, Any],
+    request: dict[str, Any],
+    kind: str,
+) -> None:
+    request_id = evacuation["request_id"]
+    controller.state["evacuation"] = copy.deepcopy(evacuation)
+    controller.state.setdefault("evacuation_requests", {})[request_id] = copy.deepcopy(
+        request
+    )
+    controller.state.setdefault("evacuation_history", {})[request_id] = copy.deepcopy(
+        evacuation
+    )
+    emit(
+        controller,
+        kind,
+        data={
+            "request_id": request_id,
+            "request": copy.deepcopy(request),
+            "evacuation": copy.deepcopy(evacuation),
+        },
+    )
+
+
+def _begin_evacuation(
+    controller: Controller,
+    command: dict[str, Any],
+    *,
+    automatic: bool = False,
+) -> None:
+    request_id, request, resume_after = _evacuation_request(
+        command, automatic=automatic
+    )
+    stored_request = controller.state.setdefault("evacuation_requests", {}).get(request_id)
+    if stored_request is not None:
+        if stored_request != request:
+            raise StorageError(f"conflicting evacuation request ID {request_id!r}")
+        current = controller.state.get("evacuation_history", {}).get(request_id)
+        if isinstance(current, dict):
+            emit(
+                controller,
+                "evacuation.replayed",
+                data={
+                    "request_id": request_id,
+                    "request": copy.deepcopy(request),
+                    "evacuation": copy.deepcopy(current),
+                },
+            )
+        return
+    current = controller.state.get("evacuation")
+    if isinstance(current, dict) and current.get("state") not in {"complete", "partial"}:
+        raise StorageError("another evacuation is already in progress")
+    scope = request["scope"]
+    if "job_id" in scope and scope["job_id"] not in controller.state["jobs"]:
+        raise KeyError(f"unknown job {scope['job_id']}")
+    requested_at = utc_now()
+    targets: dict[str, dict[str, Any]] = {}
+    for job in sorted(
+        controller.state["jobs"].values(),
+        key=lambda candidate: (int(candidate.get("queue_order", 0)), str(candidate["id"])),
+    ):
+        if job.get("state") != "running" or not _evacuation_matches_scope(job, scope):
+            continue
+        policy = job.get("recovery") if isinstance(job.get("recovery"), dict) else None
+        evacuation_policy = policy.get("evacuation") if policy else None
+        target = {
+            "job_id": job["id"],
+            "request_id": request_id,
+            "outcome": "pending",
+            "requested_at": requested_at,
+            "assignment": copy.deepcopy(job.get("assignment")),
+            "launch_token": job.get("launch_token"),
+            "allocation_incarnation_sha256": job.get("allocation_incarnation_sha256"),
+        }
+        if not isinstance(evacuation_policy, dict):
+            target.update({"outcome": "not_restartable", "reason": "no_evacuation_policy"})
+        else:
+            target.update(
+                {
+                    "signal": evacuation_policy["signal"],
+                    "grace_seconds": evacuation_policy["grace_seconds"],
+                    "deadline_at": (
+                        datetime.fromisoformat(requested_at) + timedelta(
+                            seconds=evacuation_policy["grace_seconds"]
+                        )
+                    ).astimezone(UTC).isoformat(timespec="seconds"),
+                }
+            )
+        targets[job["id"]] = target
+    evacuation = {
+        "v": 1,
+        "request_id": request_id,
+        "state": "requested",
+        "scope": copy.deepcopy(scope),
+        "resume_after": resume_after,
+        "automatic": automatic,
+        "requested_at": requested_at,
+        "targets": targets,
+    }
+    # Draining is part of the request transaction and precedes target
+    # selection/signalling.  Running jobs retain their assignments.
+    controller.state["draining"] = True
+    controller.state["drain_requested"] = True
+    controller.state["allocation"]["state"] = "draining"
+    _evacuation_emit(controller, evacuation, request, "evacuation.requested")
+
+
+def _signal_receipt_path(controller: Controller, job_id: str, request_id: str) -> Path:
+    digest = hashlib.sha256(request_id.encode()).hexdigest()[:24]
+    return controller.root / "provenance" / job_id / f"evacuation-{digest}.signal.json"
+
+
+def _signal_receipt(
+    controller: Controller, job: dict[str, Any], target: dict[str, Any]
+) -> dict[str, Any] | None:
+    source = _signal_receipt_path(controller, job["id"], target["request_id"])
+    if not source.exists():
+        return None
+    record, _ = read_immutable_json(source)
+    if not isinstance(record, dict):
+        raise StorageError(f"invalid evacuation signal receipt {source}")
+    return record
+
+
+def _write_signal_receipt(
+    controller: Controller, job: dict[str, Any], target: dict[str, Any]
+) -> None:
+    source = _signal_receipt_path(controller, job["id"], target["request_id"])
+    record = {
+        "v": 1,
+        "request_id": target["request_id"],
+        "job_id": job["id"],
+        "launch_token": job.get("launch_token"),
+        "assignment": copy.deepcopy(job.get("assignment")),
+        "allocation_incarnation_sha256": job.get("allocation_incarnation_sha256"),
+    }
+    try:
+        create_immutable_json(source, record)
+    except FileExistsError:
+        stored, _ = read_immutable_json(source)
+        if stored != record:
+            raise StorageError(f"conflicting evacuation signal receipt {source}")
+
+
+def _owned_slurm_step(controller: Controller, job: dict[str, Any]) -> str:
+    expected = job.get("slurm_step_id")
+    token = job.get("launch_token")
+    matches = [
+        step
+        for step in controller.slurm_steps
+        if (expected and step.step_id == expected) or (token and step.name == token)
+    ]
+    matches = list({step.step_id: step for step in matches}.values())
+    if len(matches) != 1:
+        raise StorageError(f"cannot prove one owned Slurm step for {job['id']}")
+    prefix = f"{controller.slurm_job_id}."
+    step_id = matches[0].step_id
+    suffix = step_id.removeprefix(prefix)
+    if not step_id.startswith(prefix) or not suffix.isascii() or not suffix.isdecimal():
+        raise StorageError(f"invalid owned Slurm step for {job['id']}")
+    return step_id
+
+
+def _target_identity_valid(
+    controller: Controller, job: dict[str, Any], target: dict[str, Any]
+) -> bool:
+    if job.get("state") != "running" or job.get("assignment") != target.get("assignment"):
+        return False
+    if controller.launcher == "slurm":
+        incarnation = controller.allocation_incarnation
+        return bool(
+            isinstance(job.get("launch_token"), str)
+            and incarnation is not None
+            and job.get("allocation_incarnation_sha256") == incarnation.fingerprint_sha256
+            and target.get("launch_token") == job.get("launch_token")
+            and target.get("allocation_incarnation_sha256") == incarnation.fingerprint_sha256
+        )
+    running = controller.running.get(job["id"])
+    return running is not None and running.process is not None
+
+
+def _signal_evacuation_target(
+    controller: Controller, evacuation: dict[str, Any], target: dict[str, Any]
+) -> None:
+    job = controller.state["jobs"].get(target["job_id"])
+    if not isinstance(job, dict):
+        target.update({"outcome": "lost", "reason": "job_missing"})
+        return
+    if job.get("state") == "succeeded":
+        target["outcome"] = "completed"
+        return
+    if not _target_identity_valid(controller, job, target):
+        target.update({"outcome": "lost", "reason": "launch_identity_changed"})
+        return
+    receipt = _signal_receipt(controller, job, target)
+    if receipt is not None:
+        target.update({"outcome": "waiting", "signal_replayed": True})
+        return
+    target.update({"outcome": "signalling", "signal_decided_at": utc_now()})
+    request = controller.state.setdefault("evacuation_requests", {})[evacuation["request_id"]]
+    _evacuation_emit(controller, evacuation, request, "evacuation.signalling")
+    try:
+        if controller.launcher == "slurm":
+            step_id = _owned_slurm_step(controller, job)
+            job["slurm_step_id"] = step_id
+            signal_step(controller.slurm_job_id or "", step_id, target["signal"])
+        else:
+            running = controller.running[job["id"]]
+            signal_process(running.process, signal.Signals.SIGUSR1)
+    except (KeyboardInterrupt, SystemExit):
+        # The side effect may have happened immediately before a crash. A
+        # durable receipt makes replay at-most-once rather than risking a
+        # second signal.
+        _write_signal_receipt(controller, job, target)
+        raise
+    except (OSError, StorageError, ValueError, subprocess.SubprocessError) as exc:
+        target.update({"outcome": "lost", "reason": f"signal_failed:{exc}"})
+        _evacuation_emit(controller, evacuation, request, "evacuation.target_failed")
+        return
+    _write_signal_receipt(controller, job, target)
+    target.update({"outcome": "waiting", "signalled_at": utc_now()})
+    evacuation["state"] = "waiting"
+    _evacuation_emit(controller, evacuation, request, "evacuation.waiting")
+
+
+def _evacuation_target_terminal(
+    controller: Controller, evacuation: dict[str, Any], target: dict[str, Any]
+) -> None:
+    job = controller.state["jobs"].get(target["job_id"])
+    if not isinstance(job, dict):
+        target.update({"outcome": "lost", "reason": "job_missing"})
+        return
+    state = job.get("state")
+    if state == "succeeded":
+        target["outcome"] = "completed"
+        return
+    if state == "failed" and job.get("reason") == "evacuated":
+        candidate = _recovery_candidate(job, "evacuated")
+        if candidate is None:
+            _mark_retry_exhaustion(job, "evacuated")
+            target.update({"outcome": "lost", "reason": "not_restartable"})
+            return
+        attempt, request_id, successor_id = candidate
+        existing = controller.state["jobs"].get(successor_id)
+        if existing is None:
+            existing = find_archived_job(controller.root, successor_id)
+        if existing is None:
+            next_order = max(
+                (int(item.get("queue_order", 0)) for item in controller.state["jobs"].values()),
+                default=0,
+            )
+            _admit_recovery_successor(
+                controller,
+                job,
+                successor_id,
+                request_id,
+                attempt,
+                next_order + 1,
+                dict(controller.state["jobs"]),
+                "evacuated",
+            )
+        _link_recovery_predecessor(controller, job, successor_id, "evacuated")
+        target.update({"outcome": "retry_queued", "successor_job_id": successor_id})
+        return
+    if state in TERMINAL_JOB_STATES:
+        target.update({"outcome": "lost", "reason": f"job_{state}"})
+
+
+def _advance_evacuation(controller: Controller) -> None:
+    evacuation = controller.state.get("evacuation")
+    if not isinstance(evacuation, dict) or evacuation.get("state") in {"complete", "partial"}:
+        return
+    request_id = evacuation.get("request_id")
+    request = controller.state.setdefault("evacuation_requests", {}).get(request_id)
+    if not isinstance(request_id, str) or not isinstance(request, dict):
+        return
+    for target in evacuation.get("targets", {}).values():
+        if not isinstance(target, dict):
+            continue
+        if target.get("outcome") in {"pending", "signalling"}:
+            _signal_evacuation_target(controller, evacuation, target)
+        if target.get("outcome") in {"waiting", "checkpointed"}:
+            _evacuation_target_terminal(controller, evacuation, target)
+            if target.get("outcome") in {"waiting", "checkpointed"}:
+                deadline = target.get("deadline_at")
+                if isinstance(deadline, str):
+                    try:
+                        expired = datetime.now(UTC) >= datetime.fromisoformat(deadline)
+                    except ValueError:
+                        expired = True
+                    if expired:
+                        target.update({"outcome": "timed_out", "reason": "grace_expired"})
+    outcomes = [
+        target.get("outcome")
+        for target in evacuation.get("targets", {}).values()
+        if isinstance(target, dict)
+    ]
+    if outcomes and all(outcome in {"completed", "retry_queued"} for outcome in outcomes):
+        evacuation["state"] = "complete"
+        if evacuation.get("resume_after"):
+            controller.state["draining"] = False
+            controller.state["drain_requested"] = False
+            controller.state["allocation"]["state"] = "running"
+        _evacuation_emit(controller, evacuation, request, "evacuation.complete")
+    elif outcomes and all(outcome in EVACUATION_TERMINAL_OUTCOMES for outcome in outcomes):
+        evacuation["state"] = "partial"
+        _evacuation_emit(controller, evacuation, request, "evacuation.partial")
+    elif not outcomes:
+        evacuation["state"] = "complete"
+        if evacuation.get("resume_after"):
+            controller.state["draining"] = False
+            controller.state["drain_requested"] = False
+            controller.state["allocation"]["state"] = "running"
+        _evacuation_emit(controller, evacuation, request, "evacuation.complete")
 
 
 def _resolution_workflow_jobs(
@@ -1054,6 +1455,39 @@ def _satisfy_artifact_waiters(
             )
 
 
+def _record_evacuation_checkpoint(
+    controller: Controller,
+    job: dict[str, Any],
+    event: dict[str, Any],
+    publication: dict[str, Any] | None,
+) -> None:
+    """Record a strict checkpoint observed after an evacuation request."""
+
+    if publication is None or event.get("data", {}).get("artifact_type") != "checkpoint":
+        return
+    evacuation = controller.state.get("evacuation")
+    if not isinstance(evacuation, dict):
+        return
+    target = evacuation.get("targets", {}).get(job.get("id"))
+    requested_at = target.get("requested_at") if isinstance(target, dict) else None
+    if not isinstance(target, dict) or not isinstance(requested_at, str):
+        return
+    try:
+        after_request = datetime.fromisoformat(event["occurred_at"]) >= datetime.fromisoformat(
+            requested_at
+        )
+    except (KeyError, TypeError, ValueError):
+        return
+    if not after_request or target.get("outcome") not in {"waiting", "checkpointed"}:
+        return
+    target["outcome"] = "checkpointed"
+    target["checkpoint_event_id"] = event["event_id"]
+    target["checkpoint_publication"] = copy.deepcopy(publication)
+    request = controller.state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
+    if isinstance(request, dict):
+        _evacuation_emit(controller, evacuation, request, "evacuation.checkpointed")
+
+
 def _has_artifact_wait_reference(
     controller: Controller, producer: dict[str, Any], artifact_id: str
 ) -> bool:
@@ -1155,7 +1589,7 @@ def _report_capability_valid(job: dict[str, Any], event: dict[str, Any]) -> bool
 
     expected = job.get("launch_token")
     supplied = event.get("source", {}).get("launch_token")
-    return not isinstance(expected, str) or supplied in {None, expected}
+    return not isinstance(expected, str) or supplied == expected
 
 
 def _initial_job_event(
@@ -1734,6 +2168,18 @@ def _ingest_commands(controller: Controller) -> None:
                     "allocation.launches_resumed",
                     data={**data, "cleared_drain": was_draining},
                 )
+        elif kind == "evacuate":
+            try:
+                _begin_evacuation(controller, command)
+            except (KeyError, StorageError, TypeError, ValueError) as exc:
+                emit(
+                    controller,
+                    "command.rejected",
+                    data={
+                        "request_id": command.get("request_id"),
+                        "reason": str(exc),
+                    },
+                )
         elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
             request_id = command.get("request_id")
             try:
@@ -2033,6 +2479,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
             _retain_exact_artifact_evidence(
                 controller, job, event, publication
             )
+            _record_evacuation_checkpoint(controller, job, event, publication)
             archive_terminal_job(controller.root, job)
         journal_event = emit(
             controller,
@@ -2055,6 +2502,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                     _retain_exact_artifact_evidence(
                         controller, job, event, publication
                     )
+                    _record_evacuation_checkpoint(controller, job, event, publication)
         if event["kind"] == "workload.artifact":
             _satisfy_artifact_waiters(
                 controller,
@@ -2373,6 +2821,8 @@ def _serve(controller: Controller) -> None:
             _ingest_requests(controller)
             _ingest_commands(controller)
             _drain_for_deadline(controller)
+            _evacuate_for_deadline(controller)
+            _advance_evacuation(controller)
             drain_messages(controller)
             poll_processes(controller)
             _maintain_health_monitor(controller)
@@ -2404,6 +2854,41 @@ def _serve(controller: Controller) -> None:
         signal.signal(signal.SIGINT, previous_int)
 
 
+def _evacuate_for_deadline(controller: Controller) -> None:
+    """Start the same evacuation state machine at the configured deadline."""
+
+    if controller.state.get("evacuation") is not None:
+        return
+    allocation = controller.state.get("allocation")
+    evacuate_at = (
+        allocation.get("automatic_evacuate_at")
+        if isinstance(allocation, dict)
+        else None
+    )
+    if not isinstance(evacuate_at, str):
+        return
+    try:
+        due = datetime.fromisoformat(evacuate_at)
+    except ValueError:
+        return
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    if datetime.now(UTC) < due:
+        return
+    request_id = "deadline-evacuation"
+    if controller.allocation_incarnation is not None:
+        request_id += f"-{controller.allocation_incarnation.fingerprint_sha256[:16]}"
+    _begin_evacuation(
+        controller,
+        {
+            "request_id": request_id,
+            "scope": {},
+            "resume_after": False,
+        },
+        automatic=True,
+    )
+
+
 def run_controller(
     *,
     root: Path,
@@ -2416,6 +2901,7 @@ def run_controller(
     cancel_grace: float = 30,
     start_paused: bool = False,
     drain_before_end_seconds: float = 900,
+    evacuate_before_end_seconds: float = 0,
     gpu_health_mode: str = "observe",
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
@@ -2433,6 +2919,8 @@ def run_controller(
         raise ValueError(
             "poll interval must be positive; grace and drain window must be non-negative"
         )
+    if evacuate_before_end_seconds < 0:
+        raise ValueError("evacuate before-end window must be non-negative")
     if gpu_health_interval <= 0:
         raise ValueError("GPU health interval must be positive")
     if launcher == "local" and len(inventory) != 1:
@@ -2468,6 +2956,7 @@ def run_controller(
                     cancel_grace=cancel_grace,
                     start_paused=start_paused,
                     drain_before_end_seconds=drain_before_end_seconds,
+                    evacuate_before_end_seconds=evacuate_before_end_seconds,
                     gpu_health_mode=gpu_health_mode,
                     gpu_isolation=gpu_isolation,
                     gpu_health_interval=gpu_health_interval,

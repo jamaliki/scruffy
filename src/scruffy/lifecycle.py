@@ -617,7 +617,20 @@ def _finish_job(
     controller: Controller, job_id: str, running: RunningProcess, returncode: int
 ) -> None:
     job = controller.state["jobs"][job_id]
-    if running.final_state is not None:
+    evacuation = controller.state.get("evacuation")
+    evacuation_target = (
+        evacuation.get("targets", {}).get(job_id)
+        if isinstance(evacuation, dict)
+        else None
+    )
+    evacuated_exit = (
+        returncode == 75
+        and isinstance(evacuation_target, dict)
+        and evacuation_target.get("outcome") in {"waiting", "checkpointed"}
+    )
+    if evacuated_exit:
+        state, reason = "failed", "evacuated"
+    elif running.final_state is not None:
         state = running.final_state
         reason = running.final_reason or state
     elif returncode == 0:

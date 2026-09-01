@@ -29,6 +29,7 @@ include the effects of returned events.
 | Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
 | Resume after recovery | `scruffy resume` | `resume_queue(root)` |
+| Evacuate selected jobs | `scruffy evacuate ...` | `request_evacuation(root, ...)` |
 | Quarantine a GPU | `scruffy gpu-quarantine NODE UUID` | `quarantine_gpu(...)` |
 | Clear GPU quarantine | `scruffy gpu-clear NODE UUID` | `clear_gpu_quarantine(...)` |
 | Re-probe automatic GPU quarantine | `scruffy gpu-reprobe NODE UUID` | `reprobe_gpu(...)` |
@@ -156,6 +157,44 @@ A transient I/O failure while the controller reads an immutable request defers
 admission to a later poll without deleting the request or consuming its ID.
 Decodable but invalid requests, including a `job_id` that disagrees with its
 directory, are rejected and permanently consume that ID.
+
+## Evacuation
+
+`scruffy evacuate` is a durable, idempotent operator request:
+
+```text
+scruffy --root ROOT evacuate [--job ID | --project ID [--workflow ID]] \
+  [--request-id ID] [--wait] [--resume-after]
+```
+
+The scope selects running jobs only. The controller first disables new
+launches, records the exact target identity, and journals the signal decision
+before sending `USR1`. A target is signalable only when its current launch
+token, assignment, and allocation incarnation still match the request. Local
+jobs use the owned process group; Slurm jobs use the exact numeric worker step,
+never the outer allocation or a stale PID. Each target is signalled at most
+once, with an immutable receipt closing the signal/crash window.
+
+The operation state is `requested`, `signalling`, `waiting`, `complete`, or
+`partial`. Target outcomes are `completed`, `checkpointed`, `retry_queued`,
+`not_restartable`, `timed_out`, and `lost`. A policy-enabled job that publishes
+a strict checkpoint after the request and exits 75 becomes `failed` with
+`reason=evacuated`; the controller admits at most one deterministic successor
+when `recovery.retry_on` includes `evacuated` and the attempt budget remains.
+Timeout never kills a target automatically. `--wait` is bounded by the target
+grace deadline and succeeds only for `complete`; `--resume-after` clears the
+drain only after every target completes or queues a retry. Partial operations
+remain drained and return nonzero.
+
+The CLI prints a generated request ID before submitting a request when one was
+not supplied. Reusing an ID with the same scope and options is a replay; using
+it with different options is rejected. The current operation and durable
+terminal history are present in `status`, `summary`, `explain`, dashboard, and
+MCP projections.
+
+`--evacuate-before-end-seconds` on `scruffy serve` starts this same state
+machine at the configured allocation deadline offset. Its default is `0`; the
+legacy drain-before-end setting remains separate and is not an evacuation.
 
 CLI and MCP submissions require an explicit GPU count. Zero means CPU-only and
 defaults to one CPU and 4 GB; a positive count defaults to 14 CPUs and 128 GB

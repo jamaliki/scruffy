@@ -22,12 +22,14 @@ from .client import (
     publish_event,
     quarantine_gpu,
     reprobe_gpu,
+    request_evacuation,
     resume_queue,
     status,
     submit_job,
     submit_workflow,
     summary,
     validate_workflow,
+    wait_for_evacuation,
     wait_for_job,
 )
 from .controller import run_controller
@@ -141,6 +143,8 @@ def _serve(arguments: argparse.Namespace) -> int:
     root = _root(arguments)
     if arguments.drain_before_end_seconds < 0:
         raise ValueError("--drain-before-end-seconds must be non-negative")
+    if arguments.evacuate_before_end_seconds < 0:
+        raise ValueError("--evacuate-before-end-seconds must be non-negative")
     slurm_job_id = arguments.slurm_job_id or os.environ.get("SLURM_JOB_ID")
     launcher = arguments.launcher
     if launcher == "auto":
@@ -171,6 +175,11 @@ def _serve(arguments: argparse.Namespace) -> int:
     )
     if launcher == "slurm" and allocation_id != slurm_job_id:
         raise ValueError("the Slurm allocation ID must equal its Slurm job ID")
+    controller_options = {}
+    if arguments.evacuate_before_end_seconds:
+        controller_options["evacuate_before_end_seconds"] = (
+            arguments.evacuate_before_end_seconds
+        )
     run_controller(
         root=root,
         inventory=inventory,
@@ -185,6 +194,7 @@ def _serve(arguments: argparse.Namespace) -> int:
         gpu_health_mode=arguments.gpu_health,
         gpu_isolation=arguments.gpu_isolation,
         gpu_health_interval=arguments.gpu_health_interval,
+        **controller_options,
     )
     return 0
 
@@ -493,6 +503,29 @@ def _resume(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _evacuate(arguments: argparse.Namespace) -> int:
+    project_id = _project(arguments) if arguments.project is not None else None
+    request_id = arguments.request_id or f"evacuate-{uuid.uuid4().hex}"
+    if arguments.request_id is None:
+        # Make the id visible before the command reaches the controller. This
+        # is the operator's recovery handle if the client or controller dies.
+        print(request_id, flush=True)
+    request = request_evacuation(
+        _root(arguments),
+        job_id=arguments.job_id,
+        project_id=project_id,
+        workflow_id=arguments.workflow_id,
+        request_id=request_id,
+        resume_after=arguments.resume_after,
+    )
+    if not arguments.wait:
+        _json(request)
+        return 0
+    result = wait_for_evacuation(_root(arguments), request["request_id"])
+    _json(result)
+    return 0 if result.get("state") == "complete" else 1
+
+
 def _dashboard(arguments: argparse.Namespace) -> int:
     run_dashboard(
         str(_root(arguments)),
@@ -569,6 +602,12 @@ def build_parser() -> argparse.ArgumentParser:
             "stop new launches this many seconds before the allocation ends "
             "(default: 900; 0 disables)"
         ),
+    )
+    serve.add_argument(
+        "--evacuate-before-end-seconds",
+        type=float,
+        default=0,
+        help="start policy-based evacuation this many seconds before deadline (default: 0)",
     )
     serve.add_argument(
         "--gpu-health",
@@ -861,6 +900,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     resume.set_defaults(handler=_resume)
+
+    evacuate = commands.add_parser(
+        "evacuate",
+        help="checkpoint and recover selected running jobs",
+        description="Signal policy-enabled jobs once and track bounded evacuation outcomes.",
+    )
+    scope = evacuate.add_mutually_exclusive_group()
+    scope.add_argument("--job", dest="job_id", help="select one running job")
+    scope.add_argument("--project", help="select a project")
+    evacuate.add_argument("--workflow", dest="workflow_id", help="select one workflow within --project")
+    evacuate.add_argument("--request-id", help="stable evacuation idempotency key")
+    evacuate.add_argument("--wait", action="store_true", help="wait for complete or partial outcome")
+    evacuate.add_argument(
+        "--resume-after",
+        action="store_true",
+        help="clear the drain only when every selected target completes or retries",
+    )
+    evacuate.set_defaults(handler=_evacuate)
 
     dashboard = commands.add_parser(
         "dashboard",

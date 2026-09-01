@@ -1117,7 +1117,13 @@ def submit_command(root: Path, command: dict[str, Any]) -> str:
     root = ensure_layout(root)
     request_id = str(command.get("request_id") or uuid.uuid4().hex)
     document = {**command, "request_id": request_id}
-    atomic_write_json(root / "commands" / f"{request_id}.json", document)
+    destination = root / "commands" / f"{request_id}.json"
+    if destination.exists():
+        existing = read_json(destination)
+        if existing != document:
+            raise StorageError(f"conflicting command request ID {request_id!r}")
+        return request_id
+    atomic_write_json(destination, document)
     return request_id
 
 

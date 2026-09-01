@@ -178,6 +178,8 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
         "scheduler": copy.deepcopy(value.get("scheduler", {})),
         "resources": resource_totals(value.get("nodes")),
         "gpu_health": copy.deepcopy(value.get("gpu_health")),
+        "evacuation": copy.deepcopy(value.get("evacuation")),
+        "evacuation_history": copy.deepcopy(value.get("evacuation_history", {})),
     }
 
 
@@ -377,7 +379,14 @@ def compact_explanation(value: dict[str, Any]) -> dict[str, Any]:
 
     result = {
         key: copy.deepcopy(value[key])
-        for key in ("v", "dependencies", "conditions", "blockers", "explanation")
+        for key in (
+            "v",
+            "dependencies",
+            "conditions",
+            "blockers",
+            "explanation",
+            "evacuation",
+        )
         if key in value
     }
     result["job"] = compact_job(value["job"])

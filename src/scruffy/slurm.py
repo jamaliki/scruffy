@@ -653,6 +653,27 @@ def cancel_step(slurm_job_id: str, step_id: str) -> None:
     )
 
 
+def signal_step(slurm_job_id: str, step_id: str, sig: str = "USR1") -> None:
+    """Signal exactly one owned numeric Slurm step, never the allocation."""
+
+    prefix = f"{slurm_job_id}."
+    suffix = step_id.removeprefix(prefix)
+    if (
+        not step_id.startswith(prefix)
+        or not suffix.isascii()
+        or not suffix.isdecimal()
+        or sig != "USR1"
+    ):
+        raise ValueError(f"refusing unsafe Slurm signal target {step_id!r}")
+    subprocess.run(
+        ["scancel", "--ctld", "--quiet", f"--signal={sig}", step_id],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
 def build_local_argv(
     assignment_file: Path, node_name: str
 ) -> tuple[list[str], dict[str, str]]:

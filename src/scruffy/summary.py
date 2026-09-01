@@ -92,6 +92,7 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "allocation_incarnation_sha256": job.get(
             "allocation_incarnation_sha256"
         ),
+        "evacuation": copy.deepcopy(job.get("evacuation")),
         "gpu_binding": job.get("gpu_binding"),
         "runtime_placement_contract": job.get("runtime_placement_contract"),
         "runtime_placement_files": list(job.get("runtime_placement_files") or []),
@@ -533,6 +534,8 @@ def build_summary(
         "project_id": selected_project,
         "as_of_cursor": state_cursor(state),
         "allocation": allocation,
+        "evacuation": copy.deepcopy(state.get("evacuation")),
+        "evacuation_history": copy.deepcopy(state.get("evacuation_history", {})),
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
         "launches_paused": bool(state.get("launches_paused", False)),
@@ -606,6 +609,11 @@ def explain_job(state: dict[str, Any], job_id: str) -> dict[str, Any]:
     return {
         "v": 1,
         "job": job,
+        "evacuation": copy.deepcopy(
+            (state.get("evacuation") or {}).get("targets", {}).get(job_id)
+            if isinstance(state.get("evacuation"), dict)
+            else None
+        ),
         "dependencies": dependencies,
         "conditions": conditions,
         "blockers": list(job.get("blockers") or []),
