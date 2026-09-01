@@ -30,6 +30,7 @@ from .storage import (
     queue_id,
     read_event_page,
     read_output,
+    report_acknowledged,
     submit_command,
     submit_report,
     submit_request,
@@ -192,6 +193,8 @@ def publish_event(
     event_id: str | None = None,
     occurred_at: str | None = None,
     source: dict[str, str] | None = None,
+    wait: bool = False,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Spool an event; ``event_id`` deduplicates across retained generations."""
 
@@ -213,12 +216,48 @@ def publish_event(
         }
     )
     published_id, deduplicated = submit_report(root, document)
-    return {
+    result = {
         "event_id": published_id,
         "job_id": document["job_id"],
         "state": "spooled",
         "deduplicated": deduplicated,
     }
+    if not wait:
+        return result
+    acknowledged, identity = wait_for_event_ack(
+        root, job_id=document["job_id"], event_id=published_id, timeout=timeout
+    )
+    return {
+        **result,
+        "state": "accepted" if identity is not None else "rejected",
+        "acknowledged": acknowledged,
+        "identity_sha256": identity,
+    }
+
+
+def wait_for_event_ack(
+    root: Path,
+    *,
+    job_id: str,
+    event_id: str,
+    timeout: float | None = None,
+) -> tuple[bool, str | None]:
+    """Wait for the controller's immutable receipt for one producer event."""
+
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("job_id must be a non-empty string")
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("event_id must be a non-empty string")
+    if timeout is not None and timeout < 0:
+        raise ValueError("timeout must be non-negative")
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        receipt = report_acknowledged(root, job_id, event_id)
+        if receipt[0]:
+            return receipt
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for event acknowledgement {event_id}")
+        time.sleep(0.05)
 
 
 def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
@@ -253,6 +292,8 @@ def request_evacuation(
     workflow_id: str | None = None,
     request_id: str | None = None,
     resume_after: bool = False,
+    after_task: str | None = None,
+    after_artifact: str | None = None,
 ) -> dict[str, Any]:
     """Durably request one scoped allocation evacuation."""
 
@@ -260,6 +301,10 @@ def request_evacuation(
         raise ValueError("--job cannot be combined with project or workflow")
     if workflow_id is not None and project_id is None:
         raise ValueError("workflow evacuation requires a project")
+    if (after_task is None) != (after_artifact is None):
+        raise ValueError("after_task and after_artifact must be provided together")
+    if (after_task is not None) and (project_id is None or workflow_id is None):
+        raise ValueError("artifact-triggered evacuation requires project and workflow")
     scope: dict[str, str] = {}
     if job_id is not None:
         if not isinstance(job_id, str) or not job_id.strip() or "/" in job_id:
@@ -282,6 +327,23 @@ def request_evacuation(
         raise ValueError("request_id must be a non-empty path-safe string")
     if not isinstance(resume_after, bool):
         raise TypeError("resume_after must be a boolean")
+    trigger = None
+    if after_task is not None and after_artifact is not None:
+        if (
+            not isinstance(after_task, str)
+            or not after_task.strip()
+            or len(after_task) > 256
+            or any(ord(character) < 32 for character in after_task)
+        ):
+            raise ValueError("after_task must be a non-empty string")
+        if (
+            not isinstance(after_artifact, str)
+            or not after_artifact.strip()
+            or len(after_artifact) > 256
+            or any(ord(character) < 32 for character in after_artifact)
+        ):
+            raise ValueError("after_artifact must be a non-empty string")
+        trigger = {"task_id": after_task, "artifact_id": after_artifact}
     submit_command(
         root,
         {
@@ -289,6 +351,7 @@ def request_evacuation(
             "request_id": request_id,
             "scope": scope,
             "resume_after": resume_after,
+            **({"trigger": trigger} if trigger is not None else {}),
         },
     )
     return {
@@ -296,6 +359,7 @@ def request_evacuation(
         "state": "evacuation_requested",
         "scope": scope,
         "resume_after": resume_after,
+        **({"trigger": trigger} if trigger is not None else {}),
     }
 
 
@@ -306,7 +370,9 @@ def wait_for_evacuation(
 
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request_id must be a non-empty string")
-    deadline = None if timeout is None else time.monotonic() + max(timeout, 0)
+    if timeout is not None and timeout < 0:
+        raise ValueError("timeout must be non-negative")
+    deadline = None if timeout is None else time.monotonic() + timeout
     discovered_deadline: float | None = None
     while True:
         snapshot = status(root)
@@ -336,7 +402,7 @@ def wait_for_evacuation(
                             continue
                 if parsed:
                     discovered_deadline = max(parsed) + 1
-                elif evacuation.get("state") == "requested":
+                elif evacuation.get("state") in {"requested", "armed"}:
                     discovered_deadline = time.monotonic() + 60
                 else:
                     discovered_deadline = time.monotonic() + 1

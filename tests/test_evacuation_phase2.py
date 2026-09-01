@@ -14,16 +14,19 @@ from typing import Any
 from unittest import mock
 
 from scruffy.client import (
+    publish_event,
     request_evacuation,
     status,
     submit_job,
     wait_for_evacuation,
+    wait_for_event_ack,
     wait_for_job,
 )
 from scruffy.controller import (
     _advance_evacuation,
     _begin_evacuation,
     _ingest_commands,
+    _ingest_reports,
     _initialize_controller,
 )
 from scruffy.models import Assignment, NodeInventory, NodeReservation, ResourceRequest
@@ -31,6 +34,7 @@ from scruffy.runtime import RunningProcess
 from scruffy.slurm import signal_step
 from scruffy.storage import (
     StorageError,
+    list_commands,
     read_events,
     record_command_receipt,
     remove_command,
@@ -287,6 +291,81 @@ class EvacuationPhase2Tests(unittest.TestCase):
                 self.assertEqual("timed_out", target["outcome"])
                 self.assertEqual("partial", controller.state["evacuation"]["state"])
                 self.assertTrue(controller.state["draining"])
+            finally:
+                controller.journal.close()
+
+    def test_armed_artifact_evacuation_is_exact_and_ack_signals_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("node", (0,), 4, 8),),
+                launcher="local",
+                allocation_id="local",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+                gpu_health_mode="off",
+            )
+            assignment = Assignment(
+                "trainer",
+                ResourceRequest(1, 0, 1, 1),
+                (NodeReservation("node", (), 1, 1),),
+            ).to_dict()
+            job = {
+                "id": "trainer",
+                "state": "running",
+                "project_id": "project-a",
+                "workflow_id": "flow",
+                "task_id": "trainer",
+                "recovery": POLICY,
+                "assignment": assignment,
+                "launch_token": "trainer-token",
+            }
+            controller.state["jobs"][job["id"]] = job
+            controller.running[job["id"]] = RunningProcess(mock.Mock(pid=100), "trainer-token")
+            try:
+                request_evacuation(
+                    root,
+                    project_id="project-a",
+                    workflow_id="flow",
+                    request_id="armed",
+                    resume_after=True,
+                    after_task="trainer",
+                    after_artifact="checkpoint/2",
+                )
+                command = next(iter(list_commands(root)))[1]
+                _begin_evacuation(controller, command)
+                self.assertEqual("armed", controller.state["evacuation"]["state"])
+                self.assertFalse(controller.state["draining"])
+
+                publication = {
+                    "v": 1,
+                    "artifact_id": "checkpoint/2",
+                    "path": "/tmp/checkpoint",
+                    "size_bytes": 1,
+                    "sha256": "a" * 64,
+                    "manifest_path": "/tmp/checkpoint.ready.json",
+                }
+                with mock.patch("scruffy.controller.signal_process") as signal_process:
+                    publish_event(
+                        root,
+                        job_id="trainer",
+                        event_id="trigger-event",
+                        kind="workload.artifact",
+                        data={"publication": publication},
+                        source={"launch_token": "trainer-token"},
+                    )
+                    _ingest_reports(controller)
+                    self.assertEqual(1, signal_process.call_count)
+                    self.assertEqual("waiting", controller.state["evacuation"]["state"])
+                    acknowledged = wait_for_event_ack(
+                        root,
+                        job_id="trainer",
+                        event_id="trigger-event",
+                        timeout=0.1,
+                    )
+                    self.assertTrue(acknowledged[0])
             finally:
                 controller.journal.close()
     def test_slurm_signal_accepts_only_numeric_worker_steps(self) -> None:

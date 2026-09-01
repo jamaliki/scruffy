@@ -860,6 +860,18 @@ def report_was_accepted(root: Path, source: Path) -> tuple[bool, str | None]:
     return _report_receipt_identity(report_root, source.parent.name, source.stem)
 
 
+def report_acknowledged(
+    root: Path, job_id: str, event_id: str
+) -> tuple[bool, str | None]:
+    """Return the durable receipt for one immutable producer event."""
+
+    if not isinstance(job_id, str) or not isinstance(event_id, str):
+        raise TypeError("job_id and event_id must be strings")
+    report_root = ensure_layout(root) / "reports"
+    event_digest = hashlib.sha256(event_id.encode()).hexdigest()
+    return _report_receipt_identity(report_root, job_id, event_digest)
+
+
 def submit_report(root: Path, report: dict[str, Any]) -> tuple[str, bool]:
     """Spool an event; its ID deduplicates across retained generations."""
 

@@ -526,11 +526,15 @@ def _evacuate(arguments: argparse.Namespace) -> int:
         workflow_id=arguments.workflow_id,
         request_id=request_id,
         resume_after=arguments.resume_after,
+        after_task=arguments.after_task,
+        after_artifact=arguments.after_artifact,
     )
     if not arguments.wait:
         _json(request)
         return 0
-    result = wait_for_evacuation(_root(arguments), request["request_id"])
+    result = wait_for_evacuation(
+        _root(arguments), request["request_id"], timeout=arguments.timeout
+    )
     _json(result)
     return 0 if result.get("state") == "complete" else 1
 
@@ -924,8 +928,11 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--job", dest="job_id", help="select one running job")
     scope.add_argument("--project", help="select a project")
     evacuate.add_argument("--workflow", dest="workflow_id", help="select one workflow within --project")
+    evacuate.add_argument("--after-task", help="arm until this workflow task publishes the exact artifact")
+    evacuate.add_argument("--after-artifact", help="arm until this exact artifact ID is published")
     evacuate.add_argument("--request-id", help="stable evacuation idempotency key")
     evacuate.add_argument("--wait", action="store_true", help="wait for complete or partial outcome")
+    evacuate.add_argument("--timeout", type=float, help="bound --wait in seconds")
     evacuate.add_argument(
         "--resume-after",
         action="store_true",

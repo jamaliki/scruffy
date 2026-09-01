@@ -14,6 +14,7 @@ from .client import (
     submit_workflow,
     summary,
     validate_workflow,
+    wait_for_event_ack,
     wait_for_job,
 )
 from .models import ResourceRequest
@@ -39,5 +40,6 @@ __all__ = [
     "submit_workflow",
     "summary",
     "validate_workflow",
+    "wait_for_event_ack",
     "wait_for_job",
 ]

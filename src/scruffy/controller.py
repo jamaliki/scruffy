@@ -741,11 +741,32 @@ def _evacuation_request(
     resume_after = command.get("resume_after", False)
     if not isinstance(resume_after, bool):
         raise TypeError("evacuation resume_after must be boolean")
+    raw_trigger = command.get("trigger")
+    if raw_trigger is not None:
+        if not isinstance(raw_trigger, dict) or set(raw_trigger) != {"task_id", "artifact_id"}:
+            raise ValueError("evacuation trigger must contain task_id and artifact_id")
+        if "job_id" in scope or "project_id" not in scope or "workflow_id" not in scope:
+            raise ValueError("artifact-triggered evacuation requires project and workflow scope")
+        trigger = {}
+        for key in ("task_id", "artifact_id"):
+            value = raw_trigger[key]
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 256
+                or any(ord(character) < 32 for character in value)
+            ):
+                raise ValueError(f"evacuation trigger {key} must be a non-empty string")
+            trigger[key] = value
+    else:
+        trigger = None
     request = {
         "scope": scope,
         "resume_after": resume_after,
         "automatic": automatic,
     }
+    if trigger is not None:
+        request["trigger"] = trigger
     return request_id, request, resume_after
 
 
@@ -782,38 +803,9 @@ def _evacuation_emit(
     )
 
 
-def _begin_evacuation(
-    controller: Controller,
-    command: dict[str, Any],
-    *,
-    automatic: bool = False,
-) -> None:
-    request_id, request, resume_after = _evacuation_request(
-        command, automatic=automatic
-    )
-    stored_request = controller.state.setdefault("evacuation_requests", {}).get(request_id)
-    if stored_request is not None:
-        if stored_request != request:
-            raise StorageError(f"conflicting evacuation request ID {request_id!r}")
-        current = controller.state.get("evacuation_history", {}).get(request_id)
-        if isinstance(current, dict):
-            emit(
-                controller,
-                "evacuation.replayed",
-                data={
-                    "request_id": request_id,
-                    "request": copy.deepcopy(request),
-                    "evacuation": copy.deepcopy(current),
-                },
-            )
-        return
-    current = controller.state.get("evacuation")
-    if isinstance(current, dict) and current.get("state") not in {"complete", "partial"}:
-        raise StorageError("another evacuation is already in progress")
-    scope = request["scope"]
-    if "job_id" in scope and scope["job_id"] not in controller.state["jobs"]:
-        raise KeyError(f"unknown job {scope['job_id']}")
-    requested_at = utc_now()
+def _evacuation_targets(
+    controller: Controller, request_id: str, scope: dict[str, str], requested_at: str
+) -> dict[str, dict[str, Any]]:
     targets: dict[str, dict[str, Any]] = {}
     for job in sorted(
         controller.state["jobs"].values(),
@@ -847,6 +839,135 @@ def _begin_evacuation(
                 }
             )
         targets[job["id"]] = target
+    return targets
+
+
+def _artifact_trigger_evidence(
+    controller: Controller, request: dict[str, Any]
+) -> dict[str, Any] | None:
+    trigger = request.get("trigger")
+    scope = request.get("scope")
+    if not isinstance(trigger, dict) or not isinstance(scope, dict):
+        return None
+    retained = request.get("trigger_evidence")
+    if isinstance(retained, dict):
+        publication = retained.get("publication")
+        if (
+            isinstance(publication, dict)
+            and publication.get("artifact_id") == trigger.get("artifact_id")
+            and isinstance(retained.get("producer_event_id"), str)
+        ):
+            return copy.deepcopy(retained)
+    candidates = list(controller.state.get("jobs", {}).values())
+    project_id = scope.get("project_id")
+    workflow_id = scope.get("workflow_id")
+    if isinstance(project_id, str) and isinstance(workflow_id, str):
+        try:
+            candidates.extend(_archived_workflow_jobs(controller, project_id, workflow_id) or [])
+        except (OSError, StorageError, TransientStorageError):
+            pass
+    for job in candidates:
+        if (
+            job_project(job) != scope.get("project_id")
+            or job.get("workflow_id") != scope.get("workflow_id")
+            or job.get("task_id") != trigger.get("task_id")
+        ):
+            continue
+        expected_token = job.get("launch_token")
+        for evidence in _artifact_evidence(job):
+            publication = evidence["publication"]
+            if publication.get("artifact_id") != trigger.get("artifact_id"):
+                continue
+            source = evidence.get("source")
+            if not isinstance(source, dict):
+                continue
+            if isinstance(expected_token, str) and source.get("launch_token") != expected_token:
+                continue
+            return {
+                "producer_job_id": job.get("id"),
+                "producer_event_id": evidence.get("producer_event_id"),
+                "publication": copy.deepcopy(publication),
+            }
+    return None
+
+
+def _activate_armed_evacuation(controller: Controller) -> None:
+    evacuation = controller.state.get("evacuation")
+    if not isinstance(evacuation, dict) or evacuation.get("state") != "armed":
+        return
+    request_id = evacuation.get("request_id")
+    request = controller.state.setdefault("evacuation_requests", {}).get(request_id)
+    if not isinstance(request_id, str) or not isinstance(request, dict):
+        return
+    evidence = _artifact_trigger_evidence(controller, request)
+    if evidence is None:
+        return
+    requested_at = utc_now()
+    active = {
+        "v": 1,
+        "request_id": request_id,
+        "state": "requested",
+        "scope": copy.deepcopy(request["scope"]),
+        "resume_after": request["resume_after"],
+        "automatic": request["automatic"],
+        "requested_at": requested_at,
+        "targets": _evacuation_targets(controller, request_id, request["scope"], requested_at),
+        "trigger": copy.deepcopy(request.get("trigger")),
+        "trigger_evidence": evidence,
+    }
+    controller.state["draining"] = True
+    controller.state["drain_requested"] = True
+    controller.state["allocation"]["state"] = "draining"
+    _evacuation_emit(controller, active, request, "evacuation.requested")
+
+
+def _begin_evacuation(
+    controller: Controller,
+    command: dict[str, Any],
+    *,
+    automatic: bool = False,
+) -> None:
+    request_id, request, resume_after = _evacuation_request(
+        command, automatic=automatic
+    )
+    stored_request = controller.state.setdefault("evacuation_requests", {}).get(request_id)
+    if stored_request is not None:
+        if stored_request != request:
+            raise StorageError(f"conflicting evacuation request ID {request_id!r}")
+        current = controller.state.get("evacuation_history", {}).get(request_id)
+        if isinstance(current, dict):
+            emit(
+                controller,
+                "evacuation.replayed",
+                data={
+                    "request_id": request_id,
+                    "request": copy.deepcopy(request),
+                    "evacuation": copy.deepcopy(current),
+                },
+            )
+        return
+    current = controller.state.get("evacuation")
+    if isinstance(current, dict) and current.get("state") not in {"complete", "partial"}:
+        raise StorageError("another evacuation is already in progress")
+    scope = request["scope"]
+    if "job_id" in scope and scope["job_id"] not in controller.state["jobs"]:
+        raise KeyError(f"unknown job {scope['job_id']}")
+    requested_at = utc_now()
+    if request.get("trigger") is not None:
+        evacuation = {
+            "v": 1,
+            "request_id": request_id,
+            "state": "armed",
+            "scope": copy.deepcopy(scope),
+            "resume_after": resume_after,
+            "automatic": automatic,
+            "requested_at": requested_at,
+            "targets": {},
+            "trigger": copy.deepcopy(request["trigger"]),
+        }
+        _evacuation_emit(controller, evacuation, request, "evacuation.armed")
+        _activate_armed_evacuation(controller)
+        return
     evacuation = {
         "v": 1,
         "request_id": request_id,
@@ -855,7 +976,7 @@ def _begin_evacuation(
         "resume_after": resume_after,
         "automatic": automatic,
         "requested_at": requested_at,
-        "targets": targets,
+        "targets": _evacuation_targets(controller, request_id, scope, requested_at),
     }
     # Draining is part of the request transaction and precedes target
     # selection/signalling.  Running jobs retain their assignments.
@@ -1072,7 +1193,10 @@ def _evacuation_target_terminal(
 
 def _advance_evacuation(controller: Controller) -> None:
     evacuation = controller.state.get("evacuation")
-    if not isinstance(evacuation, dict) or evacuation.get("state") in {"complete", "partial"}:
+    if (
+        not isinstance(evacuation, dict)
+        or evacuation.get("state") in {"armed", "complete", "partial"}
+    ):
         return
     request_id = evacuation.get("request_id")
     request = controller.state.setdefault("evacuation_requests", {}).get(request_id)
@@ -1401,6 +1525,7 @@ def _artifact_evidence(producer: dict[str, Any]) -> Iterable[dict[str, Any]]:
             "publication": publication,
             "producer_event_id": item.get("producer_event_id"),
             "occurred_at": item.get("occurred_at"),
+            "source": copy.deepcopy(item.get("source")),
         }
     for item in reversed(list(producer.get("artifact_condition_evidence") or [])):
         if not isinstance(item, dict):
@@ -1418,6 +1543,7 @@ def _artifact_evidence(producer: dict[str, Any]) -> Iterable[dict[str, Any]]:
             "publication": publication,
             "producer_event_id": item.get("producer_event_id"),
             "occurred_at": item.get("occurred_at"),
+            "source": copy.deepcopy(item.get("source")),
         }
     workload = producer.get("workload")
     artifacts = workload.get("latest_artifacts") if isinstance(workload, dict) else None
@@ -1433,6 +1559,7 @@ def _artifact_evidence(producer: dict[str, Any]) -> Iterable[dict[str, Any]]:
                 "publication": publication,
                 "producer_event_id": item.get("event_id"),
                 "occurred_at": item.get("occurred_at"),
+                "source": copy.deepcopy(item.get("source")),
             }
 
 
@@ -1560,6 +1687,23 @@ def _has_artifact_wait_reference(
     task_id = producer.get("task_id")
     if not isinstance(workflow_id, str) or not isinstance(task_id, str):
         return False
+    evacuation = controller.state.get("evacuation")
+    request = (
+        controller.state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
+        if isinstance(evacuation, dict) and evacuation.get("state") == "armed"
+        else None
+    )
+    trigger = request.get("trigger") if isinstance(request, dict) else None
+    scope = request.get("scope") if isinstance(request, dict) else None
+    if (
+        isinstance(trigger, dict)
+        and isinstance(scope, dict)
+        and scope.get("project_id") == project_id
+        and scope.get("workflow_id") == workflow_id
+        and trigger.get("task_id") == task_id
+        and trigger.get("artifact_id") == artifact_id
+    ):
+        return True
     candidates: list[dict[str, Any]] = list(controller.state["jobs"].values())
     archived = _archived_workflow_jobs(controller, project_id, workflow_id)
     if archived:
@@ -1613,6 +1757,7 @@ def _retain_exact_artifact_evidence(
             "publication_sha256": publication_digest,
             "producer_event_id": event["event_id"],
             "occurred_at": event["occurred_at"],
+            "source": copy.deepcopy(event.get("source", {})),
         }
     )
     producer["artifact_condition_evidence"] = evidence
@@ -2581,6 +2726,10 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
 
     if not acknowledged:
         return
+    # An armed trigger is activated, and its first signal is decided, before
+    # the immutable report receipt becomes visible to the producer.
+    _activate_armed_evacuation(controller)
+    _advance_evacuation(controller)
     if new_report_ids:
         # The inbox is acknowledged only after both the ordered events and
         # their cumulative workload projection are durable.
@@ -2893,6 +3042,10 @@ def _serve(controller: Controller) -> None:
             _maintain_health_monitor(controller)
             _ingest_gpu_health(controller)
             _ingest_reports(controller)
+            # Replay can restore an armed operation and its exact publication
+            # evidence without another report file being present.
+            _activate_armed_evacuation(controller)
+            _advance_evacuation(controller)
             _refresh_dependencies(controller)
             compact_journal(controller)
             if controller.stopping:

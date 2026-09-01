@@ -164,7 +164,8 @@ directory, are rejected and permanently consume that ID.
 
 ```text
 scruffy --root ROOT evacuate [--job ID | --project ID [--workflow ID]] \
-  [--request-id ID] [--wait] [--resume-after]
+  [--after-task TASK --after-artifact ARTIFACT] [--request-id ID] [--wait] \
+  [--timeout SECONDS] [--resume-after]
 ```
 
 The scope selects running jobs only. The controller first disables new
@@ -185,6 +186,16 @@ Timeout never kills a target automatically. `--wait` is bounded by the target
 grace deadline and succeeds only for `complete`; `--resume-after` clears the
 drain only after every target completes or queues a retry. Partial operations
 remain drained and return nonzero.
+
+An evacuation may be armed before its workflow exists with the paired
+`--after-task TASK --after-artifact ARTIFACT` options. They require project and
+workflow scope and identify one exact strict artifact publication from the
+capability-authenticated producer. Arming does not drain or pause launches;
+the publication activates the ordinary evacuation before its report receipt
+is acknowledged. `--wait --timeout SECONDS` bounds waiting for an armed or
+active request without cancelling it. Python callers use `after_task` and
+`after_artifact` on `request_evacuation`; publishers may use
+`publish_event(..., wait=True, timeout=SECONDS)` to await the immutable receipt.
 
 The CLI prints a generated request ID before submitting a request when one was
 not supplied. Reusing an ID with the same scope and options is a replay; using

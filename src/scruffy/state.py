@@ -68,6 +68,42 @@ def _remember_event(
     workload[f"{field}_event_id"] = event["event_id"]
 
 
+def _remember_armed_trigger_evidence(
+    state: dict[str, Any], job: dict[str, Any], event: dict[str, Any]
+) -> None:
+    """Retain an armed trigger publication while replaying its journal event."""
+
+    evacuation = state.get("evacuation")
+    if not isinstance(evacuation, dict) or evacuation.get("state") != "armed":
+        return
+    request_id = evacuation.get("request_id")
+    request = state.get("evacuation_requests", {}).get(request_id)
+    trigger = request.get("trigger") if isinstance(request, dict) else None
+    publication = artifact_publication(event.get("data"))
+    if (
+        not isinstance(request_id, str)
+        or not isinstance(request, dict)
+        or not isinstance(trigger, dict)
+        or publication is None
+        or job_project(job) != request.get("scope", {}).get("project_id")
+        or job.get("workflow_id") != request.get("scope", {}).get("workflow_id")
+        or job.get("task_id") != trigger.get("task_id")
+        or publication.get("artifact_id") != trigger.get("artifact_id")
+    ):
+        return
+    expected = job.get("launch_token")
+    source = event.get("source")
+    if not isinstance(source, dict) or (
+        isinstance(expected, str) and source.get("launch_token") != expected
+    ):
+        return
+    request["trigger_evidence"] = {
+        "producer_job_id": job.get("id"),
+        "producer_event_id": event.get("event_id"),
+        "publication": copy.deepcopy(publication),
+    }
+
+
 def apply_workload_event(
     job: dict[str, Any], event: dict[str, Any], *, recorded_at: str
 ) -> None:
@@ -132,6 +168,7 @@ def apply_workload_event(
                 **data,
                 "occurred_at": event["occurred_at"],
                 "event_id": event["event_id"],
+                "source": copy.deepcopy(event.get("source", {})),
             }
         )
         artifacts.sort(
@@ -153,6 +190,7 @@ def apply_workload_event(
                     "publication": publication,
                     "producer_event_id": event["event_id"],
                     "occurred_at": event["occurred_at"],
+                    "source": copy.deepcopy(event.get("source", {})),
                 }
             )
             evidence.sort(
@@ -552,9 +590,21 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                         "event_id": event["source_event_id"],
                         "occurred_at": event["occurred_at"],
                         "kind": event["kind"],
+                        "source": event.get("source", {}),
                         "data": event["data"],
                     },
                     recorded_at=str(event.get("recorded_at") or event.get("at") or ""),
+                )
+                _remember_armed_trigger_evidence(
+                    state,
+                    current,
+                    {
+                        "event_id": event["source_event_id"],
+                        "occurred_at": event["occurred_at"],
+                        "kind": event["kind"],
+                        "source": event.get("source", {}),
+                        "data": event["data"],
+                    },
                 )
         if event.get("kind") == "resource.gpu_health_changed":
             data = event.get("data")
