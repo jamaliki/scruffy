@@ -19,6 +19,13 @@ Need = tuple[str, str]
 ArtifactCondition = tuple[str, str]
 
 DEPENDENCY_CONDITIONS = frozenset({"succeeded", "terminal"})
+RECOVERY_REASONS = frozenset(
+    {"allocation_replaced", "allocation_incarnation_changed", "evacuated"}
+)
+AUTO_RECOVERY_REASONS = frozenset(
+    {"allocation_replaced", "allocation_incarnation_changed"}
+)
+MAX_RECOVERY_ATTEMPTS = 10
 
 
 class WorkflowError(ValueError):
@@ -45,6 +52,60 @@ def _artifact_id(value: object, label: str) -> str:
     if len(identifier) > 256 or any(ord(character) < 32 for character in identifier):
         raise WorkflowError(f"{label} must be at most 256 printable characters")
     return identifier
+
+
+def validate_recovery_policy(
+    value: object, label: str = "recovery"
+) -> dict[str, object] | None:
+    """Validate and detach the strict, version-one retry policy."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise WorkflowError(f"{label} must be an object")
+    if set(value) != {"max_attempts", "retry_on", "evacuation"}:
+        raise WorkflowError(
+            f"{label} must contain exactly max_attempts, retry_on and evacuation"
+        )
+    max_attempts = value["max_attempts"]
+    if type(max_attempts) is not int or not 1 <= max_attempts <= MAX_RECOVERY_ATTEMPTS:
+        raise WorkflowError(
+            f"{label}.max_attempts must be an integer from 1 to {MAX_RECOVERY_ATTEMPTS}"
+        )
+    retry_on = value["retry_on"]
+    if not isinstance(retry_on, list):
+        raise WorkflowError(f"{label}.retry_on must be an array")
+    reasons = list(retry_on)
+    if any(not isinstance(reason, str) or not reason for reason in reasons):
+        raise WorkflowError(f"{label}.retry_on must contain non-empty strings")
+    if len(set(reasons)) != len(reasons):
+        raise WorkflowError(f"{label}.retry_on must not contain duplicates")
+    unsupported = set(reasons) - RECOVERY_REASONS
+    if unsupported:
+        raise WorkflowError(
+            f"{label}.retry_on contains unsupported reasons: {sorted(unsupported)!r}"
+        )
+    evacuation = value["evacuation"]
+    if not isinstance(evacuation, Mapping) or set(evacuation) != {
+        "signal",
+        "grace_seconds",
+    }:
+        raise WorkflowError(
+            f"{label}.evacuation must contain exactly signal and grace_seconds"
+        )
+    if evacuation["signal"] != "USR1":
+        raise WorkflowError(f"{label}.evacuation.signal must equal 'USR1'")
+    grace_seconds = evacuation["grace_seconds"]
+    if type(grace_seconds) is not int or grace_seconds < 0:
+        raise WorkflowError(f"{label}.evacuation.grace_seconds must be non-negative")
+    return {
+        "max_attempts": max_attempts,
+        "retry_on": reasons,
+        "evacuation": {
+            "signal": "USR1",
+            "grace_seconds": grace_seconds,
+        },
+    }
 
 
 def _identity(job: Job, label: str) -> TaskKey | None:
@@ -207,9 +268,18 @@ def _validated_graph(
     for index, job in enumerate(ordered):
         label = f"jobs[{index}]"
         key = _identity(job, label)
+        recovery = None
+        if "recovery" in job:
+            if job["recovery"] is None:
+                raise WorkflowError(f"{label}.recovery must be an object")
+            recovery = validate_recovery_policy(job["recovery"], f"{label}.recovery")
         dependencies = _dependencies(job, label)
         artifact_waits = _artifact_conditions(job, label)
         if key is None:
+            if recovery is not None:
+                raise WorkflowError(
+                    f"{label}.recovery requires workflow_id and task_id"
+                )
             if dependencies or artifact_waits:
                 raise WorkflowError(
                     f"{label} cannot declare needs or wait_for without "

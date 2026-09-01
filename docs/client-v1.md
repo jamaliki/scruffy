@@ -177,7 +177,27 @@ identity remains unique for the workflow and project. A terminal non-success att
 `rejected`, or `skipped`) may be replaced by a new job using the same
 `workflow_id` and `task_id` with a new `request_id`. Resolution and explanation
 use the newest valid attempt. Scruffy does not retry skipped dependants
-automatically; submit their next attempts explicitly.
+automatically; submit their next attempts explicitly. Workflow tasks may opt
+into the strict recovery object below; its `max_attempts` includes the first
+attempt and is capped at 10:
+
+```json
+{
+  "max_attempts": 4,
+  "retry_on": ["allocation_replaced", "allocation_incarnation_changed", "evacuated"],
+  "evacuation": {"signal": "USR1", "grace_seconds": 600}
+}
+```
+
+The object has no extension fields. `signal` is currently restricted to
+`USR1`; `evacuated` is persisted for the next evacuation phase but is not
+automatically retried in this release. Wave 1 automatically creates one
+replay-safe successor only for `allocation_replaced` and
+`allocation_incarnation_changed`, preserving argv, cwd, environment, resource,
+dependency, artifact, and recovery declarations. Successors expose
+`predecessor_job_id`, `successor_job_id`, `retry_reason`, and `retry_exhausted`
+in inspection, summaries, and archives. Non-restartable tasks and exhausted
+policies remain terminal `lost` jobs.
 
 ## Observation and cursors
 
@@ -261,9 +281,9 @@ status changes and operator actions, not every periodic metric sample.
 After compaction, hot state contains every nonterminal job and the newest 1,000
 terminal jobs. Older terminal jobs move to records marked `archived: true`.
 These retain identity, lifecycle results and timestamps, workflow metadata,
-resource request, final placement, and immutable provenance references. They
-drop cwd, argv, environment, live assignment, blockers, workload projection,
-output paths, and per-job logs. The state exposes per-state `archived_counts`;
+recovery lineage and policy, resource request, final placement, and immutable
+provenance references. They drop cwd, argv, environment, live assignment,
+blockers, workload projection, output paths, and per-job logs. The state exposes per-state `archived_counts`;
 `summary.counts` combines these with hot counts, while detailed summary lists
 and unqualified `status(root)` remain hot views.
 

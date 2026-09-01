@@ -51,6 +51,9 @@ def write_request_record(root: Path, job: dict[str, Any]) -> Path:
                 "workflow_id",
                 "task_id",
                 "attempt",
+                "recovery",
+                "predecessor_job_id",
+                "retry_reason",
             )
             if key in job and job[key] is not None
         },

@@ -36,7 +36,11 @@ from .storage import (
 )
 from .submissions import submission_summary, workflow_submission
 from .summary import build_summary, explain_job
-from .workflows import select_task_attempts, validate_workflows
+from .workflows import (
+    select_task_attempts,
+    validate_recovery_policy,
+    validate_workflows,
+)
 
 
 def _workflow_fields(
@@ -44,6 +48,7 @@ def _workflow_fields(
     task_id: str | None,
     needs: Sequence[Mapping[str, str]] | None,
     wait_for: Sequence[Mapping[str, str]] | None,
+    recovery: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Validate one task's local metadata without requiring upstream jobs yet."""
 
@@ -57,6 +62,8 @@ def _workflow_fields(
         candidate["workflow_id"] = workflow_id
     if task_id is not None:
         candidate["task_id"] = task_id
+    if recovery is not None:
+        candidate["recovery"] = recovery
     validate_workflows([candidate])
     if workflow_id is None:
         return {}
@@ -65,6 +72,7 @@ def _workflow_fields(
         "task_id": task_id,
         "needs": [dict(need) for need in dependencies],
         "wait_for": [dict(condition) for condition in conditions],
+        **({"recovery": copy.deepcopy(recovery)} if recovery is not None else {}),
     }
 
 
@@ -82,6 +90,7 @@ def submit_job(
     task_id: str | None = None,
     needs: Sequence[Mapping[str, str]] | None = None,
     wait_for: Sequence[Mapping[str, str]] | None = None,
+    recovery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Durably enqueue a job and return immediately with its stable job ID."""
 
@@ -102,7 +111,7 @@ def submit_job(
         "env": dict(sorted(environment.items())),
         "resources": request.to_dict(),
         **({"project_id": project_id} if project_id != DEFAULT_PROJECT else {}),
-        **_workflow_fields(workflow_id, task_id, needs, wait_for),
+        **_workflow_fields(workflow_id, task_id, needs, wait_for, recovery),
     }
     job_id, deduplicated = submit_request(root, spec)
     return {
@@ -325,7 +334,14 @@ def _submitted_from_spec(
     workflow_id, task_id = document.get("workflow_id"), document.get("task_id")
     needs = document.get("needs", [])
     wait_for = document.get("wait_for", [])
-    if workflow_id is not None or task_id is not None or needs or wait_for:
+    recovery = document.get("recovery")
+    if (
+        workflow_id is not None
+        or task_id is not None
+        or needs
+        or wait_for
+        or "recovery" in document
+    ):
         if (
             isinstance(workflow_id, str)
             and isinstance(task_id, str)
@@ -340,6 +356,14 @@ def _submitted_from_spec(
                 "needs": copy.deepcopy(needs),
                 "wait_for": copy.deepcopy(wait_for),
             }
+            if "recovery" in document:
+                if recovery is None:
+                    valid = False
+                else:
+                    try:
+                        workflow["recovery"] = validate_recovery_policy(recovery)
+                    except ValueError:
+                        valid = False
         else:
             valid = False
     submitted = {

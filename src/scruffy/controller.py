@@ -79,6 +79,7 @@ from .storage import (
     accept_submission,
     compact_report_receipts,
     controller_lock,
+    create_job_id,
     ensure_layout,
     find_archived_job,
     job_identity_digest,
@@ -91,6 +92,7 @@ from .storage import (
     read_events,
     read_json,
     record_request_receipt,
+    recovery_request_id,
     reject_request,
     remove_cold_job_directories,
     remove_command,
@@ -104,6 +106,7 @@ from .storage import (
 )
 from .submissions import job_from_spec
 from .workflows import (
+    AUTO_RECOVERY_REASONS,
     WorkflowError,
     artifact_conditions,
     resolve_blocked_jobs,
@@ -252,11 +255,14 @@ def _initialize_controller(
             job["state"] = "lost"
             job["finished_at"] = utc_now()
             job["reason"] = active_lost_reason
+            _mark_retry_exhaustion(job, active_lost_reason)
             job["last_assignment"] = job.get("assignment")
             job["assignment"] = None
             write_result_record(root, job)
         for job in active:
             emit(controller, "job.lost", job=job, snapshot=False)
+        if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
+            _recover_lost_workflow_jobs(controller, active_lost_reason)
 
     # Queued and later workflow jobs have already crossed their dependency
     # gate. Persist the marker for snapshots created before the field existed.
@@ -425,6 +431,161 @@ def _mark_workflow_rejected(job: dict[str, Any], exc: Exception) -> None:
     job["finished_at"] = utc_now()
     job["reason"] = "invalid_workflow"
     job["error"] = str(exc)
+
+
+def _recovery_policy(job: dict[str, Any]) -> dict[str, Any] | None:
+    policy = job.get("recovery")
+    return policy if isinstance(policy, dict) else None
+
+
+def _mark_retry_exhaustion(job: dict[str, Any], reason: str) -> None:
+    """Persist bounded retry exhaustion on the terminal predecessor."""
+
+    policy = _recovery_policy(job)
+    attempt = job.get("attempt") if type(job.get("attempt")) is int else 1
+    max_attempts = policy.get("max_attempts") if policy else None
+    retry_on = policy.get("retry_on") if policy else ()
+    if (
+        isinstance(max_attempts, int)
+        and attempt >= max_attempts
+        and isinstance(retry_on, list)
+        and reason in retry_on
+    ):
+        job["retry_exhausted"] = True
+        job["retry_exhausted_reason"] = reason
+        job["retry_exhausted_at"] = job.get("finished_at")
+
+
+def _recovery_successor_spec(
+    predecessor: dict[str, Any], successor_id: str, request_id: str
+) -> dict[str, Any]:
+    """Copy only immutable task inputs into one deterministic retry spec."""
+
+    spec = {
+        "v": 1,
+        "job_id": successor_id,
+        "request_id": request_id,
+        "name": predecessor.get("name", predecessor["task_id"]),
+        "submitted_at": utc_now(),
+        "argv": copy.deepcopy(predecessor["argv"]),
+        "cwd": predecessor["cwd"],
+        "env": copy.deepcopy(predecessor.get("env", {})),
+        "resources": copy.deepcopy(predecessor["request"]),
+        "workflow_id": predecessor["workflow_id"],
+        "task_id": predecessor["task_id"],
+        "needs": copy.deepcopy(predecessor.get("needs", [])),
+        "wait_for": copy.deepcopy(predecessor.get("wait_for", [])),
+        "recovery": copy.deepcopy(predecessor["recovery"]),
+    }
+    project_id = job_project(predecessor)
+    if project_id != DEFAULT_PROJECT:
+        spec["project_id"] = project_id
+    return spec
+
+
+def _recovery_candidate(
+    predecessor: dict[str, Any], reason: str
+) -> tuple[int, str, str] | None:
+    workflow_id = predecessor.get("workflow_id")
+    task_id = predecessor.get("task_id")
+    policy = _recovery_policy(predecessor)
+    if (
+        predecessor.get("state") != "lost"
+        or not isinstance(workflow_id, str)
+        or not isinstance(task_id, str)
+        or policy is None
+        or reason not in policy.get("retry_on", [])
+        or not all(key in predecessor for key in ("argv", "cwd", "request"))
+    ):
+        return None
+    attempt = predecessor.get("attempt") if type(predecessor.get("attempt")) is int else 1
+    max_attempts = policy.get("max_attempts")
+    if type(max_attempts) is not int or attempt >= max_attempts:
+        return None
+    successor_attempt = attempt + 1
+    project_id = job_project(predecessor)
+    request_id = recovery_request_id(project_id, workflow_id, task_id, successor_attempt)
+    return successor_attempt, request_id, create_job_id(request_id, project_id=project_id)
+
+
+def _admit_recovery_successor(
+    controller: Controller,
+    predecessor: dict[str, Any],
+    successor_id: str,
+    request_id: str,
+    attempt: int,
+    queue_order: int,
+    prospective: dict[str, dict[str, Any]],
+    reason: str,
+) -> None:
+    spec = _recovery_successor_spec(predecessor, successor_id, request_id)
+    successor = job_from_spec(spec, queue_order)
+    successor.update(
+        {
+            "attempt": attempt,
+            "predecessor_job_id": predecessor["id"],
+            "retry_reason": reason,
+        }
+    )
+    prospective[successor_id] = successor
+    event_kind = _initial_job_event(controller, successor, prospective)
+    write_request_record(controller.root, successor)
+    if successor.get("state") in TERMINAL_JOB_STATES:
+        write_result_record(controller.root, successor)
+    controller.state["jobs"][successor_id] = successor
+    emit(
+        controller,
+        event_kind,
+        job=successor,
+        data={"predecessor_job_id": predecessor["id"], "retry_reason": reason},
+    )
+    predecessor["successor_job_id"] = successor_id
+    emit(
+        controller,
+        "job.recovery_linked",
+        job=predecessor,
+        data={"successor_job_id": successor_id, "retry_reason": reason},
+    )
+    record_request_receipt(controller.root, successor_id, job_identity_digest(spec))
+
+
+def _recover_lost_workflow_jobs(controller: Controller, reason: str) -> None:
+    """Admit at most one deterministic successor for each eligible lost task."""
+
+    jobs = controller.state["jobs"]
+    prospective = dict(jobs)
+    next_order = max((int(job.get("queue_order", 0)) for job in jobs.values()), default=0)
+    for predecessor in sorted(
+        jobs.values(), key=lambda job: (int(job.get("queue_order", 0)), str(job["id"]))
+    ):
+        candidate = _recovery_candidate(predecessor, reason)
+        if candidate is None:
+            continue
+        attempt, request_id, successor_id = candidate
+        existing = jobs.get(successor_id)
+        if existing is None:
+            try:
+                existing = find_archived_job(controller.root, successor_id)
+            except (OSError, StorageError, TransientStorageError) as exc:
+                _storage_notice(controller, "read_recovery_receipt", successor_id, exc)
+                continue
+        if existing is not None or predecessor.get("successor_job_id") == successor_id:
+            predecessor["successor_job_id"] = successor_id
+            continue
+        _admit_recovery_successor(
+            controller,
+            predecessor,
+            successor_id,
+            request_id,
+            attempt,
+            next_order + 1,
+            prospective,
+            reason,
+        )
+        next_order += 1
+    controller.state["next_queue_order"] = max(
+        int(controller.state.get("next_queue_order", 0)), next_order
+    )
 
 
 def _resolution_workflow_jobs(

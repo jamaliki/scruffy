@@ -108,6 +108,17 @@ but a succeeded task identity remains final. Scruffy never reopens an already
 terminal descendant; a future cascade-retry operation must create new descendant
 attempts transactionally.
 
+Workflow tasks may declare a strict `recovery` policy with `max_attempts`
+(including the first attempt, capped at 10), `retry_on`, and the nested
+`evacuation` signal/grace fields. Wave 1 admits only the documented reasons and
+automatically creates deterministic successors for allocation replacement or
+incarnation change. The `evacuated` reason is validated and persisted for the
+next phase; no signal, evacuation command, or grace deadline is implemented in
+this phase. A successor copies the predecessor's immutable task inputs and
+records both lineage links plus the retry reason. Replay checks the deterministic
+successor identity before admission, so controller recovery cannot fan out
+duplicate attempts.
+
 ### Observation
 
 Read interfaces project the same authoritative state for different costs:

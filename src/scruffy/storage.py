@@ -283,6 +283,23 @@ def create_job_id(
     return f"job-{timestamp}-{uuid.uuid4().hex[:10]}"
 
 
+def recovery_request_id(
+    project_id: str, workflow_id: str, task_id: str, attempt: int
+) -> str:
+    """Return the deterministic internal idempotency key for one retry."""
+
+    if not all(isinstance(value, str) and value for value in (project_id, workflow_id, task_id)):
+        raise ValueError("recovery identity fields must be non-empty strings")
+    if type(attempt) is not int or attempt <= 0:
+        raise ValueError("recovery attempt must be a positive integer")
+    identity = json.dumps(
+        [project_id, workflow_id, task_id, attempt],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return f"scruffy-recovery-{hashlib.sha256(identity).hexdigest()}"
+
+
 def create_submission_id(request_id: str, *, project_id: str = DEFAULT_PROJECT) -> str:
     """Create the stable outer identity for an atomic multi-job submission."""
 
@@ -617,6 +634,13 @@ _ARCHIVED_JOB_FIELDS = (
     "provenance",
     "deadline_at",
     "attempt",
+    "recovery",
+    "predecessor_job_id",
+    "successor_job_id",
+    "retry_reason",
+    "retry_exhausted",
+    "retry_exhausted_reason",
+    "retry_exhausted_at",
     "resolved_dependencies",
     "workflow_id",
     "task_id",

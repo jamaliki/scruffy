@@ -16,7 +16,7 @@ from .storage import (
     submission_identity_digest,
     utc_now,
 )
-from .workflows import validate_workflows
+from .workflows import validate_recovery_policy, validate_workflows
 
 MAX_WORKFLOW_TASKS = 256
 TASK_KEYS = frozenset(
@@ -30,6 +30,7 @@ TASK_KEYS = frozenset(
         "resources",
         "needs",
         "wait_for",
+        "recovery",
     }
 )
 
@@ -53,6 +54,11 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
     if not cwd.is_absolute():
         raise ValueError("cwd must be absolute")
     project_id = normalize_project_id(spec.get("project_id"))
+    recovery = None
+    if "recovery" in spec:
+        if spec["recovery"] is None:
+            raise ValueError("recovery must be an object")
+        recovery = validate_recovery_policy(spec["recovery"], "recovery")
     job = {
         "id": str(spec["job_id"]),
         "request_id": spec.get("request_id"),
@@ -97,6 +103,10 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
                 "dependency_gate_passed": False,
             }
         )
+        if recovery is not None:
+            job["recovery"] = recovery
+    elif recovery is not None:
+        raise ValueError("recovery requires workflow_id and task_id")
     return job
 
 
@@ -125,6 +135,7 @@ def _task_spec(
     resources = task.get("resources")
     needs = task.get("needs", [])
     wait_for = task.get("wait_for", [])
+    recovery = task.get("recovery")
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"tasks[{index}].name must be a non-empty string")
     if not isinstance(argv, list) or not argv or not all(
@@ -145,6 +156,10 @@ def _task_spec(
         isinstance(item, dict) for item in wait_for
     ):
         raise ValueError(f"tasks[{index}].wait_for must be a list of condition objects")
+    if "recovery" in task and recovery is None:
+        raise ValueError(f"tasks[{index}].recovery must be an object")
+    if recovery is not None:
+        recovery = validate_recovery_policy(recovery, f"tasks[{index}].recovery")
     return {
         "v": 1,
         "job_id": create_job_id(request_id, project_id=project_id),
@@ -160,6 +175,7 @@ def _task_spec(
         "task_id": task_id,
         "needs": [dict(item) for item in needs],
         "wait_for": [dict(item) for item in wait_for],
+        **({"recovery": recovery} if recovery is not None else {}),
     }
 
 

@@ -529,6 +529,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
             "task_id",
             "needs",
             "wait_for",
+            "recovery",
             "environment",
         },
     )
@@ -590,6 +591,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
         task_id=params.get("task_id"),
         needs=needs,
         wait_for=wait_for,
+        recovery=params.get("recovery"),
     )
 
 
@@ -1054,6 +1056,7 @@ def create_server(
             task_id: str | None = None,
             needs: list[dict[str, str]] | None = None,
             wait_for: list[dict[str, str]] | None = None,
+            recovery: dict[str, Any] | None = None,
             environment: dict[str, str] | None = None,
         ) -> dict[str, Any]:
             """Durably enqueue a job in this server's pinned project.
@@ -1079,6 +1082,7 @@ def create_server(
                     "task_id": task_id,
                     "needs": needs,
                     "wait_for": wait_for,
+                    "recovery": recovery,
                     "environment": {} if environment is None else environment,
                 },
             )
