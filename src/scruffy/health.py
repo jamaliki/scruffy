@@ -186,18 +186,27 @@ def ingest_health_sample(
     failed_cuda_indices = {
         item.get("nvidia_index")
         for item in cuda_devices
-        if isinstance(item, Mapping) and item.get("ok") is False
+        if (
+            isinstance(item, Mapping)
+            and item.get("ok") is False
+            and item.get("inconclusive") is not True
+        )
     }
     failed_cuda_uuids = {
         str(item.get("uuid")).lower()
         for item in cuda_devices
         if isinstance(item, Mapping)
         and item.get("ok") is False
+        and item.get("inconclusive") is not True
         and isinstance(item.get("uuid"), str)
     }
     cuda_device_count = cuda_probe.get("device_count")
     count_mismatch = type(cuda_device_count) is int and cuda_device_count != len(rows)
-    global_cuda_failure = init_ok is False or count_mismatch or (not cuda_ok and not cuda_devices)
+    global_cuda_failure = (
+        init_ok is False
+        or count_mismatch
+        or (not cuda_ok and not cuda_devices and cuda_probe.get("inconclusive") is not True)
+    )
     node_state = health.setdefault("nodes", {}).setdefault(node_name, {"devices": {}})
     previous_sample_at = node_state.get("last_sample_at")
     if isinstance(previous_sample_at, str) and _timestamp_value(recorded_at) <= _timestamp_value(

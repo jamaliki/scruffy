@@ -172,8 +172,11 @@ Every 10 seconds, one task on each node records:
 - current temperature, power, uncorrectable volatile ECC count, and NVIDIA's
   software/hardware thermal-slowdown reasons; and
 - a CUDA Driver API initialization, device-count, UUID, and context-creation
-  probe for every visible GPU. This catches failures where `nvidia-smi` works
-  but CUDA initialization does not.
+  probe for idle visible GPUs. GPUs currently assigned by Scruffy are retained
+  in passive telemetry but are not given a competing context probe. A context
+  probe that races a newly busy GPU and returns `CUDA_ERROR_OUT_OF_MEMORY` is
+  recorded as inconclusive rather than as a hardware failure; definite CUDA,
+  ECC, and thermal failures retain their normal quarantine behavior.
 
 Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
 The default is `observe`: automatic failures become visible without changing

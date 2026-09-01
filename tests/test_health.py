@@ -161,6 +161,31 @@ class HealthTests(unittest.TestCase):
         self.assertEqual("healthy", devices["GPU-aaaa"]["status"])
         self.assertEqual("quarantined", devices["GPU-bbbb"]["status"])
 
+    def test_inconclusive_cuda_probe_does_not_accumulate_bad_samples(self) -> None:
+        health = empty_health_state(mode="enforce", isolation="node")
+        for offset in range(3):
+            sample = self.sample(at=self.at + timedelta(seconds=offset))
+            sample["cuda_probe"] = {
+                "ok": True,
+                "init_ok": True,
+                "inconclusive": True,
+                "devices": [
+                    {
+                        "nvidia_index": 0,
+                        "uuid": "GPU-aaaa",
+                        "ok": True,
+                        "inconclusive": True,
+                        "error": "cuCtxCreate_v2: CUDA_ERROR_OUT_OF_MEMORY (2)",
+                    }
+                ],
+            }
+            ingest_health_sample(health, self.inventory, sample)
+
+        device = health["nodes"]["gpu-a"]["devices"]["GPU-aaaa"]
+        self.assertEqual("healthy", device["status"])
+        self.assertEqual(0, device["bad_samples"])
+        self.assertEqual(3, device["good_samples"])
+
     def test_operator_clear_releases_a_healthy_device(self) -> None:
         health = empty_health_state(mode="enforce", isolation="node")
         ingest_health_sample(health, self.inventory, self.sample())

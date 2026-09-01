@@ -77,11 +77,13 @@ a same-allocation restart, and terminates the job with reason `timeout`.
 ### GPU health authority
 
 One controller-owned Slurm step overlaps all managed nodes and GPUs. Node-local
-workers publish atomic latest samples containing NVIDIA physical identity,
-thermal/ECC telemetry, and CUDA Driver API context probes. The controller alone
-turns those observations into `healthy`, `suspect`, or sticky `quarantined`
-state. High-rate metrics stay in replaceable samples and the current snapshot;
-only state transitions and operator commands enter the journal.
+workers publish atomic latest samples containing NVIDIA physical identity and
+thermal/ECC telemetry, plus CUDA Driver API context probes for GPUs not
+currently assigned by Scruffy. The controller alone turns those observations
+into `healthy`, `suspect`, or sticky `quarantined` state. Assigned GPUs remain
+passively observed, and context OOM races are explicitly inconclusive rather
+than failures. High-rate metrics stay in replaceable samples and the current
+snapshot; only state transitions and operator commands enter the journal.
 Samples are bound to the outer allocation-incarnation fingerprint, so a requeue
 cannot reuse healthy freshness from the previous physical execution.
 

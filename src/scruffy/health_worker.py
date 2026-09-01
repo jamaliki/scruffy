@@ -11,11 +11,13 @@ import subprocess
 import sys
 import time
 import uuid as uuid_module
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from pathlib import Path
 
 from ._compat import UTC
-from .storage import atomic_write_json
+from .models import ACTIVE_JOB_STATES
+from .storage import StorageError, atomic_write_json, load_state
 
 IDENTITY_FIELDS = (
     "index",
@@ -53,6 +55,12 @@ THERMAL_FIELD_SETS = (
         "clocks_throttle_reasons.hw_thermal_slowdown",
     ),
 )
+
+CUDA_ERROR_NAMES = {
+    0: "CUDA_SUCCESS",
+    2: "CUDA_ERROR_OUT_OF_MEMORY",
+    999: "CUDA_ERROR_UNKNOWN",
+}
 
 
 def _run_query(fields: tuple[str, ...]) -> list[list[str]]:
@@ -168,19 +176,38 @@ def _cuda_call(library: ctypes.CDLL, name: str, *arguments: object) -> int:
     return int(function(*arguments))
 
 
-def probe_cuda() -> dict[str, object]:
-    """Initialize CUDA and create one context per visible device."""
+def _cuda_error(code: int) -> str:
+    return f"{CUDA_ERROR_NAMES.get(code, f'CUDA_ERROR_{code}')} ({code})"
+
+
+def probe_cuda(*, skip_indices: Collection[int] | None = ()) -> dict[str, object]:
+    """Probe idle devices without creating contexts on reserved devices.
+
+    ``None`` skips every context probe when the reservation snapshot is
+    unavailable. Context OOM is reported as inconclusive because it may be a
+    race with a workload admitted after the snapshot.
+    """
+
+    skip_all = skip_indices is None
+    skipped = frozenset() if skip_all else frozenset(skip_indices)
 
     try:
         library = ctypes.CDLL("libcuda.so.1")
     except OSError as exc:
-        return {"ok": False, "init_ok": False, "error": str(exc), "devices": []}
+        return {
+            "ok": False,
+            "init_ok": False,
+            "operation": "load_driver",
+            "error": str(exc),
+            "devices": [],
+        }
     result = _cuda_call(library, "cuInit", ctypes.c_uint(0))
     if result != 0:
         return {
             "ok": False,
             "init_ok": False,
-            "error": f"cuInit returned CUDA error {result}",
+            "operation": "cuInit",
+            "error": f"cuInit: {_cuda_error(result)}",
             "devices": [],
         }
     count = ctypes.c_int()
@@ -189,7 +216,8 @@ def probe_cuda() -> dict[str, object]:
         return {
             "ok": False,
             "init_ok": False,
-            "error": f"cuDeviceGetCount returned CUDA error {result}",
+            "operation": "cuDeviceGetCount",
+            "error": f"cuDeviceGetCount: {_cuda_error(result)}",
             "devices": [],
         }
     devices: list[dict[str, object]] = []
@@ -197,6 +225,7 @@ def probe_cuda() -> dict[str, object]:
         device = ctypes.c_int()
         code = _cuda_call(library, "cuDeviceGet", ctypes.byref(device), ctypes.c_int(index))
         device_uuid = None
+        operation = "cuDeviceGet"
         if code == 0:
             uuid_bytes = (ctypes.c_ubyte * 16)()
             uuid_function = (
@@ -204,11 +233,15 @@ def probe_cuda() -> dict[str, object]:
                 if hasattr(library, "cuDeviceGetUuid_v2")
                 else "cuDeviceGetUuid"
             )
+            operation = uuid_function
             code = _cuda_call(library, uuid_function, ctypes.byref(uuid_bytes), device)
             if code == 0:
                 device_uuid = f"GPU-{uuid_module.UUID(bytes=bytes(uuid_bytes))}"
-        context = ctypes.c_void_p()
-        if code == 0:
+        skipped_busy = code == 0 and (skip_all or index in skipped)
+        inconclusive = skipped_busy
+        if code == 0 and not skipped_busy:
+            context = ctypes.c_void_p()
+            operation = "cuCtxCreate_v2"
             code = _cuda_call(
                 library,
                 "cuCtxCreate_v2",
@@ -216,35 +249,96 @@ def probe_cuda() -> dict[str, object]:
                 ctypes.c_uint(0),
                 device,
             )
-        if code == 0:
-            destroy_code = _cuda_call(library, "cuCtxDestroy_v2", context)
-            code = destroy_code if destroy_code != 0 else code
+            if code == 2:
+                inconclusive = True
+            elif code == 0:
+                operation = "cuCtxDestroy_v2"
+                destroy_code = _cuda_call(library, "cuCtxDestroy_v2", context)
+                code = destroy_code if destroy_code != 0 else code
+        definite_failure = code != 0 and not inconclusive
         devices.append(
             {
                 "nvidia_index": index,
                 "uuid": device_uuid,
-                "ok": code == 0,
-                "error": None if code == 0 else f"CUDA driver error {code}",
+                "ok": not definite_failure,
+                "inconclusive": inconclusive,
+                "skipped": skipped_busy,
+                "operation": operation,
+                "error": (
+                    "busy reservation; context probe skipped"
+                    if skipped_busy
+                    else f"{operation}: {_cuda_error(code)}"
+                    if inconclusive or definite_failure
+                    else None
+                ),
             }
         )
-    ok = all(device["ok"] for device in devices)
+    definite_failures = any(device["ok"] is False for device in devices)
+    inconclusive = any(device["inconclusive"] is True for device in devices)
     return {
-        "ok": ok,
+        "ok": not definite_failures,
         "init_ok": True,
         "device_count": count.value,
-        "error": None if ok else "one or more CUDA contexts failed",
+        "inconclusive": inconclusive,
+        "error": None if not definite_failures else "one or more CUDA operations failed",
         "devices": devices,
     }
 
 
-def collect_sample(node: str, allocation_incarnation_sha256: str) -> dict[str, object]:
+def _busy_gpu_indices(root: Path, node: str) -> frozenset[int] | None:
+    """Return active Scruffy reservations for ``node``.
+
+    ``state.json`` is atomically replaced by the controller.  ``None`` means
+    the snapshot could not be trusted; callers then skip all context probes
+    for this sample while retaining passive telemetry.
+    """
+
+    try:
+        state = load_state(root)
+    except (OSError, StorageError, TypeError, ValueError):
+        return None
+    if state is None:
+        return frozenset()
+    jobs = state.get("jobs")
+    if not isinstance(jobs, Mapping):
+        return None
+    busy: set[int] = set()
+    for job in jobs.values():
+        if not isinstance(job, Mapping) or job.get("state") not in ACTIVE_JOB_STATES:
+            continue
+        assignment = job.get("assignment")
+        if not isinstance(assignment, Mapping):
+            return None
+        reservations = assignment.get("reservations")
+        if not isinstance(reservations, list):
+            return None
+        for reservation in reservations:
+            if not isinstance(reservation, Mapping) or reservation.get("node") != node:
+                continue
+            gpu_ids = reservation.get("gpu_ids")
+            if not isinstance(gpu_ids, list) or any(
+                type(gpu_id) is not int or gpu_id < 0 for gpu_id in gpu_ids
+            ):
+                return None
+            busy.update(gpu_ids)
+    return frozenset(busy)
+
+
+def collect_sample(
+    node: str, allocation_incarnation_sha256: str, *, root: Path | None = None
+) -> dict[str, object]:
     devices, thermal_error = query_nvidia_gpus()
+    busy_indices = _busy_gpu_indices(root, node) if root is not None else frozenset()
+    probe = probe_cuda(skip_indices=busy_indices)
+    if busy_indices is None:
+        probe["inconclusive"] = True
+        probe["busy_state_error"] = "Scruffy state snapshot unavailable"
     return {
         "v": 1,
         "node": node,
         "recorded_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
         "allocation_incarnation_sha256": allocation_incarnation_sha256,
-        "cuda_probe": probe_cuda(),
+        "cuda_probe": probe,
         "thermal_query_error": thermal_error,
         "gpus": devices,
     }
@@ -276,7 +370,10 @@ def run(
     target = sample_root / f"{node}.json"
     while True:
         started = time.monotonic()
-        atomic_write_json(target, collect_sample(node, allocation_incarnation_sha256))
+        atomic_write_json(
+            target,
+            collect_sample(node, allocation_incarnation_sha256, root=root),
+        )
         if once:
             return
         time.sleep(max(0.0, interval - (time.monotonic() - started)))
