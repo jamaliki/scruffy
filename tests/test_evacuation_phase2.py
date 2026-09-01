@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unittest
@@ -19,11 +20,22 @@ from scruffy.client import (
     wait_for_evacuation,
     wait_for_job,
 )
-from scruffy.controller import _advance_evacuation, _begin_evacuation, _initialize_controller
+from scruffy.controller import (
+    _advance_evacuation,
+    _begin_evacuation,
+    _ingest_commands,
+    _initialize_controller,
+)
 from scruffy.models import Assignment, NodeInventory, NodeReservation, ResourceRequest
 from scruffy.runtime import RunningProcess
 from scruffy.slurm import signal_step
-from scruffy.storage import StorageError, read_events
+from scruffy.storage import (
+    StorageError,
+    read_events,
+    record_command_receipt,
+    remove_command,
+    submit_command,
+)
 
 TIMEOUT = 15.0
 REQUEST = ResourceRequest(nodes=1, gpus_per_node=0, cpus_per_node=1, memory_gb_per_node=1)
@@ -289,5 +301,187 @@ class EvacuationPhase2Tests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             signal_step("123", "123.batch")
+
+    def test_signal_receipt_prevents_resend_across_both_crash_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("node", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+                gpu_health_mode="off",
+            )
+            assignment = Assignment(
+                "crash-window",
+                ResourceRequest(1, 0, 1, 1),
+                (NodeReservation("node", (), 1, 1),),
+            ).to_dict()
+            job = {
+                "id": "crash-window",
+                "state": "running",
+                "project_id": "default",
+                "workflow_id": "flow",
+                "task_id": "task",
+                "recovery": POLICY,
+                "assignment": assignment,
+                "launch_token": "local-token",
+            }
+            controller.state["jobs"][job["id"]] = job
+            controller.running[job["id"]] = RunningProcess(mock.Mock(pid=321), "local-token")
+            try:
+                _begin_evacuation(
+                    controller,
+                    {"request_id": "crash-request", "scope": {"job_id": job["id"]}},
+                )
+                sends: list[str] = []
+
+                def crash_before_side_effect(*_args: object) -> None:
+                    raise KeyboardInterrupt("crash before delivery")
+
+                with (
+                    mock.patch(
+                        "scruffy.controller.signal_process",
+                        side_effect=crash_before_side_effect,
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    _advance_evacuation(controller)
+                self.assertEqual([], sends)
+                with mock.patch(
+                    "scruffy.controller.signal_process",
+                    side_effect=lambda *_args: sends.append("delivered"),
+                ):
+                    controller.state["evacuation"]["targets"][job["id"]][
+                        "deadline_at"
+                    ] = "2000-01-01T00:00:00+00:00"
+                    _advance_evacuation(controller)
+                self.assertEqual([], sends)
+                self.assertEqual(
+                    "timed_out",
+                    controller.state["evacuation"]["targets"][job["id"]]["outcome"],
+                )
+                self.assertEqual("partial", controller.state["evacuation"]["state"])
+
+                evacuation = controller.state["evacuation"]
+                evacuation["request_id"] = "crash-after-request"
+                evacuation["targets"][job["id"]].update(
+                    {
+                        "request_id": "crash-after-request",
+                        "outcome": "pending",
+                        "deadline_at": "2099-01-01T00:00:00+00:00",
+                    }
+                )
+                evacuation["state"] = "requested"
+                controller.state["evacuation_requests"]["crash-after-request"] = {
+                    "scope": {"job_id": job["id"]},
+                    "resume_after": False,
+                    "automatic": False,
+                }
+
+                def crash_after_side_effect(*_args: object) -> None:
+                    sends.append("delivered")
+                    raise KeyboardInterrupt("crash after delivery")
+
+                with (
+                    mock.patch(
+                        "scruffy.controller.signal_process",
+                        side_effect=crash_after_side_effect,
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    _advance_evacuation(controller)
+                with mock.patch(
+                    "scruffy.controller.signal_process",
+                    side_effect=lambda *_args: sends.append("duplicate"),
+                ):
+                    _advance_evacuation(controller)
+                self.assertEqual(["delivered"], sends)
+            finally:
+                controller.journal.close()
+
+    def test_command_id_lock_deduplicates_race_and_rejected_ids_remain_burned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "queue"
+            identical = {"kind": "evacuate", "request_id": "raced", "scope": {}, "resume_after": False}
+            barrier = threading.Barrier(2)
+            results: list[str] = []
+
+            def submit_identical() -> None:
+                barrier.wait()
+                results.append(submit_command(root, identical))
+
+            threads = [threading.Thread(target=submit_identical) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(["raced", "raced"], sorted(results))
+            conflicting = {**identical, "resume_after": True}
+            with self.assertRaises(StorageError):
+                submit_command(root, conflicting)
+
+            conflict_barrier = threading.Barrier(2)
+            conflict_results: list[str] = []
+
+            def submit_conflicting(command: dict[str, Any]) -> None:
+                conflict_barrier.wait()
+                try:
+                    submit_command(root, command)
+                except StorageError:
+                    conflict_results.append("conflict")
+                else:
+                    conflict_results.append("accepted")
+
+            conflict_a = {
+                "kind": "evacuate",
+                "request_id": "conflict-race",
+                "scope": {"job_id": "one"},
+                "resume_after": False,
+            }
+            conflict_b = {**conflict_a, "scope": {"job_id": "two"}}
+            threads = [
+                threading.Thread(target=submit_conflicting, args=(command,))
+                for command in (conflict_a, conflict_b)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(["accepted", "conflict"], sorted(conflict_results))
+
+            source = root / "commands" / "raced.json"
+            remove_command(source)
+            record_command_receipt(root, identical)
+            self.assertEqual("raced", submit_command(root, identical))
+            with self.assertRaises(StorageError):
+                submit_command(root, conflicting)
+
+            controller = _initialize_controller(
+                root=root,
+                inventory=(NodeInventory("node", (0,), 2, 2),),
+                launcher="local",
+                allocation_id="local",
+                slurm_job_id=None,
+                poll_interval=0.1,
+                cancel_grace=0,
+                gpu_health_mode="off",
+            )
+            try:
+                rejected = {
+                    "kind": "not-a-command",
+                    "request_id": "rejected-first",
+                    "payload": "bad",
+                }
+                submit_command(root, rejected)
+                _ingest_commands(controller)
+                self.assertEqual("rejected-first", submit_command(root, rejected))
+                with self.assertRaises(StorageError):
+                    submit_command(root, {**rejected, "payload": "changed"})
+            finally:
+                controller.journal.close()
 if __name__ == "__main__":
     unittest.main()

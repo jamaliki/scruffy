@@ -1117,14 +1117,51 @@ def submit_command(root: Path, command: dict[str, Any]) -> str:
     root = ensure_layout(root)
     request_id = str(command.get("request_id") or uuid.uuid4().hex)
     document = {**command, "request_id": request_id}
-    destination = root / "commands" / f"{request_id}.json"
-    if destination.exists():
-        existing = read_json(destination)
-        if existing != document:
-            raise StorageError(f"conflicting command request ID {request_id!r}")
-        return request_id
-    atomic_write_json(destination, document)
+    command_root = root / "commands"
+    receipt = _command_receipt(command_root, request_id)
+    destination = command_root / f"{request_id}.json"
+    with _key_lock(command_root, request_id) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        for source in (receipt, destination):
+            if not source.exists():
+                continue
+            existing = (
+                read_immutable_json(source)[0]
+                if source == receipt
+                else read_json(source)
+            )
+            existing_command = existing.get("command") if source == receipt else existing
+            if existing_command != document:
+                raise StorageError(f"conflicting command request ID {request_id!r}")
+            return request_id
+        atomic_write_json(destination, document)
     return request_id
+
+
+def record_command_receipt(root: Path, command: dict[str, Any]) -> None:
+    """Retain one immutable command identity after it is handled or rejected."""
+
+    root = ensure_layout(root)
+    request_id = command.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise StorageError("handled command has no request ID")
+    command_root = root / "commands"
+    receipt = _command_receipt(command_root, request_id)
+    document = {"v": 1, "request_id": request_id, "command": command}
+    with _key_lock(command_root, request_id) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if receipt.exists():
+            existing, _ = read_immutable_json(receipt)
+            if existing != document:
+                raise StorageError(f"conflicting command receipt for {request_id!r}")
+            return
+        _mkdir(receipt.parent)
+        create_immutable_json(receipt, document)
+
+
+def _command_receipt(command_root: Path, request_id: str) -> Path:
+    digest = hashlib.sha256(request_id.encode()).hexdigest()
+    return command_root / ".accepted" / f"{digest}.json"
 
 
 def list_commands(root: Path) -> list[tuple[Path, dict[str, Any]]]:

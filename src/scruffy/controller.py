@@ -97,6 +97,7 @@ from .storage import (
     read_events,
     read_immutable_json,
     read_json,
+    record_command_receipt,
     record_request_receipt,
     recovery_request_id,
     reject_request,
@@ -861,6 +862,19 @@ def _signal_receipt(
     record, _ = read_immutable_json(source)
     if not isinstance(record, dict):
         raise StorageError(f"invalid evacuation signal receipt {source}")
+    expected = {
+        "v": 1,
+        "request_id": target["request_id"],
+        "job_id": job["id"],
+        "launch_token": job.get("launch_token"),
+        "assignment": copy.deepcopy(job.get("assignment")),
+        "allocation_incarnation_sha256": job.get("allocation_incarnation_sha256"),
+        "signal": target.get("signal"),
+        "target_step": target.get("target_step"),
+        "target_pid": target.get("target_pid"),
+    }
+    if record != expected:
+        raise StorageError(f"evacuation signal receipt identity changed {source}")
     return record
 
 
@@ -875,6 +889,9 @@ def _write_signal_receipt(
         "launch_token": job.get("launch_token"),
         "assignment": copy.deepcopy(job.get("assignment")),
         "allocation_incarnation_sha256": job.get("allocation_incarnation_sha256"),
+        "signal": target.get("signal"),
+        "target_step": target.get("target_step"),
+        "target_pid": target.get("target_pid"),
     }
     try:
         create_immutable_json(source, record)
@@ -934,32 +951,60 @@ def _signal_evacuation_target(
     if not _target_identity_valid(controller, job, target):
         target.update({"outcome": "lost", "reason": "launch_identity_changed"})
         return
+    target_step = None
+    target_pid = None
+    if controller.launcher == "slurm":
+        try:
+            target_step = _owned_slurm_step(controller, job)
+        except (StorageError, ValueError) as exc:
+            target.update({"outcome": "lost", "reason": f"signal_target_invalid:{exc}"})
+            return
+    else:
+        process = controller.running[job["id"]].process
+        target_pid = process.pid if process is not None else None
+    # Recompute the exact owned target before receipt validation.  If the
+    # process crashed after the immutable receipt but before the signalling
+    # event/snapshot, replay must validate against the same identity that was
+    # durably recorded rather than treating missing projection fields as a
+    # conflict.
+    target.update({"target_step": target_step, "target_pid": target_pid})
     receipt = _signal_receipt(controller, job, target)
     if receipt is not None:
         target.update({"outcome": "waiting", "signal_replayed": True})
+        evacuation["state"] = "waiting"
+        request = controller.state.setdefault("evacuation_requests", {})[evacuation["request_id"]]
+        _evacuation_emit(controller, evacuation, request, "evacuation.waiting")
         return
-    target.update({"outcome": "signalling", "signal_decided_at": utc_now()})
+    target.update(
+        {
+            "outcome": "signalling",
+            "signal_decided_at": utc_now(),
+            "target_step": target_step,
+            "target_pid": target_pid,
+        }
+    )
     request = controller.state.setdefault("evacuation_requests", {})[evacuation["request_id"]]
+    # The immutable receipt and signalling event are both durable before the
+    # external signal. A crash in either window therefore cannot authorize a
+    # replayed signal; the target may conservatively time out and remain
+    # drained if delivery was not confirmed.
+    _write_signal_receipt(controller, job, target)
     _evacuation_emit(controller, evacuation, request, "evacuation.signalling")
     try:
         if controller.launcher == "slurm":
-            step_id = _owned_slurm_step(controller, job)
-            job["slurm_step_id"] = step_id
-            signal_step(controller.slurm_job_id or "", step_id, target["signal"])
+            job["slurm_step_id"] = target_step
+            signal_step(controller.slurm_job_id or "", target_step, target["signal"])
         else:
             running = controller.running[job["id"]]
             signal_process(running.process, signal.Signals.SIGUSR1)
     except (KeyboardInterrupt, SystemExit):
-        # The side effect may have happened immediately before a crash. A
-        # durable receipt makes replay at-most-once rather than risking a
-        # second signal.
-        _write_signal_receipt(controller, job, target)
+        # The pre-side-effect receipt makes replay at-most-once regardless of
+        # whether the signal was delivered before this process stopped.
         raise
     except (OSError, StorageError, ValueError, subprocess.SubprocessError) as exc:
         target.update({"outcome": "lost", "reason": f"signal_failed:{exc}"})
         _evacuation_emit(controller, evacuation, request, "evacuation.target_failed")
         return
-    _write_signal_receipt(controller, job, target)
     target.update({"outcome": "waiting", "signalled_at": utc_now()})
     evacuation["state"] = "waiting"
     _evacuation_emit(controller, evacuation, request, "evacuation.waiting")
@@ -2224,6 +2269,7 @@ def _ingest_commands(controller: Controller) -> None:
                 },
             )
         if not deferred:
+            record_command_receipt(controller.root, command)
             remove_command(source)
 
 
@@ -2289,7 +2335,7 @@ def _discard_journaled_commands(controller: Controller) -> None:
     """Acknowledge commands whose durable outcome survived a controller crash."""
 
     pending = {
-        str(command.get("request_id")): source
+        str(command.get("request_id")): (source, command)
         for source, command in list_commands(controller.root)
         if command.get("request_id")
     }
@@ -2303,8 +2349,10 @@ def _discard_journaled_commands(controller: Controller) -> None:
         request_id = data.get("request_id") if isinstance(data, dict) else None
         if not isinstance(request_id, str) or not request_id:
             continue
-        source = pending.pop(request_id, None)
-        if source is not None:
+        item = pending.pop(request_id, None)
+        if item is not None:
+            source, command = item
+            record_command_receipt(controller.root, command)
             remove_command(source)
         if not pending:
             return
