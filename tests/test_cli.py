@@ -511,6 +511,82 @@ class ServeCliTests(unittest.TestCase):
             gpu_health_interval=10,
         )
 
+    def test_serve_passes_explicit_release_attestation(self) -> None:
+        inventory_file = self.workspace / "inventory.json"
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("scruffy.cli.load_inventory", return_value=self.inventory),
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "serve",
+                    "--inventory",
+                    str(inventory_file),
+                    "--allocation-id",
+                    "local-test",
+                    "--release",
+                    "release-2026-09-01",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            "release-2026-09-01", run_controller.call_args.kwargs["controller_release"]
+        )
+
+    def test_serve_uses_controller_commit_environment_default(self) -> None:
+        inventory_file = self.workspace / "inventory.json"
+        with (
+            mock.patch.dict(
+                os.environ, {"SCRUFFY_CONTROLLER_COMMIT": "commit-from-env"}, clear=True
+            ),
+            mock.patch("scruffy.cli.load_inventory", return_value=self.inventory),
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "serve",
+                    "--inventory",
+                    str(inventory_file),
+                    "--allocation-id",
+                    "local-test",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            "commit-from-env", run_controller.call_args.kwargs["controller_release"]
+        )
+
+    def test_serve_rejects_empty_release_before_starting(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch("scruffy.cli.load_inventory") as load_inventory,
+            mock.patch("scruffy.cli.run_controller") as run_controller,
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = main(
+                [
+                    "--root",
+                    str(self.root),
+                    "serve",
+                    "--inventory",
+                    str(self.workspace / "inventory.json"),
+                    "--release",
+                    "",
+                ]
+            )
+
+        self.assertEqual(2, result)
+        self.assertIn("--release must be a non-empty string", stderr.getvalue())
+        load_inventory.assert_not_called()
+        run_controller.assert_not_called()
+
     def test_missing_inventory_is_reported_without_a_traceback(self) -> None:
         stderr = io.StringIO()
         with (

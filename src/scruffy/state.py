@@ -521,6 +521,14 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 incarnation = data.get("incarnation")
                 if isinstance(incarnation, dict):
                     recovered_allocation["incarnation"] = copy.deepcopy(incarnation)
+                release = data.get("controller_release")
+                recovered_allocation["controller_release"] = (
+                    release.strip()
+                    if isinstance(release, str) and release.strip()
+                    else "unknown"
+                )
+            else:
+                recovered_allocation["controller_release"] = "unknown"
             state["allocation"] = recovered_allocation
         admitted = event.get("jobs") if event.get("kind") == "submission.admitted" else None
         if isinstance(admitted, list):

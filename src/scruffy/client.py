@@ -549,6 +549,14 @@ def status(
     state.pop("report_acks", None)
     state.pop("report_ack_v", None)
     state.pop("drain_requested", None)
+    allocation = state.get("allocation")
+    if isinstance(allocation, dict):
+        release = allocation.get("controller_release")
+        allocation["controller_release"] = (
+            release.strip()
+            if isinstance(release, str) and release.strip()
+            else "unknown"
+        )
     if job_id is None:
         jobs = state["jobs"]
         for request_id, spec in list_requests(root, exclude=set(jobs)):

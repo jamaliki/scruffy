@@ -94,7 +94,11 @@ class ObserveTests(unittest.TestCase):
             "v": 1,
             "queue_id": identity,
             "last_seq": 3,
-            "allocation": {"id": "allocation-1", "state": "running"},
+            "allocation": {
+                "id": "allocation-1",
+                "state": "running",
+                "controller_release": "unknown",
+            },
             "nodes": {},
             "jobs": {job_id: {"id": job_id, "state": "succeeded"}},
             "draining": False,

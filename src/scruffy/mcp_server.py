@@ -153,24 +153,26 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
 
     allocation = value.get("allocation")
     allocation = allocation if isinstance(allocation, dict) else {}
+    allocation_view = {
+        field: copy.deepcopy(allocation.get(field))
+        for field in (
+            "id",
+            "state",
+            "heartbeat_at",
+            "deadline_at",
+            "remaining_seconds",
+            "automatic_drain_at",
+            "handover",
+        )
+    }
+    allocation_view["controller_release"] = allocation.get("controller_release", "unknown")
 
     return {
         "v": value.get("v", 1),
         "queue_id": value.get("queue_id"),
         "project_id": value.get("project_id"),
         "as_of_cursor": value.get("as_of_cursor"),
-        "allocation": {
-            field: copy.deepcopy(allocation.get(field))
-            for field in (
-                "id",
-                "state",
-                "heartbeat_at",
-                "deadline_at",
-                "remaining_seconds",
-                "automatic_drain_at",
-                "handover",
-            )
-        },
+        "allocation": allocation_view,
         "updated_at": value.get("updated_at"),
         "draining": bool(value.get("draining", False)),
         "launches_paused": bool(value.get("launches_paused", False)),

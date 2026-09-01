@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import queue
 import signal
 import subprocess
@@ -152,6 +153,7 @@ def _initialize_controller(
     launcher: str,
     allocation_id: str,
     slurm_job_id: str | None,
+    controller_release: str | None = None,
     poll_interval: float,
     cancel_grace: float,
     allocation_incarnation: AllocationIncarnation | None = None,
@@ -162,6 +164,7 @@ def _initialize_controller(
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
 ) -> Controller:
+    controller_release = _normalize_controller_release(controller_release)
     state = load_recovered_state(root)
     health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
     bind_health_incarnation(
@@ -345,6 +348,7 @@ def _initialize_controller(
 
     now = utc_now()
     metadata = allocation_metadata(allocation_id, launcher)
+    metadata["controller_release"] = controller_release
     if allocation_incarnation is not None:
         metadata["incarnation"] = allocation_incarnation.to_dict()
     metadata.update(
@@ -419,6 +423,7 @@ def _initialize_controller(
             "incarnation": (
                 allocation_incarnation.to_dict() if allocation_incarnation is not None else None
             ),
+            "controller_release": controller_release,
             "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
             "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
             "lost_reason": lost_reason,
@@ -442,6 +447,18 @@ def _initialize_controller(
             },
         )
     return controller
+
+
+def _normalize_controller_release(value: str | None) -> str:
+    """Resolve one explicit controller attestation without guessing a commit."""
+
+    if value is None:
+        value = os.environ.get("SCRUFFY_CONTROLLER_COMMIT")
+        if value is None:
+            return "unknown"
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("controller release must be a non-empty string")
+    return value.strip()
 
 
 def _reattach_slurm_jobs(controller: Controller, jobs: list[dict[str, Any]]) -> None:
@@ -2943,6 +2960,7 @@ def run_controller(
     inventory: tuple[NodeInventory, ...],
     launcher: str,
     allocation_id: str,
+    controller_release: str | None = None,
     slurm_job_id: str | None = None,
     allocation_incarnation: AllocationIncarnation | None = None,
     poll_interval: float = 0.2,
@@ -2958,6 +2976,7 @@ def run_controller(
 
     if launcher not in {"local", "slurm"}:
         raise ValueError(f"unknown launcher {launcher!r}")
+    controller_release = _normalize_controller_release(controller_release)
     inventory = validate_inventory(inventory)
     if gpu_health_mode not in HEALTH_MODES:
         raise ValueError(f"unknown GPU health mode {gpu_health_mode!r}")
@@ -2998,6 +3017,7 @@ def run_controller(
                     inventory=inventory,
                     launcher=launcher,
                     allocation_id=allocation_id,
+                    controller_release=controller_release,
                     slurm_job_id=slurm_job_id,
                     allocation_incarnation=allocation_incarnation,
                     poll_interval=poll_interval,

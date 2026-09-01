@@ -322,6 +322,7 @@ def resource_view(state: dict[str, Any]) -> dict[str, Any]:
         "allocation": {
             "id": allocation.get("id"),
             "state": allocation.get("state"),
+            "controller_release": allocation.get("controller_release", "unknown"),
         },
         "totals": resource_totals(nodes),
         "scheduler": scheduler_explanation(state),
@@ -523,6 +524,12 @@ def build_summary(
     )
     identity = state.get("queue_id")
     allocation = dict(state.get("allocation") or {})
+    release = allocation.get("controller_release")
+    allocation["controller_release"] = (
+        release.strip()
+        if isinstance(release, str) and release.strip()
+        else "unknown"
+    )
     allocation_deadline = _parse_time(allocation.get("deadline_at"))
     if allocation_deadline is not None:
         allocation["remaining_seconds"] = max(

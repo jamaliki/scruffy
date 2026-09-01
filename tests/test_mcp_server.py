@@ -209,6 +209,7 @@ class ProjectionTests(unittest.TestCase):
             "allocation": {
                 "id": "allocation-1",
                 "state": "running",
+                "controller_release": "unknown",
                 "heartbeat_at": "2026-08-06T12:00:00+00:00",
                 "launcher": "slurm",
                 "automatic_drain_at": "2026-08-07T11:45:00+00:00",
@@ -253,6 +254,7 @@ class ProjectionTests(unittest.TestCase):
             {
                 "id": "allocation-1",
                 "state": "running",
+                "controller_release": "unknown",
                 "heartbeat_at": "2026-08-06T12:00:00+00:00",
                 "deadline_at": None,
                 "remaining_seconds": None,

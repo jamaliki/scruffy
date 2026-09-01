@@ -141,6 +141,13 @@ def _json_object(value: str, label: str) -> dict[str, Any]:
 
 def _serve(arguments: argparse.Namespace) -> int:
     root = _root(arguments)
+    controller_release = getattr(arguments, "controller_release", None)
+    if controller_release is None:
+        controller_release = os.environ.get("SCRUFFY_CONTROLLER_COMMIT")
+    if controller_release is not None:
+        if not isinstance(controller_release, str) or not controller_release.strip():
+            raise ValueError("--release must be a non-empty string")
+        controller_release = controller_release.strip()
     if arguments.drain_before_end_seconds < 0:
         raise ValueError("--drain-before-end-seconds must be non-negative")
     if arguments.evacuate_before_end_seconds < 0:
@@ -176,6 +183,8 @@ def _serve(arguments: argparse.Namespace) -> int:
     if launcher == "slurm" and allocation_id != slurm_job_id:
         raise ValueError("the Slurm allocation ID must equal its Slurm job ID")
     controller_options = {}
+    if controller_release is not None:
+        controller_options["controller_release"] = controller_release
     if arguments.evacuate_before_end_seconds:
         controller_options["evacuate_before_end_seconds"] = (
             arguments.evacuate_before_end_seconds
@@ -561,6 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="worker launcher (default: auto)",
     )
     serve.add_argument("--allocation-id", help="controller allocation identity")
+    serve.add_argument(
+        "--release",
+        dest="controller_release",
+        help="controller release/commit attestation (or SCRUFFY_CONTROLLER_COMMIT)",
+    )
     serve.add_argument("--slurm-job-id", help="outer Slurm allocation job ID")
     serve.add_argument(
         "--gpus-per-node",
