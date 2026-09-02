@@ -5,6 +5,13 @@ clients. The controller snapshot is authoritative for lifecycle and resource
 ownership. Journal events are ordered notifications; the snapshot may already
 include the effects of returned events.
 
+The controller also publishes `cursor.json`, a small atomic sidecar containing
+the queue identity and committed journal watermark. Observers use it for
+polling so idle long-polls do not repeatedly decode the potentially large
+`state.json`. The sidecar is replaced only after the journal is synced and the
+matching snapshot has been atomically replaced. A missing or invalid sidecar
+falls back to `state.json`, preserving compatibility with older queue roots.
+
 ## Operations
 
 | Purpose | CLI | Python / MCP |

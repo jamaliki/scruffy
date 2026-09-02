@@ -21,8 +21,10 @@ from scruffy.models import ResourceRequest
 from scruffy.protocol import ProtocolError
 from scruffy.storage import (
     append_event,
+    atomic_write_json,
     job_directory,
     list_reports,
+    load_state,
     open_journal,
     queue_id,
     read_events,
@@ -63,6 +65,163 @@ class ObserveTests(unittest.TestCase):
             response["next_cursor"],
         )
         self.assertEqual(original_identity, response["snapshot"]["queue_id"])
+
+    def test_snapshot_cursor_reads_compact_watermark_without_state_decode(self) -> None:
+        identity = queue_id(self.root)
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 7,
+                "journal_generation": 2,
+                "journal_offset": 123,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+
+        with mock.patch(
+            "scruffy.client.load_state", side_effect=AssertionError("state decoded")
+        ):
+            self.assertEqual((2, 7, 123, False), parse_cursor(self.root, None))
+
+    def test_snapshot_cursor_falls_back_for_legacy_queue_without_watermark(self) -> None:
+        identity = queue_id(self.root)
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 7,
+                "journal_generation": 0,
+                "journal_offset": 123,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+        (self.root / "cursor.json").unlink()
+
+        self.assertEqual((0, 7, 123, False), parse_cursor(self.root, None))
+
+    def test_idle_long_poll_does_not_decode_state_each_poll(self) -> None:
+        identity = queue_id(self.root)
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 0,
+                "journal_generation": 0,
+                "journal_offset": 0,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+
+        with mock.patch("scruffy.client.load_state", wraps=load_state) as load:
+            response = observe(self.root, after=None, wait_seconds=0.25)
+
+        self.assertEqual([], response["events"])
+        self.assertEqual(1, load.call_count)
+
+    def test_observe_never_returns_events_past_snapshot_seen_on_shared_filesystem(self) -> None:
+        identity = queue_id(self.root)
+        event = {"v": 1, "queue_id": identity, "seq": 1, "kind": "job.queued"}
+        with open_journal(self.root) as journal:
+            append_event(journal, event, sync=True)
+            committed_offset = journal.tell()
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 1,
+                "journal_generation": 0,
+                "journal_offset": committed_offset,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+        # Emulate a remote reader seeing the fresh marker before the older
+        # state inode. The marker is intentionally not rewritten.
+        atomic_write_json(
+            self.root / "state.json",
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 0,
+                "journal_generation": 0,
+                "journal_offset": 0,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+
+        response = observe(self.root, after=0)
+
+        self.assertEqual([], response["events"])
+        self.assertEqual(f"{identity}:0:0:0", response["next_cursor"])
+        self.assertEqual(f"{identity}:0:0:0", response["latest_cursor"])
+
+    def test_observe_catches_up_when_state_precedes_watermark(self) -> None:
+        identity = queue_id(self.root)
+        event = {"v": 1, "queue_id": identity, "seq": 1, "kind": "job.queued"}
+        with open_journal(self.root) as journal:
+            append_event(journal, event, sync=True)
+            committed_offset = journal.tell()
+        state = {
+            "v": 1,
+            "queue_id": identity,
+            "last_seq": 0,
+            "journal_generation": 0,
+            "journal_offset": 0,
+            "allocation": None,
+            "nodes": {},
+            "jobs": {},
+            "draining": False,
+        }
+        write_state(self.root, state)
+        # The state replacement is visible first; the old marker is still a
+        # valid committed watermark, so observation must extend from it.
+        state["last_seq"] = 1
+        state["journal_offset"] = committed_offset
+        atomic_write_json(self.root / "state.json", state)
+
+        response = observe(self.root, after=0)
+
+        self.assertEqual([event], response["events"])
+        self.assertEqual(f"{identity}:0:1:{committed_offset}", response["next_cursor"])
+
+    def test_corrupt_watermark_falls_back_to_state_snapshot(self) -> None:
+        identity = queue_id(self.root)
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 4,
+                "journal_generation": 0,
+                "journal_offset": 55,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
+        (self.root / "cursor.json").write_text("x" * 5000)
+
+        self.assertEqual((0, 4, 55, False), parse_cursor(self.root, None))
 
     def test_readers_have_independent_cursors_and_output_expansion(self) -> None:
         job_id = "job-observe"
@@ -396,6 +555,20 @@ class ObserveTests(unittest.TestCase):
     def test_observe_closes_append_between_size_check_and_first_read(self) -> None:
         event = {"seq": 1, "kind": "job.queued"}
         identity = queue_id(self.root)
+        write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": identity,
+                "last_seq": 1,
+                "journal_generation": 0,
+                "journal_offset": 10,
+                "allocation": None,
+                "nodes": {},
+                "jobs": {},
+                "draining": False,
+            },
+        )
         with (
             mock.patch("scruffy.client.time.monotonic", return_value=0),
             mock.patch("scruffy.client.time.sleep"),
@@ -408,7 +581,7 @@ class ObserveTests(unittest.TestCase):
             ),
             mock.patch(
                 "scruffy.client.read_event_page",
-                side_effect=[([], 0, False), ([event], 10, False)],
+                side_effect=[([], 0, False), ([event], 10, False), ([], 0, False)],
             ) as read_page,
         ):
             response = observe(self.root, after=0, wait_seconds=1)

@@ -30,6 +30,7 @@ from .storage import (
     queue_id,
     read_event_page,
     read_output,
+    read_state_cursor,
     report_acknowledged,
     submit_command,
     submit_report,
@@ -699,6 +700,9 @@ def status(
 
 
 def _snapshot_cursor(root: Path) -> tuple[str, int, int, int]:
+    compact = read_state_cursor(root)
+    if compact is not None:
+        return compact
     snapshot = load_state(root)
     if snapshot is None:
         return queue_id(root), 0, 0, 0
@@ -824,6 +828,7 @@ def observe(
     page_limit = min(limit, 64) if include_output else limit
     deadline = time.monotonic() + max(wait_seconds, 0)
     committed = committed_cursor[1:]
+    start_sequence, start_offset = sequence, offset
     page, offset, more = read_event_page(
         root,
         after=sequence,
@@ -842,6 +847,8 @@ def observe(
         if current_identity != identity:
             identity = current_identity
             generation, sequence, offset = current
+            committed = current
+            start_sequence, start_offset = sequence, offset
             page, more, reset = [], False, True
             reset_reason = "queue_replaced"
             break
@@ -849,6 +856,8 @@ def observe(
             continue
         if current[0] != generation:
             generation, sequence, offset = current
+            committed = current
+            start_sequence, start_offset = sequence, offset
             page, more, reset = [], False, True
             reset_reason = "journal_rotated"
             break
@@ -867,6 +876,66 @@ def observe(
         normalize_project_id(project_id) if project_id is not None else None
     )
     snapshot = status(root)
+    snapshot_identity = snapshot.get("queue_id")
+    if not isinstance(snapshot_identity, str) or not snapshot_identity:
+        raise StorageError("queue state has no valid identity")
+    snapshot_generation = int(snapshot.get("journal_generation", 0))
+    latest_sequence = int(snapshot.get("last_seq", 0))
+    latest_offset = int(snapshot.get("journal_offset", 0))
+    if reset:
+        identity = snapshot_identity
+        generation = snapshot_generation
+        next_sequence = latest_sequence
+        offset = latest_offset
+        page = []
+        more = False
+    elif snapshot_identity != identity or snapshot_generation != generation:
+        reset_reason = (
+            "queue_replaced"
+            if snapshot_identity != identity
+            else "journal_rotated"
+        )
+        identity = snapshot_identity
+        generation = snapshot_generation
+        next_sequence = latest_sequence
+        offset = latest_offset
+        page = []
+        more = False
+        reset = True
+    elif (latest_sequence, latest_offset) < (committed[1], committed[2]):
+        # Shared-filesystem metadata can expose the sidecar before the state
+        # inode. Never return events beyond the state image we actually read.
+        page, offset, more = read_event_page(
+            root,
+            after=start_sequence,
+            offset=start_offset,
+            limit=page_limit,
+            end_offset=latest_offset,
+            generation=generation,
+        )
+        next_sequence = max(
+            (int(item["seq"]) for item in page), default=start_sequence
+        )
+    elif (latest_sequence, latest_offset) > (committed[1], committed[2]):
+        # The state replacement may be visible before its sidecar. Extend the
+        # page from the compact marker's endpoint without replaying its prefix.
+        remaining = page_limit - len(page)
+        if remaining <= 0:
+            more = True
+        else:
+            extra, offset, extra_more = read_event_page(
+                root,
+                after=next_sequence,
+                offset=offset,
+                limit=remaining,
+                end_offset=latest_offset,
+                generation=generation,
+            )
+            page.extend(extra)
+            more = more or extra_more
+            next_sequence = max(
+                (int(item["seq"]) for item in page), default=next_sequence
+            )
     visible: list[dict[str, Any]] = []
     for original in page:
         event_project = _event_project(original, snapshot)
@@ -888,25 +957,6 @@ def observe(
         visible.append(event)
     if selected_project is not None:
         _scope_state(snapshot, selected_project)
-    snapshot_identity = snapshot.get("queue_id")
-    if not isinstance(snapshot_identity, str) or not snapshot_identity:
-        raise StorageError("queue state has no valid identity")
-    snapshot_generation = int(snapshot.get("journal_generation", 0))
-    latest_sequence = int(snapshot.get("last_seq", 0))
-    latest_offset = int(snapshot.get("journal_offset", 0))
-    if snapshot_identity != identity or snapshot_generation != generation:
-        reset_reason = (
-            "queue_replaced"
-            if snapshot_identity != identity
-            else "journal_rotated"
-        )
-        identity = snapshot_identity
-        generation = snapshot_generation
-        next_sequence = latest_sequence
-        offset = latest_offset
-        visible = []
-        more = False
-        reset = True
     cursor = f"{identity}:{generation}:{next_sequence}:{offset}"
     return {
         "snapshot": snapshot,

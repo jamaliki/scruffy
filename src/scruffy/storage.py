@@ -29,6 +29,8 @@ LAYOUT_DIRECTORIES = ("requests", "commands", "jobs", "reports", "provenance")
 LOCK_SHARDS = 64
 MAX_TAIL_BYTES = 1024 * 1024
 INVALID_REQUEST_DIGEST = "-"
+STATE_CURSOR_FILE = "cursor.json"
+MAX_STATE_CURSOR_BYTES = 4096
 
 
 class StorageError(RuntimeError):
@@ -1194,8 +1196,78 @@ def load_state(root: Path) -> dict[str, Any] | None:
     return read_json(source) if source.exists() else None
 
 
+def _state_cursor(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the small committed watermark for a valid state image."""
+
+    queue = state.get("queue_id")
+    if not isinstance(queue, str) or not queue:
+        return None
+    values = {
+        "journal_generation": state.get("journal_generation", 0),
+        "last_seq": state.get("last_seq", 0),
+        "journal_offset": state.get("journal_offset", 0),
+    }
+    if any(type(value) is not int or value < 0 for value in values.values()):
+        return None
+    return {"v": 1, "queue_id": queue, **values}
+
+
+def read_state_cursor(root: Path) -> tuple[str, int, int, int] | None:
+    """Read the compact committed watermark without decoding ``state.json``.
+
+    A missing, malformed, or unknown-version sidecar is treated as a legacy
+    queue and returns ``None`` so callers can use the authoritative snapshot
+    fallback. The controller publishes this file only after replacing the
+    corresponding state image.
+    """
+
+    source = root.expanduser().resolve() / STATE_CURSOR_FILE
+    if not source.is_file() or not (root.expanduser().resolve() / "state.json").is_file():
+        return None
+    try:
+        metadata = source.stat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_STATE_CURSOR_BYTES
+        ):
+            return None
+        document = read_json(source)
+    except (OSError, StorageError):
+        return None
+    if (
+        not isinstance(document, dict)
+        or type(document.get("v")) is not int
+        or document["v"] != 1
+    ):
+        return None
+    compact = _state_cursor(document)
+    if compact != document:
+        return None
+    return (
+        compact["queue_id"],
+        compact["journal_generation"],
+        compact["last_seq"],
+        compact["journal_offset"],
+    )
+
+
 def write_state(root: Path, state: dict[str, Any]) -> None:
-    atomic_write_json(ensure_layout(root) / "state.json", state)
+    """Atomically publish state, then its compact observer watermark.
+
+    The ordering is intentional: a crash can leave the watermark behind the
+    state, but can never make it point past an uncommitted state image.
+    """
+
+    root = ensure_layout(root)
+    atomic_write_json(root / "state.json", state)
+    cursor = _state_cursor(state)
+    cursor_file = root / STATE_CURSOR_FILE
+    if cursor is None:
+        cursor_file.unlink(missing_ok=True)
+        _fsync_directory(root)
+    else:
+        atomic_write_json(cursor_file, cursor)
 
 
 def journal_path(root: Path, generation: int = 0) -> Path:
