@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 from typing import Any
 
+from .client import _snapshot_cursor
 from .client import explain, inspect_workflow, observe, status, summary
 from .client import reprobe_gpu as request_gpu_reprobe
 from .client import submit_job as enqueue_job
@@ -303,6 +304,28 @@ async def wait_for_updates(
     deadline = loop.time() + timeout
     transient_failures = 0
 
+    def marker_is_current(value: str | None) -> bool:
+        if not isinstance(value, str):
+            return False
+        parts = value.split(":")
+        if len(parts) != 4:
+            return False
+        try:
+            committed = _snapshot_cursor(root)
+            if parts[0] != committed[0]:
+                # A completed observe() already handles queue replacement and
+                # returns reset=true.  Keep polling here for a synthetic or
+                # otherwise stale response rather than spinning forever.
+                return True
+            return committed == (
+                parts[0],
+                int(parts[1]),
+                int(parts[2]),
+                int(parts[3]),
+            )
+        except (TransientStorageError, ValueError):
+            return False
+
     while True:
         try:
             if cursor is None:
@@ -373,7 +396,16 @@ async def wait_for_updates(
             }
         if response["more"]:
             continue
-        await sleep(min(poll_seconds, remaining))
+        # The compact committed marker is authoritative for deciding whether
+        # another full snapshot is needed.  Polling it avoids decoding the
+        # potentially large state image on every idle MCP poll.  A malformed
+        # or missing marker falls back to observe(), preserving old-controller
+        # compatibility at the cost of the legacy read behavior.
+        while remaining > 0 and marker_is_current(cursor):
+            await sleep(min(poll_seconds, remaining))
+            remaining = deadline - loop.time()
+        if remaining <= 0:
+            continue
 
 
 def compact_explanation(value: dict[str, Any]) -> dict[str, Any]:

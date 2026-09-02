@@ -18,6 +18,7 @@ from scruffy.mcp_server import (
     minimal_overview,
     wait_for_updates,
 )
+from scruffy.client import observe as client_observe
 from scruffy.storage import (
     TransientStorageError,
     append_event,
@@ -421,6 +422,23 @@ class WaitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["job.running"], [item["kind"] for item in result["events"]])
         sleep.assert_awaited_once()
+
+    async def test_idle_wait_polls_marker_without_repeated_state_decodes(self) -> None:
+        _commit(self.root, [], jobs={"job-1": _job("job-1")})
+        with (
+            mock.patch("scruffy.mcp_server.observe", wraps=client_observe) as observed,
+            mock.patch("scruffy.client.load_state", wraps=load_state) as loaded,
+        ):
+            result = await wait_for_updates(
+                self.root,
+                after=f"{self.identity}:0:0:0",
+                timeout_seconds=0.05,
+                poll_seconds=0.01,
+            )
+
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(2, observed.call_count)
+        self.assertEqual(2, loaded.call_count)
 
     async def test_filtered_backlog_is_drained_page_by_page(self) -> None:
         events = [self.event(seq, "workload.progress") for seq in range(1, 66)]
