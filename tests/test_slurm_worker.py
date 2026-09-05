@@ -479,9 +479,9 @@ class SlurmReconciliationTests(unittest.TestCase):
     def test_completed_step_reads_the_exact_accounting_row(self) -> None:
         result = mock.Mock(
             stdout=(
-                "240292|RUNNING|0:0\n"
-                "240292.17|FAILED|2:0\n"
-                "240292.17.0|FAILED|2:0\n"
+                "240292|RUNNING|0:0|allocation|gpu-3\n"
+                "240292.17|FAILED|2:0|scruffy-token|gpu-3\n"
+                "240292.17.0|FAILED|2:0|worker|gpu-3\n"
             )
         )
         with mock.patch("scruffy.slurm.subprocess.run", return_value=result) as run:
@@ -490,13 +490,15 @@ class SlurmReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(step)
         self.assertEqual("FAILED", step.state)
         self.assertEqual(2, step.returncode)
+        self.assertEqual("scruffy-token", step.name)
+        self.assertEqual("gpu-3", step.nodes)
         run.assert_called_once_with(
             [
                 "sacct",
                 "--noheader",
                 "--parsable2",
                 "--jobs=240292.17",
-                "--format=JobIDRaw,State,ExitCode",
+                "--format=JobIDRaw,State,ExitCode,JobName,NodeList",
             ],
             check=True,
             capture_output=True,

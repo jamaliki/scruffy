@@ -2549,6 +2549,124 @@ class SlurmReleaseBarrierTests(unittest.TestCase):
         self.controller.slurm_snapshot_at = 12
         self.assertTrue(reconcile_slurm(self.controller, job, running))
 
+    def test_completed_short_step_recovers_from_runtime_placement(self) -> None:
+        request = ResourceRequest(1, 0, 1, 1)
+        job = job_image("job-a", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-token",
+                "request": request.to_dict(),
+                "assignment": Assignment(
+                    "job-a", request, (NodeReservation("gpu-3", (), 1, 1),)
+                ).to_dict(),
+                "runtime_placement_contract": 1,
+                "runtime_placement_files": [
+                    "jobs/job-a/runtime-placement-0.json"
+                ],
+                "stdout": "jobs/job-a/stdout.log",
+                "stderr": "jobs/job-a/stderr.log",
+            }
+        )
+        create_immutable_json(
+            self.controller.root / "jobs/job-a/runtime-placement-0.json",
+            {
+                "schema": 1,
+                "job_id": "job-a",
+                "node": "gpu-3",
+                "requested_gpus": 0,
+                "ledger_gpu_ids": [],
+                "slurm_job_id": "240292",
+                "slurm_step_id": "7",
+                "slurm_step_gpus": [],
+                "cuda_visible_devices": [],
+                "cuda_device_order": None,
+            },
+        )
+        self.controller.state["jobs"]["job-a"] = job
+        self.process.poll.return_value = 0
+        running = RunningProcess(self.process, "scruffy-token")
+        running.exit_seen_at = 9
+        running.closed_streams.update({"stdout", "stderr"})
+        self.controller.running["job-a"] = running
+        self.controller.slurm_snapshot_at = 10
+
+        with (
+            mock.patch("scruffy.lifecycle.refresh_slurm_snapshot"),
+            mock.patch(
+                "scruffy.lifecycle.completed_step",
+                return_value=SlurmStepResult(
+                    "COMPLETED", 0, "scruffy-token", "gpu-3"
+                ),
+            ),
+            mock.patch(
+                "scruffy.lifecycle.expand_slurm_hostnames",
+                return_value=("gpu-3",),
+            ),
+        ):
+            poll_processes(self.controller)
+
+        self.assertEqual("succeeded", job["state"])
+        self.assertEqual("240292.7", job["slurm_step_id"])
+        self.assertEqual("authenticated", job["runtime_placement_status"])
+        self.assertNotIn("job-a", self.controller.running)
+
+    def test_completed_short_step_rejects_wrong_accounting_identity(self) -> None:
+        job = job_image("job-a", "gpu-3")
+        job.update(
+            {
+                "launch_token": "scruffy-token",
+                "runtime_placement_contract": 1,
+                "runtime_placement_files": [
+                    "jobs/job-a/runtime-placement-0.json"
+                ],
+                "stdout": "jobs/job-a/stdout.log",
+                "stderr": "jobs/job-a/stderr.log",
+            }
+        )
+        create_immutable_json(
+            self.controller.root / "jobs/job-a/runtime-placement-0.json",
+            {
+                "schema": 1,
+                "job_id": "job-a",
+                "node": "gpu-3",
+                "requested_gpus": 1,
+                "ledger_gpu_ids": [0],
+                "slurm_job_id": "240292",
+                "slurm_step_id": "7",
+                "slurm_step_gpus": ["5"],
+                "cuda_visible_devices": ["0"],
+                "cuda_device_order": None,
+            },
+        )
+        self.controller.state["jobs"]["job-a"] = job
+        self.process.poll.return_value = 0
+        running = RunningProcess(self.process, "scruffy-token")
+        running.exit_seen_at = 9
+        running.closed_streams.update({"stdout", "stderr"})
+        self.controller.running["job-a"] = running
+        self.controller.slurm_snapshot_at = 10
+
+        with (
+            mock.patch("scruffy.lifecycle.refresh_slurm_snapshot"),
+            mock.patch(
+                "scruffy.lifecycle.completed_step",
+                return_value=SlurmStepResult(
+                    "COMPLETED", 0, "different-token", "gpu-3"
+                ),
+            ),
+            mock.patch(
+                "scruffy.lifecycle.expand_slurm_hostnames",
+                return_value=("gpu-3",),
+            ),
+        ):
+            poll_processes(self.controller)
+            self.controller.slurm_snapshot_at = 11
+            poll_processes(self.controller)
+
+        self.assertEqual("failed", job["state"])
+        self.assertEqual("runtime_placement_invalid", job["reason"])
+        self.assertNotIn("slurm_step_id", job)
+
     def test_cancellation_targets_exact_step_and_keeps_assignment(self) -> None:
         reserved = assignment("job-a", "gpu-3").to_dict()
         job = {

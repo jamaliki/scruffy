@@ -33,6 +33,7 @@ from .slurm import (
     build_srun_argv,
     build_srun_environment,
     completed_step,
+    expand_slurm_hostnames,
     new_step_name,
 )
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
@@ -174,6 +175,99 @@ def _runtime_placement_authority(
             )
         )
     return result
+
+
+def _runtime_placement_candidate_step(
+    controller: Controller, job: dict[str, Any]
+) -> str:
+    """Read a worker-authored step ID while retaining placement validation."""
+
+    assignment = Assignment.from_dict(job["assignment"])
+    relative_files = job.get("runtime_placement_files")
+    if isinstance(relative_files, (str, bytes)) or not isinstance(
+        relative_files, Sequence
+    ):
+        raise TypeError("runtime placement file registry is missing")
+    if len(relative_files) != len(assignment.reservations):
+        raise ValueError("runtime placement file registry has the wrong size")
+    outer_job_id = controller.slurm_job_id or ""
+    if not outer_job_id:
+        raise ValueError("runtime placement has no outer Slurm job")
+    candidate = None
+    for index, reservation in enumerate(assignment.reservations):
+        relative = f"jobs/{job['id']}/runtime-placement-{index}.json"
+        if relative_files[index] != relative:
+            raise ValueError("runtime placement file registry path differs")
+        document, digest = read_immutable_json(controller.root / relative)
+        if not isinstance(document, Mapping):
+            raise TypeError("runtime placement record is not an object")
+        record_step = document.get("slurm_step_id")
+        if not isinstance(record_step, str) or not record_step:
+            raise ValueError("runtime placement record has no Slurm step")
+        full_step_id = (
+            record_step
+            if record_step.startswith(f"{outer_job_id}.")
+            else f"{outer_job_id}.{record_step}"
+        )
+        _placement_entry(
+            document,
+            digest=digest,
+            relative=relative,
+            job_id=job["id"],
+            reservation=reservation,
+            requested=assignment.request.gpus_per_node,
+            outer_job_id=outer_job_id,
+            live_step_id=full_step_id,
+            exact_gpu_binding=job.get("gpu_binding") == "exact",
+        )
+        if candidate is not None and candidate != full_step_id:
+            raise ValueError("runtime placement records disagree on the Slurm step")
+        candidate = full_step_id
+    if candidate is None:
+        raise ValueError("runtime placement has no worker records")
+    return candidate
+
+
+def _recover_completed_placement_step(
+    controller: Controller, job: dict[str, Any], returncode: int
+) -> bool:
+    """Recover a too-short step from placement plus completed Slurm authority.
+
+    Return true while a valid candidate is still settling in Slurm accounting.
+    Invalid or absent placement evidence falls through to the normal fail-closed
+    terminal path.
+    """
+
+    if job.get("runtime_placement_contract") != RUNTIME_PLACEMENT_CONTRACT:
+        return False
+    try:
+        candidate = _runtime_placement_candidate_step(controller, job)
+    except (KeyError, OSError, StorageError, TypeError, ValueError):
+        return False
+    try:
+        result = completed_step(candidate)
+        if result is None:
+            return True
+        actual_nodes = expand_slurm_hostnames(result.nodes or "")
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        job["reconciliation_error"] = str(exc)
+        return True
+    assignment = Assignment.from_dict(job["assignment"])
+    expected_nodes = tuple(sorted(item.node for item in assignment.reservations))
+    if (
+        result.name != job.get("launch_token")
+        or tuple(sorted(actual_nodes)) != expected_nodes
+        or result.returncode != returncode
+    ):
+        job["reconciliation_error"] = (
+            "completed Slurm step differs from runtime placement"
+        )
+        return False
+    job["slurm_step_id"] = candidate
+    job["slurm_state"] = result.state
+    job.pop("reconciliation_error", None)
+    emit(controller, "job.step_attached", job=job)
+    return False
 
 
 def _fail_unlaunched(
@@ -749,6 +843,12 @@ def poll_processes(controller: Controller) -> None:
 
         slurm_absent = True
         if controller.launcher == "slurm":
+            if (
+                returncode is not None
+                and not job.get("slurm_step_id")
+                and _recover_completed_placement_step(controller, job, returncode)
+            ):
+                continue
             slurm_absent = reconcile_slurm(controller, job, running)
             if slurm_absent and running.process is None and returncode is None:
                 returncode = _recovered_returncode(controller, job, running)
