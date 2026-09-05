@@ -67,6 +67,8 @@ class SlurmStep:
 class SlurmStepResult:
     state: str
     returncode: int
+    name: str | None = None
+    nodes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,10 +262,11 @@ def _managed_capacity(discovered: int, cap: int | None, option: str) -> int:
     return cap
 
 
-def _allocation_hostnames(job: Mapping[str, Any]) -> list[str]:
-    node_expression = job.get("nodes")
+def expand_slurm_hostnames(node_expression: str) -> tuple[str, ...]:
+    """Expand one Slurm hostlist expression without accepting empty output."""
+
     if not isinstance(node_expression, str) or not node_expression:
-        raise ValueError("Slurm allocation has no assigned nodes")
+        raise ValueError("Slurm node list is empty")
     result = subprocess.run(
         ["scontrol", "show", "hostnames", node_expression],
         check=True,
@@ -273,8 +276,17 @@ def _allocation_hostnames(job: Mapping[str, Any]) -> list[str]:
     )
     names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if not names:
-        raise ValueError("Slurm returned no nodes for the current allocation")
-    return names
+        raise ValueError("Slurm returned no nodes for the hostlist")
+    if len(set(names)) != len(names):
+        raise ValueError("Slurm returned duplicate hostnames")
+    return tuple(names)
+
+
+def _allocation_hostnames(job: Mapping[str, Any]) -> list[str]:
+    node_expression = job.get("nodes")
+    if not isinstance(node_expression, str) or not node_expression:
+        raise ValueError("Slurm allocation has no assigned nodes")
+    return list(expand_slurm_hostnames(node_expression))
 
 
 def _allocation_capacity(job: Mapping[str, Any], nodes: int) -> tuple[int, int, int]:
@@ -593,7 +605,7 @@ def live_steps(slurm_job_id: str) -> tuple[SlurmStep, ...]:
 
 
 def completed_step(step_id: str) -> SlurmStepResult | None:
-    """Return one completed step's exit status, or ``None`` while it settles."""
+    """Return one completed step's accounting identity, or ``None`` while it settles."""
 
     result = subprocess.run(
         [
@@ -601,7 +613,7 @@ def completed_step(step_id: str) -> SlurmStepResult | None:
             "--noheader",
             "--parsable2",
             f"--jobs={step_id}",
-            "--format=JobIDRaw,State,ExitCode",
+            "--format=JobIDRaw,State,ExitCode,JobName,NodeList",
         ],
         check=True,
         capture_output=True,
@@ -612,8 +624,11 @@ def completed_step(step_id: str) -> SlurmStepResult | None:
         job_id, separator, remainder = line.partition("|")
         if not separator or job_id != step_id:
             continue
-        state, separator, encoded_exit = remainder.partition("|")
-        if not separator or state.split(maxsplit=1)[0] in {
+        fields = remainder.split("|")
+        if len(fields) != 4:
+            raise RuntimeError("sacct returned an invalid completed step record")
+        state, encoded_exit, name, nodes = fields
+        if state.split(maxsplit=1)[0] in {
             "PENDING",
             "RUNNING",
             "COMPLETING",
@@ -633,6 +648,8 @@ def completed_step(step_id: str) -> SlurmStepResult | None:
         return SlurmStepResult(
             state=state,
             returncode=-signal_value if signal_value else int(code),
+            name=name,
+            nodes=nodes,
         )
     return None
 
