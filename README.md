@@ -669,6 +669,35 @@ sync and one cumulative snapshot. Report `event_id` receipts follow journal
 retention: the active and immediately previous generations are retained, so
 this key is for recent retry safety rather than permanent exactly-once delivery.
 
+### Strict checkpoint acknowledgements
+
+Koochak can make a numbered checkpoint publication strict by calling
+`publish_event(..., wait=True, timeout=SECONDS)`. Scruffy accepts the report at
+most once by its stable `event_id`. If the initial receipt wait expires, the
+client first checks the receipt and then performs one bounded, read-only
+reconciliation against the durable journal/job evidence; it never republishes
+the report with a new timestamp. An accepted identity that conflicts with the
+published report is a hard conflict, and an explicit rejection is not treated
+as success.
+
+For a valid strict checkpoint, the controller processes it ahead of ordinary
+telemetry already selected for the bounded report batch, synchronously appends
+the artifact event and any dependent-condition journal images, and then
+publishes the small idempotent receipt. A large cumulative state snapshot is
+not on this acknowledgement path; ordinary telemetry retains its existing
+group-commit behavior. `summary` exposes bounded `report_observability`
+metrics, including accepted/rejected totals, strict-artifact acknowledgement
+latency samples, and a backlog lower-bound/saturation watermark.
+
+If reconciliation reaches its deadline, the client returns
+`state=retryable_timeout`. The Koochak adapter exits with reserved code `76`,
+which Scruffy records as `reason=checkpoint_ack_timeout` rather than
+`application_exit`. A workflow task opts into capped recovery by including
+that reason in `recovery.retry_on`; its successor preserves the exact command
+and uses `--resume auto`, so the just-written numbered checkpoint is selected.
+An explicit artifact rejection uses reserved code `77` and is never retried as
+checkpoint recovery.
+
 Raw output is stored once in per-job files. Journal events contain ordered byte
 ranges; `observe --output` expands those references into text. For direct
 diagnosis:

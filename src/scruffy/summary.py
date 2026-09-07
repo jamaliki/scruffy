@@ -547,6 +547,7 @@ def build_summary(
         "draining": bool(state.get("draining", False)),
         "launches_paused": bool(state.get("launches_paused", False)),
         "gpu_health": copy.deepcopy(state.get("gpu_health")),
+        "report_observability": copy.deepcopy(state.get("report_observability", {})),
         "counts": dict(sorted(counts.items())),
         "scheduler": scheduler_explanation({**state, "jobs": {job["id"]: job for job in jobs}}),
         "archived_jobs": sum(int(count) for count in archived_counts.values()),

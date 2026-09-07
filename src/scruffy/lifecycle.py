@@ -47,6 +47,10 @@ from .storage import (
 
 MAX_MESSAGES_PER_TICK = 256
 RUNTIME_PLACEMENT_CONTRACT = 1
+CHECKPOINT_ACK_TIMEOUT_EXIT_CODE = 76
+CHECKPOINT_ACK_TIMEOUT_REASON = "checkpoint_ack_timeout"
+CHECKPOINT_ARTIFACT_REJECTED_EXIT_CODE = 77
+CHECKPOINT_ARTIFACT_REJECTED_REASON = "checkpoint_artifact_rejected"
 
 _RUNTIME_PLACEMENT_KEYS = {
     "schema",
@@ -76,6 +80,26 @@ def _string_list(value: object, label: str, expected: int) -> list[str]:
     ):
         raise ValueError(f"{label} does not match the requested GPU count")
     return result
+
+
+def _mark_retry_exhaustion(job: dict[str, Any], reason: str) -> None:
+    """Record that a retryable checkpoint failure reached its policy cap."""
+
+    policy = job.get("recovery")
+    attempt = job.get("attempt") if type(job.get("attempt")) is int else 1
+    if not isinstance(policy, dict):
+        return
+    max_attempts = policy.get("max_attempts")
+    retry_on = policy.get("retry_on")
+    if (
+        type(max_attempts) is int
+        and attempt >= max_attempts
+        and isinstance(retry_on, list)
+        and reason in retry_on
+    ):
+        job["retry_exhausted"] = True
+        job["retry_exhausted_reason"] = reason
+        job["retry_exhausted_at"] = job.get("finished_at")
 
 
 def _placement_entry(
@@ -635,6 +659,10 @@ def _finish_job(
         reason = running.final_reason or state
     elif returncode == 0:
         state, reason = "succeeded", "process_exit"
+    elif returncode == CHECKPOINT_ACK_TIMEOUT_EXIT_CODE:
+        state, reason = "failed", CHECKPOINT_ACK_TIMEOUT_REASON
+    elif returncode == CHECKPOINT_ARTIFACT_REJECTED_EXIT_CODE:
+        state, reason = "failed", CHECKPOINT_ARTIFACT_REJECTED_REASON
     else:
         state = "failed"
         slurm_parts = str(job.get("slurm_state") or "").split(maxsplit=1)
@@ -694,6 +722,7 @@ def _finish_job(
         job["runtime_placement_error"] = placement_error
     if placement_status is not None:
         job["runtime_placement_status"] = placement_status
+    _mark_retry_exhaustion(job, reason)
     job.pop("pid", None)
     job.pop("pending_returncode", None)
     for stream_name in ("stdout", "stderr"):

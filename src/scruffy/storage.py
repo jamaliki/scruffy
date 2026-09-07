@@ -874,6 +874,85 @@ def report_acknowledged(
     return _report_receipt_identity(report_root, job_id, event_digest)
 
 
+def report_durable_evidence(
+    root: Path, job_id: str, event_id: str
+) -> dict[str, Any] | None:
+    """Find one report outcome in the durable journal without changing it.
+
+    A receipt is the normal fast path.  This bounded fallback is used only
+    after a producer has waited for that receipt and is deliberately
+    read-only: it finds the controller's already-fsynced report event or
+    rejection notice by its deterministic report identity.  The active
+    generation and its one retained predecessor are enough because older
+    generations have their receipts retained independently.
+    """
+
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("job_id must be a non-empty string")
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("event_id must be a non-empty string")
+
+    report_name = f"{hashlib.sha256(event_id.encode()).hexdigest()}.json"
+    report_id = f"{job_id}/{report_name}"
+    generations: set[int] = {0}
+    state = load_state(root)
+    if isinstance(state, dict) and type(state.get("journal_generation")) is int:
+        generations.add(state["journal_generation"])
+    active = latest_checkpoint(root)
+    if active is not None:
+        active_generation = active[0]
+        generations.add(active_generation)
+        if active_generation > 0:
+            generations.add(active_generation - 1)
+    state_generation = state.get("journal_generation") if isinstance(state, dict) else None
+    if type(state_generation) is int and state_generation > 0:
+        generations.add(state_generation - 1)
+
+    for generation in sorted(generations, reverse=True):
+        source = journal_path(root, generation)
+        if not source.exists():
+            continue
+        with source.open("rb") as handle:
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, dict) or event.get("report_id") != report_id:
+                    continue
+                if (
+                    event.get("source_event_id") == event_id
+                    and event.get("job_id") == job_id
+                ):
+                    digest = event.get("report_digest")
+                    return {
+                        "state": "accepted",
+                        "acknowledged": True,
+                        "identity_sha256": digest if isinstance(digest, str) else None,
+                        "evidence": "journal",
+                        "journal_event_id": event.get("event_id"),
+                        "durable_job": isinstance(event.get("job"), dict),
+                    }
+                data = event.get("data")
+                if (
+                    event.get("kind") == "notice"
+                    and isinstance(data, dict)
+                    and data.get("kind") == "workload.report_rejected"
+                ):
+                    digest = event.get("report_digest")
+                    return {
+                        "state": "rejected",
+                        "acknowledged": True,
+                        "identity_sha256": digest if isinstance(digest, str) else None,
+                        "evidence": "journal",
+                        "journal_event_id": event.get("event_id"),
+                        "reason": data.get("reason"),
+                    }
+    return None
+
+
 def submit_report(root: Path, report: dict[str, Any]) -> tuple[str, bool]:
     """Spool an event; its ID deduplicates across retained generations."""
 

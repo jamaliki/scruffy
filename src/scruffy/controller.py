@@ -29,6 +29,7 @@ from .health import (
 )
 from .health_worker import health_worker_release_sha256 as _health_worker_release_sha256
 from .lifecycle import (
+    CHECKPOINT_ACK_TIMEOUT_REASON,
     begin_shutdown,
     drain_messages,
     poll_processes,
@@ -597,6 +598,7 @@ def _recovery_candidate(
     policy = _recovery_policy(predecessor)
     if (
         predecessor.get("state") not in {"lost", "failed"}
+        or predecessor.get("reason") != reason
         or not isinstance(workflow_id, str)
         or not isinstance(task_id, str)
         or policy is None
@@ -1751,6 +1753,8 @@ def _satisfy_artifact_waiters(
     producer: dict[str, Any],
     event: dict[str, Any],
     queue_event_id: str,
+    *,
+    durable: bool = False,
 ) -> None:
     """Apply one typed publication only to explicitly waiting workflow jobs."""
 
@@ -1789,7 +1793,7 @@ def _satisfy_artifact_waiters(
                 "condition.satisfied",
                 job=job,
                 data=evidence,
-                durable=False,
+                durable=durable,
                 snapshot=False,
             )
 
@@ -2715,16 +2719,117 @@ def _reject_report(
         snapshot=False,
     )
     controller.state.setdefault("report_acks", {})[report_id] = digest
+    _record_report_outcome(controller, accepted=False, artifact=False)
+
+
+_REPORT_LATENCY_SAMPLE_LIMIT = 128
+
+
+def _report_metrics(controller: Controller) -> dict[str, Any]:
+    """Return the bounded report acknowledgement metrics projection."""
+
+    metrics = controller.state.get("report_observability")
+    if not isinstance(metrics, dict):
+        metrics = {}
+        controller.state["report_observability"] = metrics
+    metrics.setdefault("schema", 1)
+    for key in ("processed_total", "accepted_total", "rejected_total", "artifact_total"):
+        if type(metrics.get(key)) is not int or metrics[key] < 0:
+            metrics[key] = 0
+    samples = metrics.get("artifact_ack_latency_samples_ms")
+    if not isinstance(samples, list):
+        samples = []
+    metrics["artifact_ack_latency_samples_ms"] = samples[-_REPORT_LATENCY_SAMPLE_LIMIT:]
+    metrics.setdefault(
+        "artifact_ack_latency_ms",
+        {"count": 0, "last": None, "p50": None, "p90": None},
+    )
+    return metrics
+
+
+def _record_report_outcome(
+    controller: Controller,
+    *,
+    accepted: bool,
+    artifact: bool,
+    latency_ms: float | None = None,
+) -> None:
+    """Record bounded report/strict-artifact acknowledgement telemetry."""
+
+    metrics = _report_metrics(controller)
+    metrics["processed_total"] += 1
+    total_key = "accepted_total" if accepted else "rejected_total"
+    metrics[total_key] += 1
+    if not artifact:
+        metrics["updated_at"] = utc_now()
+        return
+    metrics["artifact_total"] += 1
+    if latency_ms is None:
+        metrics["updated_at"] = utc_now()
+        return
+    latency = max(0.0, float(latency_ms))
+    samples = metrics["artifact_ack_latency_samples_ms"]
+    samples.append(latency)
+    del samples[:-_REPORT_LATENCY_SAMPLE_LIMIT]
+    ordered = sorted(samples)
+
+    def percentile(fraction: float) -> float:
+        index = min(len(ordered) - 1, int(round((len(ordered) - 1) * fraction)))
+        return ordered[index]
+
+    metrics["artifact_ack_latency_ms"] = {
+        "count": len(ordered),
+        "last": latency,
+        "p50": percentile(0.50),
+        "p90": percentile(0.90),
+    }
+    metrics["updated_at"] = utc_now()
+
+
+def _record_report_batch(
+    controller: Controller, *, batch_size: int, limit: int
+) -> None:
+    """Expose a lower-bound backlog watermark without a directory rescan."""
+
+    metrics = _report_metrics(controller)
+    metrics.update(
+        {
+            "batch_size": batch_size,
+            "batch_limit": limit,
+            "backlog_lower_bound": controller.report_backlog_lower_bound,
+            "backlog_saturated": controller.report_backlog_saturated,
+            "updated_at": utc_now(),
+        }
+    )
+
+
+def _strict_artifact_document(document: object) -> bool:
+    """Return whether a decoded report is a valid strict artifact candidate."""
+
+    if not isinstance(document, dict) or document.get("kind") != "workload.artifact":
+        return False
+    try:
+        return artifact_publication(document.get("data")) is not None
+    except (TypeError, ValueError):
+        return False
 
 
 def _report_batch(controller: Controller, limit: int) -> list[tuple[Path, object | None]]:
     """Round-robin pending reports so one noisy job cannot starve another."""
 
     if limit <= 0:
+        controller.report_batch_size = 0
+        controller.report_batch_limit = limit
+        controller.report_backlog_lower_bound = 0
+        controller.report_backlog_saturated = False
         return []
     streams = report_streams(controller.root)
     job_ids = [job_id for job_id, _ in streams]
     if not streams:
+        controller.report_batch_size = 0
+        controller.report_batch_limit = limit
+        controller.report_backlog_lower_bound = 0
+        controller.report_backlog_saturated = False
         return []
     if controller.report_cursor in job_ids:
         pivot = job_ids.index(controller.report_cursor) + 1
@@ -2756,37 +2861,52 @@ def _report_batch(controller: Controller, limit: int) -> list[tuple[Path, object
                 close()
     if batch:
         controller.report_cursor = batch[-1][0].parent.name
+    controller.report_batch_size = len(batch)
+    controller.report_batch_limit = limit
+    controller.report_backlog_lower_bound = len(batch)
+    controller.report_backlog_saturated = len(batch) == limit
     return batch
 
 
 def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -> None:
-    """Validate and commit one bounded report batch with one state rewrite."""
+    """Validate one bounded report batch with a fast durable artifact path."""
 
-    acknowledged: list[tuple[Path, str | None]] = []
+    batch = _report_batch(controller, limit)
+    _record_report_batch(controller, batch_size=len(batch), limit=limit)
+    # A strict publication is the producer's checkpoint barrier. Process those
+    # reports before ordinary telemetry already selected for this tick.
+    batch.sort(key=lambda item: 0 if _strict_artifact_document(item[1]) else 1)
+
+    strict_acknowledged: list[tuple[Path, str | None]] = []
+    ordinary_acknowledged: list[tuple[Path, str | None]] = []
+    strict_started_at: dict[str, float] = {}
     new_report_ids: list[str] = []
-    for source, document in _report_batch(controller, limit):
+    for source, document in batch:
+        report_started = time.monotonic()
         try:
             retained, retained_digest = report_was_accepted(controller.root, source)
         except (OSError, StorageError) as exc:
             _storage_notice(controller, "read_report_receipt", _report_id(source), exc)
             continue
         if retained:
-            acknowledged.append((source, retained_digest))
+            ordinary_acknowledged.append((source, retained_digest))
+            _record_report_outcome(controller, accepted=True, artifact=False)
             continue
         if document is None:
             _reject_report(controller, source, "unreadable_report")
-            acknowledged.append((source, None))
+            ordinary_acknowledged.append((source, None))
             new_report_ids.append(_report_id(source))
             continue
         try:
             event = validate_event(document)
         except (TypeError, ValueError) as exc:
             _reject_report(controller, source, str(exc))
-            acknowledged.append((source, None))
+            ordinary_acknowledged.append((source, None))
             new_report_ids.append(_report_id(source))
             continue
         job_id = event["job_id"]
         digest = report_identity_digest(event)
+        strict_artifact = _strict_artifact_document(event)
         if source.parent.name != job_id:
             _reject_report(
                 controller,
@@ -2794,7 +2914,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                 "job_id does not match report directory",
                 digest=digest,
             )
-            acknowledged.append((source, digest))
+            ordinary_acknowledged.append((source, digest))
             new_report_ids.append(_report_id(source))
             continue
         job = controller.state["jobs"].get(job_id)
@@ -2823,7 +2943,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                         "archived jobs accept strict artifact publications only",
                         digest=digest,
                     )
-                    acknowledged.append((source, digest))
+                    ordinary_acknowledged.append((source, digest))
                     new_report_ids.append(_report_id(source))
                     continue
                 job = copy.deepcopy(archived_job)
@@ -2834,7 +2954,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                     f"unknown job {job_id}",
                     digest=digest,
                 )
-                acknowledged.append((source, digest))
+                ordinary_acknowledged.append((source, digest))
                 new_report_ids.append(_report_id(source))
                 continue
         if event["kind"] == "workload.artifact":
@@ -2844,12 +2964,12 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                     _check_artifact_condition_conflict(job, publication)
                 except StorageError as exc:
                     _reject_report(controller, source, str(exc), digest=digest)
-                    acknowledged.append((source, digest))
+                    ordinary_acknowledged.append((source, digest))
                     new_report_ids.append(_report_id(source))
                     continue
         if not _report_capability_valid(job, event):
             _reject_report(controller, source, "invalid launch capability", digest=digest)
-            acknowledged.append((source, digest))
+            ordinary_acknowledged.append((source, digest))
             new_report_ids.append(_report_id(source))
             continue
         if archived_job is not None:
@@ -2859,9 +2979,20 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
             )
             _record_evacuation_checkpoint(controller, job, event, publication)
             archive_terminal_job(controller.root, job)
+        event_job = None
+        if archived_job is None and strict_artifact:
+            # Include the updated artifact evidence in the durable journal
+            # image. The current in-memory projection is intentionally updated
+            # before the image is copied; the journal fsync below is the small
+            # dependency-safe write that precedes the receipt.
+            apply_workload_event(job, event, recorded_at=utc_now())
+            _retain_exact_artifact_evidence(controller, job, event, publication)
+            _record_evacuation_checkpoint(controller, job, event, publication)
+            event_job = job
         journal_event = emit(
             controller,
             event["kind"],
+            job=event_job,
             job_id=job_id,
             data=event["data"],
             occurred_at=event["occurred_at"],
@@ -2869,10 +3000,10 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
             source=event["source"],
             report_id=_report_id(source),
             report_digest=digest,
-            durable=False,
+            durable=strict_artifact,
             snapshot=False,
         )
-        if archived_job is None:
+        if archived_job is None and not strict_artifact:
             apply_workload_event(job, event, recorded_at=journal_event["recorded_at"])
             if event["kind"] == "workload.artifact":
                 publication = artifact_publication(event["data"])
@@ -2887,25 +3018,57 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                 job,
                 event,
                 journal_event["event_id"],
+                durable=strict_artifact,
             )
         controller.state.setdefault("report_acks", {})[_report_id(source)] = digest
-        acknowledged.append((source, digest))
+        if strict_artifact:
+            strict_acknowledged.append((source, digest))
+            strict_started_at[_report_id(source)] = report_started
+        else:
+            ordinary_acknowledged.append((source, digest))
         new_report_ids.append(_report_id(source))
+        if not strict_artifact:
+            _record_report_outcome(
+                controller,
+                accepted=True,
+                artifact=publication is not None,
+                latency_ms=(time.monotonic() - report_started) * 1000,
+            )
 
-    if not acknowledged:
+    if not strict_acknowledged and not ordinary_acknowledged:
         return
     # An armed trigger is activated, and its first signal is decided, before
     # the immutable report receipt becomes visible to the producer.
     _activate_armed_evacuation(controller)
     _advance_evacuation(controller)
-    if new_report_ids:
-        # The inbox is acknowledged only after both the ordered events and
-        # their cumulative workload projection are durable.
+    generation = int(controller.state.get("journal_generation", 0))
+    strict_report_ids = {_report_id(source) for source, _ in strict_acknowledged}
+    ordinary_new_report_ids = [
+        report_id for report_id in new_report_ids if report_id not in strict_report_ids
+    ]
+    if strict_acknowledged:
+        # The strict path has already fsynced the complete producer image and
+        # now publishes only the tiny idempotent receipt. A large state image
+        # is deliberately not on the checkpoint acknowledgement critical path.
+        accept_reports(strict_acknowledged, generation=generation)
+        for source, _ in strict_acknowledged:
+            started_at = strict_started_at.get(_report_id(source))
+            _record_report_outcome(
+                controller,
+                accepted=True,
+                artifact=True,
+                latency_ms=(
+                    (time.monotonic() - started_at) * 1000
+                    if started_at is not None
+                    else None
+                ),
+            )
+    if ordinary_new_report_ids:
+        # Ordinary telemetry retains the group commit and cumulative snapshot
+        # durability contract.
         commit_snapshot(controller)
-    accept_reports(
-        acknowledged,
-        generation=int(controller.state.get("journal_generation", 0)),
-    )
+    if ordinary_acknowledged:
+        accept_reports(ordinary_acknowledged, generation=generation)
     report_acks = controller.state.setdefault("report_acks", {})
     for report_id in new_report_ids:
         report_acks.pop(report_id, None)
@@ -3266,6 +3429,11 @@ def _serve(controller: Controller) -> None:
             _advance_evacuation(controller)
             drain_messages(controller)
             poll_processes(controller)
+            if not controller.stopping:
+                # This is the only ordinary-failure recovery admitted
+                # automatically. The candidate function checks both the
+                # terminal reason and the task's explicit retry policy.
+                _recover_lost_workflow_jobs(controller, CHECKPOINT_ACK_TIMEOUT_REASON)
             _maintain_health_monitor(controller)
             _ingest_gpu_health(controller)
             _ingest_reports(controller)

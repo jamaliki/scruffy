@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import time
 import uuid
@@ -21,6 +22,7 @@ from .models import (
 )
 from .protocol import validate_event
 from .storage import (
+    ReportConflict,
     StorageError,
     create_job_id,
     find_archived_job,
@@ -32,6 +34,8 @@ from .storage import (
     read_output,
     read_state_cursor,
     report_acknowledged,
+    report_durable_evidence,
+    report_identity_digest,
     submit_command,
     submit_report,
     submit_request,
@@ -45,6 +49,37 @@ from .workflows import (
     validate_recovery_policy,
     validate_workflows,
 )
+
+DEFAULT_EVENT_ACK_RECONCILIATION_SECONDS = 300.0
+
+
+def _ack_identity_or_conflict(
+    identity: str | None,
+    expected_identity_sha256: str | None,
+    *,
+    rejected: bool = False,
+) -> None:
+    if rejected or expected_identity_sha256 is None:
+        return
+    if identity != expected_identity_sha256:
+        raise ReportConflict("event acknowledgement identity differs from the published report")
+
+
+def _ack_response(
+    *,
+    state: str,
+    acknowledged: bool,
+    identity: str | None,
+    evidence: str | None = None,
+    **details: Any,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "acknowledged": acknowledged,
+        "identity_sha256": identity,
+        **({"evidence": evidence} if evidence is not None else {}),
+        **details,
+    }
 
 
 def _workflow_fields(
@@ -196,6 +231,7 @@ def publish_event(
     source: dict[str, str] | None = None,
     wait: bool = False,
     timeout: float | None = None,
+    reconciliation_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Spool an event; ``event_id`` deduplicates across retained generations."""
 
@@ -225,15 +261,42 @@ def publish_event(
     }
     if not wait:
         return result
-    acknowledged, identity = wait_for_event_ack(
-        root, job_id=document["job_id"], event_id=published_id, timeout=timeout
-    )
-    return {
-        **result,
-        "state": "accepted" if identity is not None else "rejected",
-        "acknowledged": acknowledged,
-        "identity_sha256": identity,
-    }
+    expected_identity = report_identity_digest(document)
+    try:
+        acknowledged, identity = wait_for_event_ack(
+            root, job_id=document["job_id"], event_id=published_id, timeout=timeout
+        )
+        _ack_identity_or_conflict(
+            identity,
+            expected_identity,
+            rejected=identity is None,
+        )
+        return {
+            **result,
+            "state": "accepted" if identity is not None else "rejected",
+            "acknowledged": acknowledged,
+            "identity_sha256": identity,
+            "evidence": "receipt",
+        }
+    except TimeoutError:
+        reconciled = reconcile_event_ack(
+            root,
+            job_id=document["job_id"],
+            event_id=published_id,
+            expected_identity_sha256=expected_identity,
+            timeout=(
+                DEFAULT_EVENT_ACK_RECONCILIATION_SECONDS
+                if reconciliation_timeout is None
+                else reconciliation_timeout
+            ),
+        )
+        reconciled_identity = reconciled.get("identity_sha256")
+        _ack_identity_or_conflict(
+            reconciled_identity if isinstance(reconciled_identity, str) else None,
+            expected_identity,
+            rejected=reconciled.get("state") == "rejected",
+        )
+        return {**result, **reconciled}
 
 
 def wait_for_event_ack(
@@ -259,6 +322,85 @@ def wait_for_event_ack(
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for event acknowledgement {event_id}")
         time.sleep(0.05)
+
+
+def reconcile_event_ack(
+    root: Path,
+    *,
+    job_id: str,
+    event_id: str,
+    expected_identity_sha256: str | None = None,
+    timeout: float = DEFAULT_EVENT_ACK_RECONCILIATION_SECONDS,
+) -> dict[str, Any]:
+    """Reconcile one timed-out report without republishing it.
+
+    The journal lookup happens at most once.  Subsequent checks are cheap
+    receipt reads, which prevents an overloaded telemetry journal from
+    turning acknowledgement recovery into repeated large-file I/O.
+    """
+
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("job_id must be a non-empty string")
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("event_id must be a non-empty string")
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+        raise ValueError("timeout must be a finite non-negative number")
+    timeout = float(timeout)
+    if timeout < 0 or not math.isfinite(timeout):
+        raise ValueError("timeout must be a finite non-negative number")
+
+    deadline = time.monotonic() + timeout
+    journal_checked = False
+    delay = 0.05
+    reconciliation_error: str | None = None
+    while True:
+        accepted, identity = report_acknowledged(root, job_id, event_id)
+        if accepted:
+            _ack_identity_or_conflict(
+                identity,
+                expected_identity_sha256,
+                rejected=identity is None,
+            )
+            return _ack_response(
+                state="accepted" if identity is not None else "rejected",
+                acknowledged=True,
+                identity=identity,
+                evidence="receipt",
+            )
+
+        if not journal_checked:
+            journal_checked = True
+            try:
+                evidence = report_durable_evidence(root, job_id, event_id)
+            except (OSError, StorageError) as exc:
+                reconciliation_error = f"{type(exc).__name__}: {exc}"
+            else:
+                if evidence is not None:
+                    identity = evidence.get("identity_sha256")
+                    if not isinstance(identity, str):
+                        identity = None
+                    _ack_identity_or_conflict(
+                        identity,
+                        expected_identity_sha256,
+                        rejected=evidence.get("state") == "rejected",
+                    )
+                    return evidence
+
+        now = time.monotonic()
+        if now >= deadline:
+            return _ack_response(
+                state="retryable_timeout",
+                acknowledged=False,
+                identity=None,
+                reason="checkpoint_ack_timeout",
+                **(
+                    {"reconciliation_error": reconciliation_error}
+                    if reconciliation_error is not None
+                    else {}
+                ),
+            )
+        time.sleep(min(delay, deadline - now))
+        delay = min(delay * 2, 1.0)
 
 
 def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
@@ -652,6 +794,7 @@ def status(
             "jobs": {},
             "report_acks": {},
             "report_ack_v": 1,
+            "report_observability": {},
             "next_queue_order": 0,
             "archived_jobs": 0,
             "archived_counts": {},

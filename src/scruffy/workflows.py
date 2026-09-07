@@ -20,7 +20,12 @@ ArtifactCondition = tuple[str, str]
 
 DEPENDENCY_CONDITIONS = frozenset({"succeeded", "terminal"})
 RECOVERY_REASONS = frozenset(
-    {"allocation_replaced", "allocation_incarnation_changed", "evacuated"}
+    {
+        "allocation_replaced",
+        "allocation_incarnation_changed",
+        "evacuated",
+        "checkpoint_ack_timeout",
+    }
 )
 AUTO_RECOVERY_REASONS = frozenset(
     {"allocation_replaced", "allocation_incarnation_changed"}

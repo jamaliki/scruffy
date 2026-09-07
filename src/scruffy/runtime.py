@@ -110,6 +110,10 @@ class Controller:
     last_slurm_query: float = 0.0
     slurm_query_error: str | None = None
     report_cursor: str | None = None
+    report_batch_size: int = 0
+    report_batch_limit: int = 0
+    report_backlog_lower_bound: int = 0
+    report_backlog_saturated: bool = False
     workflow_signatures: dict[tuple[str, str], tuple[tuple[str, object], ...]] | None = None
     gpu_health_mode: str = "off"
     gpu_isolation: str = "gpu"

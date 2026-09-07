@@ -522,6 +522,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "jobs": {},
                 "report_acks": {},
                 "report_ack_v": 1,
+                "report_observability": {},
                 "next_queue_order": 0,
                 "archived_jobs": 0,
                 "archived_counts": {},
@@ -709,6 +710,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
         state["last_seq"] = max(int(state.get("last_seq", 0)), int(event["seq"]))
     state["journal_offset"] = journal_offset
     state.setdefault("report_acks", {})
+    state.setdefault("report_observability", {})
     state["next_queue_order"] = max(
         int(state.get("next_queue_order", 0)),
         max(
