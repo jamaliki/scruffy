@@ -657,8 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("gpu", "node"),
         default="gpu",
         help=(
-            "quarantine one GPU when exact Slurm binding is available; use node "
-            "as the conservative fallback (default: gpu)"
+            "local launcher quarantine scope (default: gpu); Slurm always "
+            "withholds the whole node from new GPU work"
         ),
     )
     serve.set_defaults(handler=_serve)

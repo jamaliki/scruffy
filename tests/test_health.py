@@ -378,6 +378,22 @@ class HealthTests(unittest.TestCase):
             nodes_requiring_exact_gpu_binding(health, self.inventory, now=self.at),
         )
 
+    def test_slurm_whole_node_hold_respects_automatic_enforcement_mode(self) -> None:
+        health = empty_health_state(mode="observe", isolation="gpu")
+        for offset in range(3):
+            ingest_health_sample(
+                health, self.inventory,
+                self.sample(cuda_ok=False, at=self.at + timedelta(seconds=offset)),
+            )
+        self.assertEqual(
+            {}, unavailable_gpu_ids(health, self.inventory, slurm_managed=True, now=self.at)
+        )
+        health["mode"] = "enforce"
+        self.assertEqual(
+            {"gpu-a": (0, 1)},
+            unavailable_gpu_ids(health, self.inventory, slurm_managed=True, now=self.at),
+        )
+
     def test_node_isolation_remains_a_conservative_fallback(self) -> None:
         health = empty_health_state(mode="observe", isolation="node")
         ingest_health_sample(health, self.inventory, self.sample())

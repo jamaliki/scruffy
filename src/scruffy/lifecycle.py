@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ._compat import UTC
-from .health import nodes_requiring_exact_gpu_binding, unavailable_gpu_ids
+from .health import unavailable_gpu_ids
 from .models import (
     Assignment,
     NodeReservation,
@@ -348,21 +348,6 @@ def remaining_time_limit(job: dict[str, Any]) -> float | None:
     return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
 
 
-def _requires_exact_gpu_binding(
-    controller: Controller, assignment: Assignment
-) -> bool:
-    if (
-        assignment.request.gpus_per_node == 0
-        or getattr(controller, "gpu_isolation", "node") != "gpu"
-    ):
-        return False
-    state = getattr(controller, "state", {})
-    health = state.get("gpu_health", {}) if isinstance(state, Mapping) else {}
-    inventory = getattr(controller, "inventory", ())
-    exact_nodes = nodes_requiring_exact_gpu_binding(health, inventory)
-    return any(item.node in exact_nodes for item in assignment.reservations)
-
-
 def _launch_arguments(
     controller: Controller,
     job: dict[str, Any],
@@ -372,12 +357,8 @@ def _launch_arguments(
     stderr_file: Path,
 ) -> tuple[list[str], dict[str, str] | None]:
     if controller.launcher == "slurm":
-        binding = job.get("gpu_binding")
-        exact_gpu_binding = (
-            binding == "exact"
-            if binding is not None
-            else _requires_exact_gpu_binding(controller, assignment)
-        )
+        # Preserve the contract of persisted launches from older controllers.
+        exact_gpu_binding = job.get("gpu_binding") == "exact"
         return (
             build_srun_argv(
                 slurm_job_id=controller.slurm_job_id or "",
@@ -480,9 +461,7 @@ def start_job(
             f"jobs/{job['id']}/runtime-placement-{index}.json"
             for index, _ in enumerate(assignment.reservations)
         ]
-        job["gpu_binding"] = (
-            "exact" if _requires_exact_gpu_binding(controller, assignment) else "count"
-        )
+        job["gpu_binding"] = "count"
 
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
@@ -620,19 +599,15 @@ def schedule(controller: Controller) -> None:
             QueuedJob(job["id"], ResourceRequest.from_dict(job["request"]))
             for job in queued_images
         ]
-        exact_gpu_nodes = (
-            nodes_requiring_exact_gpu_binding(
-                controller.state.get("gpu_health", {}), controller.inventory
-            )
-            if controller.launcher == "slurm"
-            else frozenset()
-        )
         choice = choose_first_fitting_job(
             controller.inventory,
             active_assignments(controller.state),
             queued,
-            unavailable_gpu_ids(controller.state.get("gpu_health", {}), controller.inventory),
-            exact_gpu_nodes=exact_gpu_nodes,
+            unavailable_gpu_ids(
+                controller.state.get("gpu_health", {}),
+                controller.inventory,
+                slurm_managed=controller.launcher == "slurm",
+            ),
         )
         if choice is None:
             return

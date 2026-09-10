@@ -230,7 +230,11 @@ def refresh_nodes(
     assignments = active_assignments(state)
     health = state.get("gpu_health")
     health_view = health if isinstance(health, dict) else {}
-    unavailable = unavailable_gpu_ids(health_view, inventory)
+    unavailable = unavailable_gpu_ids(
+        health_view,
+        inventory,
+        slurm_managed=state.get("allocation", {}).get("launcher") == "slurm",
+    )
     free_by_node = {
         item.name: item
         for item in available_resources(inventory, assignments, unavailable)

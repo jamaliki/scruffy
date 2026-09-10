@@ -1417,7 +1417,7 @@ class SlurmLaunchTests(unittest.TestCase):
         self.assertNotIn("--overlap", argv)
         self.assertEqual(14, assigned.request.cpus_per_node)
 
-    def test_quarantine_sensitive_worker_step_gets_exact_binding(self) -> None:
+    def test_persisted_exact_worker_step_keeps_its_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = mock.Mock(
@@ -1452,7 +1452,7 @@ class SlurmLaunchTests(unittest.TestCase):
 
             argv, _ = _launch_arguments(
                 controller,
-                {"launch_token": "scruffy-token"},
+                {"launch_token": "scruffy-token", "gpu_binding": "exact"},
                 assigned,
                 root / "assignment.json",
                 root / "stdout.log",

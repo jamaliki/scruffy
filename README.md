@@ -183,9 +183,9 @@ Every 10 seconds, one task on each node records:
 
 Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
 The default is `observe`: automatic failures become visible without changing
-placement. GPU isolation defaults to `gpu`, so an explicit `gpu-quarantine`
-withholds only the selected slot when Slurm can bind it exactly. Use
-`--gpu-isolation=node` for conservative whole-node withholding.
+placement. GPU isolation defaults to `gpu` for the local launcher. Under Slurm,
+an enforced or explicit operator quarantine always withholds the whole node
+from new GPU work, even with `--gpu-isolation=gpu`.
 In `enforce`, three consecutive bad samples within the bounded sampling window
 make the affected UUID's quarantine sticky; inconclusive samples do not count,
 and missing or older-than-45-second samples fail closed. Samples more than 30
@@ -204,13 +204,12 @@ scruffy --root "$SCRUFFY_ROOT" gpu-reprobe gpu-3 GPU-...
 scruffy --root "$SCRUFFY_ROOT" gpu-clear gpu-3 GPU-...
 ```
 
-GPU worker steps request their ledger-selected physical IDs with an explicit
-Slurm GRES mask, and the worker verifies `SLURM_STEP_GPUS` before executing user
-code. Enforced or operator quarantine therefore marks the bad GPU `STOPPED`
-while healthy peers remain schedulable. Multi-node exact steps use one common
-slot set on every node; if that cannot be represented, Scruffy refuses the
-unsafe placement rather than risk the quarantined GPU. Use
-`--gpu-isolation=node` when whole-node withholding is the required fallback.
+Slurm owns physical GPU selection: worker steps request GPU counts and preserve
+Slurm's device visibility. A task GRES binding mask does not reserve particular
+physical GPUs, so it cannot safely implement partial-node quarantine. The bad
+GPU is `STOPPED` and its healthy peers are `node_held`; other eligible nodes
+remain schedulable. If none fit, the job stays queued rather than failing a
+physical-mapping check. CPU-only work may still use the affected node.
 Existing jobs are not killed automatically; their assignment stays owned until
 normal exit or explicit cancellation.
 
