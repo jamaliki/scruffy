@@ -219,6 +219,14 @@ active request without cancelling it. Python callers use `after_task` and
 `after_artifact` on `request_evacuation`; publishers may use
 `publish_event(..., wait=True, timeout=SECONDS)` to await the immutable receipt.
 
+For a live campaign pinned to a pre-capability report client, an operator may
+start `serve --legacy-report-project PROJECT` (repeatable). Only those projects
+retain the earlier queue-root-write trust for reports with no launch token.
+Incorrect supplied tokens remain rejected; other projects remain strict. The
+allowlist is attested in allocation metadata and must be supplied on restart.
+Unsigned publications still cannot activate capability-authenticated armed
+evacuations. Upgrade the campaign client before removing this exception.
+
 The CLI prints a generated request ID before submitting a request when one was
 not supplied. Reusing an ID with the same scope and options is a replay; using
 it with different options is rejected. The current operation and durable

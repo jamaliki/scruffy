@@ -113,6 +113,7 @@ class Controller:
     workflow_signatures: dict[tuple[str, str], tuple[tuple[str, object], ...]] | None = None
     gpu_health_mode: str = "off"
     gpu_isolation: str = "gpu"
+    legacy_report_projects: tuple[str, ...] = ()
     gpu_health_interval: float = 10.0
     health_worker_release_sha256: str = ""
     health_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)

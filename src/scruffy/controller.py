@@ -166,8 +166,10 @@ def _initialize_controller(
     gpu_health_mode: str = "observe",
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
+    legacy_report_projects: tuple[str, ...] = (),
 ) -> Controller:
     controller_release = _normalize_controller_release(controller_release)
+    legacy_report_projects = tuple(normalize_project_id(p) for p in legacy_report_projects)
     state = load_recovered_state(root)
     health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
     worker_release = _health_worker_release_sha256()
@@ -250,6 +252,7 @@ def _initialize_controller(
         output=OutputNotifier(messages),
         gpu_health_mode=gpu_health_mode,
         gpu_isolation=gpu_isolation,
+        legacy_report_projects=legacy_report_projects,
         gpu_health_interval=gpu_health_interval,
         health_worker_release_sha256=worker_release,
         health_step_name=(
@@ -354,6 +357,7 @@ def _initialize_controller(
     now = utc_now()
     metadata = allocation_metadata(allocation_id, launcher)
     metadata["controller_release"] = controller_release
+    metadata["legacy_report_projects"] = list(legacy_report_projects)
     if allocation_incarnation is not None:
         metadata["incarnation"] = allocation_incarnation.to_dict()
     metadata.update(
@@ -470,11 +474,6 @@ def _reattach_slurm_jobs(controller: Controller, jobs: list[dict[str, Any]]) -> 
     """Restore ownership of persisted steps without their old local clients."""
 
     for job in jobs:
-        # Pre-binding workers (including cb633a6) never received the report
-        # capability in their environment. Preserve their queue-root trust
-        # only when reattaching that existing launch, not for new submissions.
-        if job.get("runtime_placement_contract") == 1 and "gpu_binding" not in job:
-            job["legacy_report_source"] = True
         job.pop("pid", None)
         running = RunningProcess(None, str(job["launch_token"]))
         running.closed_streams.update({"stdout", "stderr"})
@@ -1946,12 +1945,14 @@ def _check_artifact_condition_conflict(
             )
 
 
-def _report_capability_valid(job: dict[str, Any], event: dict[str, Any]) -> bool:
-    """Verify a worker capability when present; queue-root access is legacy trust."""
+def _report_capability_valid(
+    job: dict[str, Any], event: dict[str, Any], legacy_projects: tuple[str, ...] = (),
+) -> bool:
+    """Permit old unsigned clients only in explicitly operator-opted-in projects."""
 
     expected = job.get("launch_token")
     supplied = event.get("source", {}).get("launch_token")
-    if supplied is None and job.get("legacy_report_source") is True:
+    if supplied is None and job_project(job) in legacy_projects:
         return True
     return not isinstance(expected, str) or supplied == expected
 
@@ -2854,7 +2855,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                     acknowledged.append((source, digest))
                     new_report_ids.append(_report_id(source))
                     continue
-        if not _report_capability_valid(job, event):
+        if not _report_capability_valid(job, event, controller.legacy_report_projects):
             _reject_report(controller, source, "invalid launch capability", digest=digest)
             acknowledged.append((source, digest))
             new_report_ids.append(_report_id(source))
@@ -3358,6 +3359,7 @@ def run_controller(
     gpu_health_mode: str = "observe",
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
+    legacy_report_projects: tuple[str, ...] = (),
 ) -> None:
     """Own a queue until interrupted, retrying transient storage failures."""
 
@@ -3414,6 +3416,7 @@ def run_controller(
                     evacuate_before_end_seconds=evacuate_before_end_seconds,
                     gpu_health_mode=gpu_health_mode,
                     gpu_isolation=gpu_isolation,
+                    legacy_report_projects=legacy_report_projects,
                     gpu_health_interval=gpu_health_interval,
                 )
                 _serve(controller)

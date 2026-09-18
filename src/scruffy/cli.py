@@ -186,6 +186,8 @@ def _serve(arguments: argparse.Namespace) -> int:
     controller_options = {}
     if controller_release is not None:
         controller_options["controller_release"] = controller_release
+    if getattr(arguments, "legacy_report_project", None):
+        controller_options["legacy_report_projects"] = tuple(arguments.legacy_report_project)
     if arguments.evacuate_before_end_seconds:
         controller_options["evacuate_before_end_seconds"] = (
             arguments.evacuate_before_end_seconds
@@ -651,6 +653,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=10,
         help="seconds between CUDA/thermal probes (default: 10)",
+    )
+    serve.add_argument(
+        "--legacy-report-project", action="append", default=[], metavar="PROJECT",
+        help="trust unsigned legacy-client reports in this project only (repeatable)",
     )
     serve.add_argument(
         "--gpu-isolation",
