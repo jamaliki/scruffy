@@ -460,6 +460,7 @@ def start_job(
     prior_job = prior_launch.get("job") if prior_launch else None
     prior_started_at = prior_launch.get("started_at") if prior_launch else None
     prior_token = prior_job.get("launch_token") if isinstance(prior_job, dict) else None
+    job.pop("legacy_report_source", None)
     job["started_at"] = (
         job.get("started_at")
         or (prior_started_at if isinstance(prior_started_at, str) else None)

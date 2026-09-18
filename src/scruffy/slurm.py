@@ -420,8 +420,11 @@ def build_srun_argv(
     admission slots, while each worker task requests its exact GPUs, CPUs, and
     memory. Task-scoped GPU requests make Slurm bind a device set to every
     worker and populate ``CUDA_VISIBLE_DEVICES``. When ``gpu_ids_per_node`` is
-    supplied, its common slot set is converted to an explicit Slurm GRES mask;
-    the worker validates the resulting physical mapping before exec.
+    supplied, the worker validates the resulting physical mapping before exec.
+    A physical-node mask is NOT a step reservation: on cgroup-constrained Slurm
+    steps its indices are step-local. Let Slurm bind its selected devices and
+    fail closed in the worker if their physical identities differ. Placement
+    can therefore fail; this does not promise arbitrary physical reservations.
     ``--exact`` prevents a partial step from inheriting the remaining
     outer-allocation resources.
     """
@@ -463,9 +466,6 @@ def build_srun_argv(
         # that task rather than merely reserving node-level GRES: Slurm then
         # owns both exclusivity and the task-visible CUDA device mapping.
         argv.append(f"--gpus-per-task={gpus_per_node}")
-        if gpu_ids_per_node is not None:
-            mask = sum(1 << gpu_id for gpu_id in gpu_ids_per_node[0])
-            argv.append(f"--tres-bind=gres/gpu:mask:0x{mask:x}")
     argv.extend(
         [
             f"--cpus-per-task={cpus_per_node}",

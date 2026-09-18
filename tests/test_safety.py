@@ -1460,7 +1460,7 @@ class SlurmLaunchTests(unittest.TestCase):
             )
 
         self.assertIn("--gpus-per-task=1", argv)
-        self.assertIn("--tres-bind=gres/gpu:mask:0x1", argv)
+        self.assertFalse(any(arg.startswith("--tres-bind=") for arg in argv))
 
     def test_start_job_passes_only_sanitized_environment_to_srun(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

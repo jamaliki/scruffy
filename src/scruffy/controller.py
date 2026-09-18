@@ -470,6 +470,11 @@ def _reattach_slurm_jobs(controller: Controller, jobs: list[dict[str, Any]]) -> 
     """Restore ownership of persisted steps without their old local clients."""
 
     for job in jobs:
+        # Pre-binding workers (including cb633a6) never received the report
+        # capability in their environment. Preserve their queue-root trust
+        # only when reattaching that existing launch, not for new submissions.
+        if job.get("runtime_placement_contract") == 1 and "gpu_binding" not in job:
+            job["legacy_report_source"] = True
         job.pop("pid", None)
         running = RunningProcess(None, str(job["launch_token"]))
         running.closed_streams.update({"stdout", "stderr"})
@@ -1946,6 +1951,8 @@ def _report_capability_valid(job: dict[str, Any], event: dict[str, Any]) -> bool
 
     expected = job.get("launch_token")
     supplied = event.get("source", {}).get("launch_token")
+    if supplied is None and job.get("legacy_report_source") is True:
+        return True
     return not isinstance(expected, str) or supplied == expected
 
 
