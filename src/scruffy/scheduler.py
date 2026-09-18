@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import replace
 from itertools import combinations
 from typing import Any
 
@@ -367,6 +368,7 @@ def choose_first_fitting_job(
     *,
     require_uniform_gpu_ids: bool = False,
     exact_gpu_nodes: Collection[str] = (),
+    slurm_count_binding: bool = False,
 ) -> tuple[QueuedJob, Assignment] | None:
     """Return the first queued job that currently fits.
 
@@ -388,6 +390,19 @@ def choose_first_fitting_job(
     free_nodes = _available_resources(
         inventory, assignments, unavailable_gpu_ids
     )
+    if slurm_count_binding and unavailable_gpu_ids:
+        # Count-based Slurm GRES picks the lowest unreserved physical devices,
+        # not the lowest *healthy* devices in our ledger. A quarantined hole
+        # therefore blocks placement above that hole, not below it. Do not
+        # change quarantine state or withhold healthy lower-index peers.
+        physical = {node.name: node.gpu_ids for node in _available_resources(inventory, assignments)}
+        adjusted = []
+        for node in free_nodes:
+            blocked = set(unavailable_gpu_ids.get(node.name, ()))
+            first_blocked = next((gpu for gpu in physical[node.name] if gpu in blocked), None)
+            available = tuple(gpu for gpu in node.gpu_ids if first_blocked is None or gpu < first_blocked)
+            adjusted.append(replace(node, gpu_ids=available))
+        free_nodes = tuple(adjusted)
     for job in queued_jobs:
         assignment = _candidate_assignment(
             free_nodes,

@@ -633,6 +633,7 @@ def schedule(controller: Controller) -> None:
             queued,
             unavailable_gpu_ids(controller.state.get("gpu_health", {}), controller.inventory),
             exact_gpu_nodes=exact_gpu_nodes,
+            slurm_count_binding=controller.launcher == "slurm",
         )
         if choice is None:
             return
