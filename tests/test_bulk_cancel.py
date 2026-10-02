@@ -398,6 +398,11 @@ class BulkCancelControllerTests(unittest.TestCase):
             event for event in read_events(self.root) if event["kind"] == "jobs.cancel_completed"
         ]
         self.assertEqual({"job_id_count": 5001}, completed[0]["data"]["selector"])
+        started = [
+            event for event in read_events(self.root) if event["kind"] == "jobs.cancel_started"
+        ]
+        self.assertEqual({"job_id_count": 5001}, started[0]["data"]["operation"]["selector"])
+        self.assertEqual(["known"], started[0]["data"]["operation"]["targets"])
 
     def test_oversized_selectors_are_refused_by_the_client(self) -> None:
         with self.assertRaises(ValueError):
@@ -479,6 +484,12 @@ class BulkCancelControllerTests(unittest.TestCase):
             _ingest_commands(controller)
         self.assertEqual("blocked", controller.state["jobs"]["known"]["state"])
         self.assertEqual(1, len(command_sources(self.root)))
+        notices = [
+            event["data"]
+            for event in read_events(self.root)
+            if event["kind"] == "notice" and event["data"].get("operation") == "read_archived_job"
+        ]
+        self.assertEqual("elsewhere", notices[-1]["item"])
         _ingest_commands(controller)
         self.assertEqual(1, self._receipt_outcome("flaky-read")["counts"]["unknown"])
 

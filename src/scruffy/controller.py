@@ -2742,9 +2742,10 @@ def _start_bulk_cancel(
         for job_id in missing:
             try:
                 archived = find_archived_job(controller.root, job_id)
-            except (OSError, TransientStorageError):
+            except (OSError, TransientStorageError) as exc:
                 # The outcome is immutable; never record a read failure as
-                # an unknown job. Retry the whole command next tick.
+                # an unknown job. Report it and retry the command next tick.
+                _storage_notice(controller, "read_archived_job", job_id, exc)
                 return None
             except StorageError as exc:
                 _storage_notice(controller, "read_archived_job", job_id, exc)
@@ -2771,7 +2772,8 @@ def _start_bulk_cancel(
         "v": 1,
         "kind": "cancel_jobs",
         "request_id": request_id,
-        "selector": selector,
+        # Explicit IDs are resolved into targets; keep only the filters.
+        "selector": selector_summary(selector),
         "started_at": utc_now(),
         "targets": [job["id"] for job in targets],
         "position": 0,
@@ -2792,7 +2794,7 @@ def _start_bulk_cancel(
         "jobs.cancel_started",
         data={
             "request_id": request_id,
-            "selector": selector_summary(selector),
+            "selector": operation["selector"],
             "counts": copy.deepcopy(operation["counts"]),
             "operation": copy.deepcopy(operation),
             **_bulk_project(selector),
@@ -2878,7 +2880,7 @@ def _apply_bulk_cancel(
         "jobs.cancel_completed",
         data={
             **copy.deepcopy(outcome),
-            "selector": selector_summary(operation["selector"]),
+            "selector": operation["selector"],
             **_bulk_project(operation["selector"]),
         },
     )
