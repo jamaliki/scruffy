@@ -6,6 +6,7 @@ uses to apply it, so a dry run and the applied command agree on what matches.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
@@ -14,7 +15,10 @@ from .models import job_project, normalize_project_id
 
 CANCELLABLE_STATES = frozenset({"queued", "blocked", "starting", "running", "finishing"})
 MAX_SELECTOR_JOB_IDS = 10_000
+MAX_SELECTOR_JOB_ID_CHARS = 128
 MAX_SELECTOR_TEXT = 256
+# The selector is retained in the command file and its immutable receipt.
+MAX_SELECTOR_BYTES = 1024 * 1024
 SELECTOR_FIELDS = frozenset(
     {
         "job_ids",
@@ -75,8 +79,11 @@ def cancel_selector(value: object) -> dict[str, Any]:
         job_ids = [_text(job_id, "job_ids entry") for job_id in raw_ids]
         if not job_ids or len(job_ids) > MAX_SELECTOR_JOB_IDS:
             raise ValueError(f"job_ids must contain 1-{MAX_SELECTOR_JOB_IDS} IDs")
-        if any("/" in job_id for job_id in job_ids):
-            raise ValueError("job_ids entries must not contain '/'")
+        if any("/" in job_id or len(job_id) > MAX_SELECTOR_JOB_ID_CHARS for job_id in job_ids):
+            raise ValueError(
+                f"job_ids entries must be at most {MAX_SELECTOR_JOB_ID_CHARS} "
+                "characters without '/'"
+            )
         selector["job_ids"] = sorted(set(job_ids))
     if value.get("states") is not None:
         raw_states = value["states"]
@@ -102,7 +109,18 @@ def cancel_selector(value: object) -> dict[str, Any]:
             raise ValueError("selector must name job_ids or at least one filter")
         if "states" not in selector:
             raise ValueError("a filter selector must name at least one state")
+    if len(json.dumps(selector, separators=(",", ":")).encode()) > MAX_SELECTOR_BYTES:
+        raise ValueError(f"selector must encode to at most {MAX_SELECTOR_BYTES} bytes")
     return selector
+
+
+def selector_summary(selector: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a selector for events, replacing an explicit ID list by its size."""
+
+    summary = {key: value for key, value in selector.items() if key != "job_ids"}
+    if "job_ids" in selector:
+        summary["job_id_count"] = len(selector["job_ids"])
+    return summary
 
 
 def selector_matches(job: Mapping[str, Any], selector: Mapping[str, Any]) -> bool:

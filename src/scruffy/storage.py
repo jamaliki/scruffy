@@ -31,8 +31,9 @@ MAX_TAIL_BYTES = 1024 * 1024
 INVALID_REQUEST_DIGEST = "-"
 STATE_CURSOR_FILE = "cursor.json"
 MAX_STATE_CURSOR_BYTES = 4096
-# A bulk command may name up to 10,000 job IDs; its receipt retains it.
-MAX_COMMAND_RECEIPT_BYTES = 1024 * 1024
+# A bulk command may name up to 10,000 job IDs; its receipt retains it. A
+# larger command keeps only its digest so a receipt is always readable.
+MAX_COMMAND_RECEIPT_BYTES = 4 * 1024 * 1024
 
 
 class StorageError(RuntimeError):
@@ -1172,13 +1173,12 @@ def submit_command(root: Path, command: dict[str, Any]) -> str:
         for source in (receipt, destination):
             if not source.exists():
                 continue
-            existing = (
-                read_immutable_json(source, max_bytes=MAX_COMMAND_RECEIPT_BYTES)[0]
-                if source == receipt
-                else read_json(source)
-            )
-            existing_command = existing.get("command") if source == receipt else existing
-            if existing_command != document:
+            if source == receipt:
+                existing = read_immutable_json(source, max_bytes=MAX_COMMAND_RECEIPT_BYTES)[0]
+                same = _receipt_matches(existing, document)
+            else:
+                same = read_json(source) == document
+            if not same:
                 raise StorageError(f"conflicting command request ID {request_id!r}")
             return request_id
         atomic_write_json(destination, document)
@@ -1204,17 +1204,45 @@ def record_command_receipt(
     document: dict[str, Any] = {"v": 1, "request_id": request_id, "command": command}
     if outcome is not None:
         document["outcome"] = outcome
+    if len(_canonical_bytes(document)) > MAX_COMMAND_RECEIPT_BYTES:
+        document = {
+            "v": 1,
+            "request_id": request_id,
+            "command_sha256": hashlib.sha256(_canonical_bytes(command)).hexdigest(),
+        }
+        if outcome is not None:
+            document["outcome"] = outcome
     with _key_lock(command_root, request_id) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if receipt.exists():
             existing, _ = read_immutable_json(
                 receipt, max_bytes=MAX_COMMAND_RECEIPT_BYTES
             )
-            if not isinstance(existing, dict) or existing.get("command") != command:
+            if not _receipt_matches(existing, command):
                 raise StorageError(f"conflicting command receipt for {request_id!r}")
             return
         _mkdir(receipt.parent)
         create_immutable_json(receipt, document, max_bytes=MAX_COMMAND_RECEIPT_BYTES)
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode()
+
+
+def _receipt_matches(receipt: object, command: dict[str, Any]) -> bool:
+    """Compare a command with a receipt holding it in full or as a digest."""
+
+    if not isinstance(receipt, dict):
+        return False
+    if "command" in receipt:
+        return receipt["command"] == command
+    return (
+        receipt.get("command_sha256")
+        == hashlib.sha256(_canonical_bytes(command)).hexdigest()
+    )
 
 
 def command_receipt(root: Path, request_id: str) -> dict[str, Any] | None:

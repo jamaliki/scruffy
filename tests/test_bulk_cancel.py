@@ -377,6 +377,54 @@ class BulkCancelControllerTests(unittest.TestCase):
             self._receipt_outcome("first-tick")["counts"],
         )
 
+    def test_large_explicit_selector_keeps_a_readable_receipt(self) -> None:
+        controller = self._controller()
+        self._seed(controller, job("known"))
+        job_ids = ["known", *(f"job-{index:05d}-{'x' * 115}" for index in range(5000))]
+        cancel_jobs(self.root, job_ids=job_ids, request_id="large")
+        _ingest_commands(controller)
+        outcome = self._receipt_outcome("large")
+        self.assertEqual(1, outcome["counts"]["cancelled"])
+        self.assertEqual(5000, outcome["counts"]["unknown"])
+        self.assertNotIn("selector", outcome)
+        controller.journal.close()
+        restarted = self._controller()
+        _discard_journaled_commands(restarted)
+        _ingest_commands(restarted)
+        self.assertEqual([], command_sources(self.root))
+        completed = [
+            event for event in read_events(self.root) if event["kind"] == "jobs.cancel_completed"
+        ]
+        self.assertEqual({"job_id_count": 5001}, completed[0]["data"]["selector"])
+
+    def test_oversized_selectors_are_refused_by_the_client(self) -> None:
+        with self.assertRaises(ValueError):
+            cancel_jobs(
+                self.root, job_ids=[f"job-{index:05d}-{'x' * 120}" for index in range(10_000)]
+            )
+        with self.assertRaises(ValueError):
+            cancel_jobs(self.root, job_ids=["job-" + "x" * 200])
+        self.assertEqual([], command_sources(self.root))
+
+    def test_any_command_size_leaves_a_readable_receipt(self) -> None:
+        controller = self._controller()
+        from scruffy.storage import submit_command
+
+        command = {
+            "kind": "cancel",
+            "request_id": "huge",
+            "job_id": "missing",
+            "note": "y" * (5 * 1024 * 1024),
+        }
+        submit_command(self.root, command)
+        _ingest_commands(controller)
+        receipt = command_receipt(self.root, "huge")
+        self.assertNotIn("command", receipt)
+        self.assertEqual(64, len(receipt["command_sha256"]))
+        self.assertEqual("huge", submit_command(self.root, command))
+        with self.assertRaises(StorageError):
+            submit_command(self.root, {**command, "note": "different"})
+
     def test_named_job_awaiting_admission_defers_the_whole_command(self) -> None:
         controller = self._controller()
         self._seed(controller, job("known"))

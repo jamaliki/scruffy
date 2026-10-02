@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._compat import UTC
-from .bulk import cancel_selector, selector_matches
+from .bulk import cancel_selector, selector_matches, selector_summary
 from .health import (
     GPU_ISOLATION_MODES,
     HEALTH_MODES,
@@ -2774,7 +2774,7 @@ def _start_bulk_cancel(
         "jobs.cancel_started",
         data={
             "request_id": request_id,
-            "selector": selector,
+            "selector": selector_summary(selector),
             "counts": copy.deepcopy(operation["counts"]),
             **_bulk_project(selector),
         },
@@ -2834,10 +2834,10 @@ def _apply_bulk_cancel(
     if operation["position"] < len(targets):
         return False, None, used
     del operations[request_id]
+    # The receipt already holds the command and its selector.
     outcome = {
         "state": "completed",
         "request_id": request_id,
-        "selector": operation["selector"],
         "started_at": operation["started_at"],
         "completed_at": utc_now(),
         "counts": dict(counts),
@@ -2846,7 +2846,11 @@ def _apply_bulk_cancel(
     emit(
         controller,
         "jobs.cancel_completed",
-        data={**copy.deepcopy(outcome), **_bulk_project(operation["selector"])},
+        data={
+            **copy.deepcopy(outcome),
+            "selector": selector_summary(operation["selector"]),
+            **_bulk_project(operation["selector"]),
+        },
     )
     return True, outcome, used
 
@@ -3070,7 +3074,9 @@ def _discard_journaled_commands(controller: Controller) -> None:
             source, command = item
             if event.get("kind") == "jobs.cancel_completed":
                 outcome = {
-                    key: value for key, value in data.items() if key != "project_id"
+                    key: value
+                    for key, value in data.items()
+                    if key not in {"project_id", "selector"}
                 }
             elif command.get("kind") == "cancel_jobs":
                 outcome = {"state": "rejected", "reason": data.get("reason")}
