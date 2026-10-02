@@ -390,7 +390,9 @@ blockers, workload projection, and output paths. The state exposes per-state `ar
 `summary.counts` combines these with hot counts, while detailed summary lists
 and unqualified `status(root)` remain hot views.
 
-Archiving is a journaled `jobs.archived` record (job IDs and count deltas).
+Archiving is journaled as one `jobs.archived` record per project (its
+`project_id`, job IDs, and count deltas), so project-filtered observers see
+only their own project's records.
 It neither rotates the journal nor resets observer cursors; MCP waits do not
 wake for it by default. Per-job stdout and stderr outlive hot state: the
 `retained_log_jobs` list keeps the log directories of the 1,000 most recently
@@ -438,7 +440,8 @@ release safe. Cancelling any terminal job, including an archived one, produces
  "selector": {"states": ["blocked"], "project_id": "koochak"}}
 ```
 
-The selector names `job_ids` (at most 10,000), filters, or both (their
+The selector names `job_ids` (at most 10,000 IDs of at most 128 characters;
+the encoded selector is at most 1 MiB), filters, or both (their
 intersection). Filters are `states` (a non-empty subset of `queued`,
 `blocked`, `starting`, `running`, and `finishing`; required unless `job_ids`
 is given), `project_id`, `workflow_id`, `workflow_id_prefix`,
@@ -447,11 +450,16 @@ UTC offset). The controller resolves the selector once against its hot state.
 A named job still awaiting admission defers the whole command to a later
 tick. It then cancels at most 512 jobs per tick, each with its ordinary
 `job.cancelled` or `job.cancelling` event carrying `data.bulk_request_id`, and
-each job records `cancel_request_id`. `jobs.cancel_started` and the outcome
+each job records `cancel_request_id`. `jobs.cancel_started` (which journals
+the resolved operation), `jobs.cancel_progress` after each tick that advances
+it (not a wake-up for MCP waits by default), and the outcome
 `jobs.cancel_completed` repeat `request_id` and carry `counts`:
 `matched = cancelled + cancelling + ignored`, where `ignored` jobs were already
 terminal or cancelling, plus `unknown` named IDs. The same summary is kept as
 `outcome` in the command's immutable receipt, which `wait_for_command` returns.
+Events carry the selector with an explicit ID list replaced by
+`job_id_count`; the receipt keeps the full command (a command too large for a
+4 MiB receipt is kept by its SHA256, which retries still match).
 An invalid selector produces `command.rejected` and a rejected outcome.
 Progress of an unfinished operation appears in `summary.bulk_operations`.
 Reusing a `request_id` with the same selector is an idempotent retry. On MCP,
