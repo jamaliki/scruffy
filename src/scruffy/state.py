@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -353,8 +355,17 @@ def emit(
         event["data"] = data
         if "job_id" in data and "job_id" not in event:
             event["job_id"] = data["job_id"]
-    append_event(controller.journal, event, sync=durable)
+    deferred = controller.commit_depth > 0
+    append_event(controller.journal, event, sync=durable and not deferred)
     state["journal_offset"] = controller.journal.tell()
+    if deferred:
+        # Inside a group commit the enclosing block publishes one cumulative
+        # snapshot after one journal sync. Nothing outside the controller can
+        # observe this event before then, because readers stop at the
+        # committed watermark.
+        if durable or snapshot:
+            controller.commit_pending = True
+        return event
     if snapshot:
         refresh_nodes(state, controller.inventory)
         write_state(controller.root, state)
@@ -405,12 +416,69 @@ def _reopen_journal(controller: Controller) -> None:
 
 
 def commit_snapshot(controller: Controller) -> None:
-    """Durably commit prior events, then publish one cumulative state image."""
+    """Durably commit prior events, then publish one cumulative state image.
+
+    Actions registered with :func:`after_commit` run only after both the
+    journal and the snapshot containing their effects are durable.
+    """
 
     sync_file(controller.journal)
     refresh_nodes(controller.state, controller.inventory)
     write_state(controller.root, controller.state)
     _reopen_journal(controller)
+    controller.commit_pending = False
+    actions, controller.after_commit = controller.after_commit, []
+    for action in actions:
+        action()
+
+
+@contextmanager
+def group_commit(controller: Controller) -> Iterator[None]:
+    """Apply a batch of transitions, then publish them with one commit.
+
+    Inside the block :func:`emit` appends events without a journal sync or a
+    snapshot replacement. When the outermost block exits normally, a single
+    :func:`commit_snapshot` syncs the journal, replaces ``state.json`` once,
+    and runs the deferred post-commit actions (for example removing the
+    command files whose effects are now durable). Nested blocks join the
+    outermost one. If the block raises, nothing is committed or acknowledged:
+    a restarted controller replays whatever reached the journal and retries
+    the unacknowledged inbox items.
+
+    Code inside the block that performs an external side effect which must
+    follow a durable transition (a signal, a launch) calls
+    :func:`ensure_committed` first.
+    """
+
+    controller.commit_depth += 1
+    try:
+        yield
+    except BaseException:
+        controller.commit_depth -= 1
+        if controller.commit_depth == 0:
+            controller.after_commit.clear()
+        raise
+    controller.commit_depth -= 1
+    if controller.commit_depth == 0 and (
+        controller.commit_pending or controller.after_commit
+    ):
+        commit_snapshot(controller)
+
+
+def ensure_committed(controller: Controller) -> None:
+    """Make every transition emitted so far durable before a side effect."""
+
+    if controller.commit_pending:
+        commit_snapshot(controller)
+
+
+def after_commit(controller: Controller, action: Callable[[], None]) -> None:
+    """Run ``action`` once the transitions emitted so far are durable."""
+
+    if controller.commit_depth == 0 and not controller.commit_pending:
+        action()
+    else:
+        controller.after_commit.append(action)
 
 
 def compact_journal(

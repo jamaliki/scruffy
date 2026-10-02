@@ -8,6 +8,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
@@ -125,6 +126,12 @@ class Controller:
     health_replaced_step_ids: dict[str, set[str]] = field(default_factory=dict)
     health_monitor_errors: dict[str, str] = field(default_factory=dict)
     health_ingest_errors: dict[str, str] = field(default_factory=dict)
+    # Group commit: while commit_depth is positive, emit() appends events
+    # without syncing the journal or replacing the snapshot. One commit then
+    # publishes the batch and runs actions that must follow durability.
+    commit_depth: int = 0
+    commit_pending: bool = False
+    after_commit: list[Callable[[], None]] = field(default_factory=list)
 
 
 def copy_stream(

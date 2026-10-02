@@ -392,7 +392,10 @@ return immediately:
 {"request_id": "...", "state": "resume_requested"}
 ```
 
-The corresponding outcome event repeats `request_id`. Cancellation retains its
+The corresponding outcome event repeats `request_id`. The controller applies
+pending commands in batches and publishes each batch with one snapshot commit,
+so an outcome becomes visible within one controller tick of being applied; the
+command file is removed only after that commit. Cancellation retains its
 assignment until launcher exit, output closure, and Slurm reconciliation prove
 release safe. Cancelling any terminal job, including an archived one, produces
 `job.cancel_ignored` rather than `command.rejected`.

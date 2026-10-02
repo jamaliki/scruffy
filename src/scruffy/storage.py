@@ -1178,17 +1178,59 @@ def _command_receipt(command_root: Path, request_id: str) -> Path:
     return command_root / ".accepted" / f"{digest}.json"
 
 
+def command_sources(root: Path) -> list[Path]:
+    """List pending command files without reading them."""
+
+    return sorted((ensure_layout(root) / "commands").glob("*.json"))
+
+
 def list_commands(root: Path) -> list[tuple[Path, dict[str, Any]]]:
-    command_root = ensure_layout(root) / "commands"
-    result: list[tuple[Path, dict[str, Any]]] = []
-    for source in sorted(command_root.glob("*.json")):
-        result.append((source, read_json(source)))
-    return result
+    return [(source, read_json(source)) for source in command_sources(root)]
 
 
 def remove_command(source: Path) -> None:
     source.unlink(missing_ok=True)
     _fsync_directory(source.parent)
+
+
+def acknowledge_commands(
+    root: Path, commands: Sequence[tuple[Path, dict[str, Any]]]
+) -> None:
+    """Retain immutable receipts for a handled batch, then remove its files.
+
+    Callers invoke this only after the effects of every command are durable.
+    One directory sync commits all removals; a removal lost in a crash leaves
+    a file whose journaled outcome is acknowledged again on restart.
+    """
+
+    for _, command in commands:
+        record_command_receipt(root, command)
+    for source, _ in commands:
+        source.unlink(missing_ok=True)
+    if commands:
+        _fsync_directory(ensure_layout(root) / "commands")
+
+
+def remove_stale_state_temporaries(root: Path) -> int:
+    """Delete snapshot replacements abandoned by an interrupted controller.
+
+    Only the controller holding the queue lock writes these files, so the
+    caller must hold that lock.
+    """
+
+    root = ensure_layout(root)
+    candidates = [
+        *root.glob(".state.json.*.tmp"),
+        *root.glob(f".{STATE_CURSOR_FILE}.*.tmp"),
+    ]
+    journal_root = root / "journal"
+    if journal_root.is_dir():
+        candidates.extend(journal_root.glob(".*.tmp"))
+    for source in candidates:
+        source.unlink(missing_ok=True)
+    for directory in {source.parent for source in candidates}:
+        _fsync_directory(directory)
+    return len(candidates)
 
 
 def load_state(root: Path) -> dict[str, Any] | None:

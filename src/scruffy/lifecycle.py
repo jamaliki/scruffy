@@ -37,7 +37,7 @@ from .slurm import (
     new_step_name,
 )
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
-from .state import active_assignments, emit
+from .state import active_assignments, emit, ensure_committed
 from .storage import (
     StorageError,
     atomic_write_json,
@@ -538,6 +538,7 @@ def start_job(
         # can be launched. The immutable launch record is already available to
         # the worker by the time that transition is published.
         emit(controller, "job.starting", job=job)
+        ensure_committed(controller)
         atomic_write_json(assignment_file, worker_document)
         argv, environment = _launch_arguments(
             controller,
@@ -642,8 +643,18 @@ def schedule(controller: Controller) -> None:
 
 
 def request_cancellation(
-    controller: Controller, job: dict[str, Any], request_id: str | None = None
+    controller: Controller,
+    job: dict[str, Any],
+    request_id: str | None = None,
+    *,
+    deferred_stops: list[RunningProcess] | None = None,
 ) -> bool:
+    """Cancel one job, returning false when its state cannot be cancelled.
+
+    When ``deferred_stops`` is given, launchers are collected for the caller
+    to stop after one commit instead of being signalled one by one.
+    """
+
     data = {"request_id": request_id} if request_id else None
     if job["state"] in {"queued", "blocked"}:
         prior = _replayable_result(controller, job)
@@ -667,7 +678,13 @@ def request_cancellation(
         if running.final_state is None:
             running.final_state = "cancelled"
             running.final_reason = "cancelled"
-        stop_launcher(controller, running)
+        if deferred_stops is not None:
+            deferred_stops.append(running)
+        else:
+            # The cancelling transition must be durable before the launcher
+            # can observe the request.
+            ensure_committed(controller)
+            stop_launcher(controller, running)
     return True
 
 

@@ -132,6 +132,12 @@ The loop reconciles durable intent with live worker state before admitting more
 work. Scheduling is a pure calculation over the current inventory and active
 assignments; all filesystem writes, lifecycle transitions, and process launches
 remain in the single-writer controller.
+Each iteration is one group commit. New admissions, up to 512 commands, report
+batches, and the dependency transitions they cause are appended to the journal
+without a sync, then published with one journal sync and one `state.json`
+replacement. Request and command files are retired only after that commit, so
+a crash either replays a journaled outcome or retries the inbox item. Launches
+and signals still follow their own durable transition.
 Periodic metrics remain replaceable evidence rather than journal traffic. Only
 health transitions and operator actions are durable events, while enforce mode
 removes stale or quarantined nodes from the scheduler's eligible GPU inventory.

@@ -135,6 +135,22 @@ predecessor's immutable task inputs and records both lineage links plus the
 retry reason. Replay checks the deterministic successor identity before
 admission, so controller recovery cannot fan out duplicate attempts.
 
+### Group commit
+
+The journal is the write-ahead log and `state.json` is a replaceable
+checkpoint of it. One controller poll iteration is one group commit: every
+admission, command, report, and dependency transition in the iteration is
+appended without a sync; the iteration then syncs the journal once, replaces
+the snapshot once, and only afterwards retires request, command, and report
+inbox files. A failure before that commit acknowledges nothing, so a
+restarted controller either replays the journaled outcome or applies the
+still-pending inbox item. Transitions that guard an external effect (the
+`job.starting` reservation before a launch, `job.cancelling` before a signal,
+and the evacuation signal decision) force a commit before that effect. The
+cost of N queued commands is therefore one snapshot write per iteration rather
+than N, and a per-iteration bound keeps one iteration short when thousands of
+command files are pending.
+
 ### Observation
 
 Read interfaces project the same authoritative state for different costs:

@@ -55,6 +55,7 @@ from .runtime import (
     RunningProcess,
     abandon_processes,
     signal_process,
+    stop_launcher,
 )
 from .scheduler import InvariantError, assert_invariants, request_can_ever_fit
 from .slurm import (
@@ -67,11 +68,14 @@ from .slurm import (
     signal_step,
 )
 from .state import (
+    after_commit,
     apply_workload_event,
     commit_snapshot,
     compact_journal,
     emit,
     emit_submission,
+    ensure_committed,
+    group_commit,
     load_recovered_state,
 )
 from .storage import (
@@ -82,7 +86,9 @@ from .storage import (
     accept_reports,
     accept_request,
     accept_submission,
+    acknowledge_commands,
     archive_terminal_job,
+    command_sources,
     compact_report_receipts,
     controller_lock,
     create_immutable_json,
@@ -105,6 +111,7 @@ from .storage import (
     reject_request,
     remove_cold_job_directories,
     remove_command,
+    remove_stale_state_temporaries,
     report_identity_digest,
     report_streams,
     report_was_accepted,
@@ -125,6 +132,9 @@ from .workflows import (
 )
 
 MAX_REPORTS_PER_TICK = 128
+# Commands are applied in one group commit per tick. The bound keeps one tick
+# short when thousands of command files are pending on a shared filesystem.
+MAX_COMMANDS_PER_TICK = 512
 STORAGE_RETRY_SECONDS = 5
 COMMAND_OUTCOME_KINDS = {
     "job.cancelled",
@@ -170,6 +180,9 @@ def _initialize_controller(
 ) -> Controller:
     controller_release = _normalize_controller_release(controller_release)
     legacy_report_projects = tuple(normalize_project_id(p) for p in legacy_report_projects)
+    # Only the lock-holding controller writes snapshots, so any temporary
+    # replacement left by an interrupted predecessor is garbage.
+    removed_temporaries = remove_stale_state_temporaries(root)
     state = load_recovered_state(root)
     health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
     worker_release = _health_worker_release_sha256()
@@ -436,6 +449,7 @@ def _initialize_controller(
             "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
             "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
             "lost_reason": lost_reason,
+            "removed_stale_temporaries": removed_temporaries,
             **({"handover": metadata["handover"]} if replacement else {}),
         },
     )
@@ -1282,6 +1296,7 @@ def _signal_evacuation_target(
     # drained if delivery was not confirmed.
     _write_signal_receipt(controller, job, target)
     _evacuation_emit(controller, evacuation, request, "evacuation.signalling")
+    ensure_committed(controller)
     try:
         if controller.launcher == "slurm":
             job["slurm_step_id"] = target_step
@@ -2230,6 +2245,13 @@ def _admit_atomic_submission(
 
 
 def _ingest_requests(controller: Controller) -> None:
+    """Admit pending requests with one commit, then retire their inbox files."""
+
+    with group_commit(controller):
+        _admit_pending_requests(controller)
+
+
+def _admit_pending_requests(controller: Controller) -> None:
     known = controller.state["jobs"]
     next_order = max(
         int(controller.state.get("next_queue_order", 0)),
@@ -2320,7 +2342,14 @@ def _ingest_requests(controller: Controller) -> None:
     controller.state["next_queue_order"] = next_order
     for job, malformed_identity in staged:
         _admit_job(controller, job, prospective)
-        _finish_staged_request(controller, job, malformed_identity)
+    if staged:
+        # A request directory is the only full copy of its job until the
+        # admission event is durable; retire inbox entries only afterwards.
+        def finish_staged() -> None:
+            for job, malformed_identity in staged:
+                _finish_staged_request(controller, job, malformed_identity)
+
+        after_commit(controller, finish_staged)
 
 
 def _workflow_groups(
@@ -2368,6 +2397,11 @@ def _workflow_groups(
 def _refresh_dependencies(controller: Controller) -> None:
     """Refresh dirty workflows, including terminal dependency cascades."""
 
+    with group_commit(controller):
+        _refresh_dirty_workflows(controller)
+
+
+def _refresh_dirty_workflows(controller: Controller) -> None:
     jobs = controller.state["jobs"]
     workflows, blocked_by_workflow, signatures = _workflow_groups(jobs)
     previous = controller.workflow_signatures
@@ -2480,130 +2514,166 @@ def _finish_missing_cancel(controller: Controller, command: dict[str, Any], job_
     return True
 
 
-def _ingest_commands(controller: Controller) -> None:
-    for source, command in list_commands(controller.root):
-        deferred = False
-        kind = command.get("kind")
-        if kind == "cancel":
-            job_id = str(command.get("job_id"))
-            job = controller.state["jobs"].get(job_id)
-            if job is None:
-                # Submit returns only after its request is durable. If command
-                # ingestion won a polling race, retain the cancel for next tick.
-                deferred = not _finish_missing_cancel(controller, command, job_id)
-            elif not request_cancellation(controller, job, str(command.get("request_id") or "")):
-                emit(
-                    controller,
-                    "job.cancel_ignored",
-                    data={
-                        "request_id": command.get("request_id"),
-                        "job_id": job_id,
-                        "reason": f"job_is_{job['state']}",
-                    },
-                )
-        elif kind == "drain":
-            data = {"request_id": command.get("request_id")}
-            if controller.state["draining"]:
-                emit(
-                    controller,
-                    "allocation.drain_ignored",
-                    data={**data, "reason": "already_draining"},
-                )
-            else:
-                controller.state["draining"] = True
-                controller.state["drain_requested"] = True
-                controller.state["allocation"]["state"] = "draining"
-                emit(controller, "allocation.draining", data=data)
-        elif kind == "resume":
-            data = {"request_id": command.get("request_id")}
-            was_draining = bool(controller.state["draining"])
-            if not was_draining and not controller.state.get("launches_paused", False):
-                emit(
-                    controller,
-                    "allocation.resume_ignored",
-                    data={**data, "reason": "launches_not_paused"},
-                )
-            else:
-                controller.state["draining"] = False
-                controller.state["drain_requested"] = False
-                controller.state["launches_paused"] = False
-                controller.state["allocation"]["state"] = "running"
-                emit(
-                    controller,
-                    "allocation.launches_resumed",
-                    data={**data, "cleared_drain": was_draining},
-                )
-        elif kind == "evacuate":
-            try:
-                _begin_evacuation(controller, command)
-            except (KeyError, StorageError, TypeError, ValueError) as exc:
-                emit(
-                    controller,
-                    "command.rejected",
-                    data={
-                        "request_id": command.get("request_id"),
-                        "reason": str(exc),
-                    },
-                )
-        elif kind in {"evacuate_cancel", "evacuate-cancel"}:
-            try:
-                _evacuation_cancel(controller, command)
-            except (StorageError, TypeError, ValueError) as exc:
-                emit(
-                    controller,
-                    "command.rejected",
-                    data={
-                        "request_id": command.get("request_id"),
-                        "evacuation_request_id": command.get("evacuation_request_id"),
-                        "reason": str(exc),
-                    },
-                )
-        elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
-            request_id = command.get("request_id")
-            try:
-                node = str(command.get("node") or "")
-                uuid = str(command.get("uuid") or "")
-                at = utc_now()
-                if kind == "gpu.reprobe":
-                    transition = reprobe_quarantine(
-                        controller.state["gpu_health"],
-                        node=node,
-                        uuid=uuid,
-                        at=at,
-                    )
-                else:
-                    transition = set_quarantine(
-                        controller.state["gpu_health"],
-                        node=node,
-                        uuid=uuid,
-                        quarantined=kind == "gpu.quarantine",
-                        at=at,
-                        reason=(
-                            str(command["reason"])
-                            if isinstance(command.get("reason"), str)
-                            else None
-                        ),
-                    )
-            except HealthError as exc:
-                emit(
-                    controller,
-                    "command.rejected",
-                    data={"request_id": request_id, "reason": str(exc)},
-                )
-            else:
-                _emit_gpu_health(controller, [transition], request_id=request_id)
+def _ingest_commands(
+    controller: Controller, limit: int = MAX_COMMANDS_PER_TICK
+) -> None:
+    """Apply a bounded batch of commands and persist their effects once.
+
+    Every command's transitions are emitted inside one group commit. A command
+    file is acknowledged (immutable receipt, then removal) only after the
+    journal and snapshot containing its effect are durable, so a crash at any
+    point either replays the outcome from the journal or retries the command.
+    """
+
+    handled: list[tuple[Path, dict[str, Any]]] = []
+    stops: list[RunningProcess] = []
+    with group_commit(controller):
+        for source in command_sources(controller.root)[:limit]:
+            command = read_json(source)
+            if _apply_command(controller, command, stops):
+                handled.append((source, command))
+        if stops:
+            # Cancelling transitions are durable before any launcher sees them.
+            ensure_committed(controller)
+            for running in stops:
+                stop_launcher(controller, running)
+        if handled:
+            after_commit(
+                controller, lambda: acknowledge_commands(controller.root, handled)
+            )
+
+
+def _apply_command(
+    controller: Controller,
+    command: dict[str, Any],
+    stops: list[RunningProcess],
+) -> bool:
+    """Apply one command's transitions; return false to retry it next tick."""
+
+    kind = command.get("kind")
+    if kind == "cancel":
+        job_id = str(command.get("job_id"))
+        job = controller.state["jobs"].get(job_id)
+        if job is None:
+            # Submit returns only after its request is durable. If command
+            # ingestion won a polling race, retain the cancel for next tick.
+            return _finish_missing_cancel(controller, command, job_id)
+        if not request_cancellation(
+            controller,
+            job,
+            str(command.get("request_id") or ""),
+            deferred_stops=stops,
+        ):
+            emit(
+                controller,
+                "job.cancel_ignored",
+                data={
+                    "request_id": command.get("request_id"),
+                    "job_id": job_id,
+                    "reason": f"job_is_{job['state']}",
+                },
+            )
+    elif kind == "drain":
+        data = {"request_id": command.get("request_id")}
+        if controller.state["draining"]:
+            emit(
+                controller,
+                "allocation.drain_ignored",
+                data={**data, "reason": "already_draining"},
+            )
         else:
+            controller.state["draining"] = True
+            controller.state["drain_requested"] = True
+            controller.state["allocation"]["state"] = "draining"
+            emit(controller, "allocation.draining", data=data)
+    elif kind == "resume":
+        data = {"request_id": command.get("request_id")}
+        was_draining = bool(controller.state["draining"])
+        if not was_draining and not controller.state.get("launches_paused", False):
+            emit(
+                controller,
+                "allocation.resume_ignored",
+                data={**data, "reason": "launches_not_paused"},
+            )
+        else:
+            controller.state["draining"] = False
+            controller.state["drain_requested"] = False
+            controller.state["launches_paused"] = False
+            controller.state["allocation"]["state"] = "running"
+            emit(
+                controller,
+                "allocation.launches_resumed",
+                data={**data, "cleared_drain": was_draining},
+            )
+    elif kind == "evacuate":
+        try:
+            _begin_evacuation(controller, command)
+        except (KeyError, StorageError, TypeError, ValueError) as exc:
             emit(
                 controller,
                 "command.rejected",
                 data={
                     "request_id": command.get("request_id"),
-                    "reason": f"unknown_command:{kind}",
+                    "reason": str(exc),
                 },
             )
-        if not deferred:
-            record_command_receipt(controller.root, command)
-            remove_command(source)
+    elif kind in {"evacuate_cancel", "evacuate-cancel"}:
+        try:
+            _evacuation_cancel(controller, command)
+        except (StorageError, TypeError, ValueError) as exc:
+            emit(
+                controller,
+                "command.rejected",
+                data={
+                    "request_id": command.get("request_id"),
+                    "evacuation_request_id": command.get("evacuation_request_id"),
+                    "reason": str(exc),
+                },
+            )
+    elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
+        request_id = command.get("request_id")
+        try:
+            node = str(command.get("node") or "")
+            uuid = str(command.get("uuid") or "")
+            at = utc_now()
+            if kind == "gpu.reprobe":
+                transition = reprobe_quarantine(
+                    controller.state["gpu_health"],
+                    node=node,
+                    uuid=uuid,
+                    at=at,
+                )
+            else:
+                transition = set_quarantine(
+                    controller.state["gpu_health"],
+                    node=node,
+                    uuid=uuid,
+                    quarantined=kind == "gpu.quarantine",
+                    at=at,
+                    reason=(
+                        str(command["reason"])
+                        if isinstance(command.get("reason"), str)
+                        else None
+                    ),
+                )
+        except HealthError as exc:
+            emit(
+                controller,
+                "command.rejected",
+                data={"request_id": request_id, "reason": str(exc)},
+            )
+        else:
+            _emit_gpu_health(controller, [transition], request_id=request_id)
+    else:
+        emit(
+            controller,
+            "command.rejected",
+            data={
+                "request_id": command.get("request_id"),
+                "reason": f"unknown_command:{kind}",
+            },
+        )
+    return True
 
 
 def _discard_journaled_reports(controller: Controller) -> None:
@@ -2768,8 +2838,13 @@ def _report_batch(controller: Controller, limit: int) -> list[tuple[Path, object
 
 
 def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -> None:
-    """Validate and commit one bounded report batch with one state rewrite."""
+    """Validate one bounded report batch and acknowledge it after its commit."""
 
+    with group_commit(controller):
+        _apply_report_batch(controller, limit)
+
+
+def _apply_report_batch(controller: Controller, limit: int) -> None:
     acknowledged: list[tuple[Path, str | None]] = []
     new_report_ids: list[str] = []
     for source, document in _report_batch(controller, limit):
@@ -2906,17 +2981,23 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
     # the immutable report receipt becomes visible to the producer.
     _activate_armed_evacuation(controller)
     _advance_evacuation(controller)
+
+    def acknowledge() -> None:
+        accept_reports(
+            acknowledged,
+            generation=int(controller.state.get("journal_generation", 0)),
+        )
+        report_acks = controller.state.setdefault("report_acks", {})
+        for report_id in new_report_ids:
+            report_acks.pop(report_id, None)
+
     if new_report_ids:
         # The inbox is acknowledged only after both the ordered events and
         # their cumulative workload projection are durable.
-        commit_snapshot(controller)
-    accept_reports(
-        acknowledged,
-        generation=int(controller.state.get("journal_generation", 0)),
-    )
-    report_acks = controller.state.setdefault("report_acks", {})
-    for report_id in new_report_ids:
-        report_acks.pop(report_id, None)
+        after_commit(controller, acknowledge)
+    else:
+        # Only stale copies of already-receipted reports: nothing to commit.
+        acknowledge()
 
 
 def _heartbeat(controller: Controller) -> None:
@@ -3267,22 +3348,27 @@ def _serve(controller: Controller) -> None:
     previous_int = signal.signal(signal.SIGINT, stop)
     try:
         while True:
-            _ingest_requests(controller)
-            _ingest_commands(controller)
-            _drain_for_deadline(controller)
-            _evacuate_for_deadline(controller)
-            _advance_evacuation(controller)
-            drain_messages(controller)
-            poll_processes(controller)
-            _maintain_health_monitor(controller)
-            _ingest_gpu_health(controller)
-            _ingest_reports(controller)
-            # Replay can restore an armed operation and its exact publication
-            # evidence without another report file being present.
-            _activate_armed_evacuation(controller)
-            _advance_evacuation(controller)
-            _refresh_dependencies(controller)
-            compact_journal(controller)
+            # One poll iteration is one group commit: every transition below
+            # is journaled without a sync, then published by one journal sync
+            # and one snapshot replacement before any inbox item is
+            # acknowledged. Launch decisions follow the commit.
+            with group_commit(controller):
+                _ingest_requests(controller)
+                _ingest_commands(controller)
+                _drain_for_deadline(controller)
+                _evacuate_for_deadline(controller)
+                _advance_evacuation(controller)
+                drain_messages(controller)
+                poll_processes(controller)
+                _maintain_health_monitor(controller)
+                _ingest_gpu_health(controller)
+                _ingest_reports(controller)
+                # Replay can restore an armed operation and its exact
+                # publication evidence without another report file.
+                _activate_armed_evacuation(controller)
+                _advance_evacuation(controller)
+                _refresh_dependencies(controller)
+                compact_journal(controller)
             if controller.stopping:
                 begin_shutdown(controller)
                 _stop_health_monitor(controller)

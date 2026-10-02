@@ -1366,6 +1366,7 @@ class SlurmLaunchTests(unittest.TestCase):
                     side_effect=write_launch,
                 ),
                 mock.patch("scruffy.lifecycle.emit"),
+                mock.patch("scruffy.lifecycle.ensure_committed"),
                 mock.patch("scruffy.lifecycle.atomic_write_json") as write,
                 mock.patch(
                     "scruffy.lifecycle._launch_arguments",

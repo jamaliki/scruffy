@@ -172,6 +172,10 @@ agents; reading does not consume events for anyone else. Use
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.
+- Each controller poll iteration is one group commit: admissions, up to 512
+  commands, and the transitions they cause share one journal sync and one
+  snapshot replacement. Inbox files are retired only after that commit, so
+  command outcomes become visible within one tick of being applied.
 - A typed artifact publication contains a stable artifact ID, absolute immutable
   path, size, SHA256, and ready-manifest path. Generic workload strings never
   release conditions, and the controller never polls artifact storage.
