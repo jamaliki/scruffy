@@ -112,6 +112,9 @@ class Controller:
     slurm_query_error: str | None = None
     report_cursor: str | None = None
     workflow_signatures: dict[tuple[str, str], tuple[tuple[str, object], ...]] | None = None
+    # Wall-clock times at which a workflow must be re-resolved even without a
+    # state change, such as when an artifact producer's settling time ends.
+    workflow_recheck_at: dict[tuple[str, str], float] = field(default_factory=dict)
     gpu_health_mode: str = "off"
     gpu_isolation: str = "gpu"
     legacy_report_projects: tuple[str, ...] = ()

@@ -639,9 +639,18 @@ both `wait_for` and `needs` when it also requires successful producer exit. Only
 a strict typed publication from the named task satisfies the condition; ordinary
 artifact messages remain observations. Satisfaction is journaled on the
 consumer with the exact producer job, event, path, byte count, and SHA256, and
-therefore survives controller restarts and allocation handover. A terminal
-producer without matching evidence leaves the consumer safely blocked rather
-than racing a late report into `skipped`.
+therefore survives controller restarts and allocation handover.
+
+A producer that ends without publishing the awaited artifact (failed,
+cancelled, succeeded without it, or `lost` with a replaced allocation) releases
+its waiters as `skipped` with reason `condition_unsatisfied` once its result is
+final: 10 minutes after it finished and with an empty report inbox, so a
+publication spooled just before exit is never raced into a skip. A producer
+that never ran (`skipped` or `rejected`) is final at once, so a skip propagates
+through a whole chain in one pass. A pending automatic retry (a `lost` task
+whose recovery policy will admit a successor, or an evacuated target still
+being recovered) keeps waiters blocked, as does a producer task that has not
+been submitted yet. The blocker records the producer's terminal state.
 
 ## Workload progress and output
 

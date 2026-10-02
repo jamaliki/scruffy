@@ -114,6 +114,7 @@ from .storage import (
     remove_command,
     remove_stale_state_temporaries,
     report_identity_digest,
+    report_inbox_pending,
     report_streams,
     report_was_accepted,
     request_pending,
@@ -140,6 +141,13 @@ MAX_COMMANDS_PER_TICK = 512
 # over thousands of jobs advances over several ticks, one commit per tick.
 MAX_BULK_CANCELS_PER_TICK = 512
 MAX_REPORTED_UNKNOWN_JOB_IDS = 20
+# Skips write immutable result records; a backlog drains over several ticks.
+MAX_DEPENDENCY_SKIPS_PER_TICK = 512
+# A producer's publication may be spooled just before it exits and become
+# visible to the controller later on a shared filesystem. Its artifact
+# waiters are skipped only after this settling time and an empty inbox.
+ARTIFACT_SKIP_GRACE_SECONDS = 600
+REPORT_INBOX_RECHECK_SECONDS = 5
 STORAGE_RETRY_SECONDS = 5
 COMMAND_OUTCOME_KINDS = {
     "jobs.cancel_completed",
@@ -2407,10 +2415,104 @@ def _refresh_dependencies(controller: Controller) -> None:
         _refresh_dirty_workflows(controller)
 
 
+def _retry_pending(controller: Controller, producer: dict[str, Any]) -> bool:
+    """Return whether a terminal attempt still expects a deterministic retry."""
+
+    if producer.get("successor_job_id") is not None:
+        return False
+    reason = producer.get("reason")
+    if not isinstance(reason, str) or _recovery_candidate(producer, reason) is None:
+        return False
+    if reason in AUTO_RECOVERY_REASONS:
+        # Admitted by the next controller start in this or a later allocation.
+        return True
+    evacuation = controller.state.get("evacuation")
+    return (
+        reason == "evacuated"
+        and isinstance(evacuation, dict)
+        and evacuation.get("state") not in {"complete", "partial", "cancelled"}
+        and producer.get("id") in (evacuation.get("targets") or {})
+    )
+
+
+def _final_artifact_producers(
+    controller: Controller,
+    resolution_jobs: list[dict[str, Any]],
+    blocked_jobs: list[dict[str, Any]],
+    now: float,
+) -> tuple[set[str], float | None]:
+    """Find terminal producers whose awaited publications can no longer arrive.
+
+    A producer that never ran (skipped or rejected) is final at once. Any
+    other terminal producer is final only when no deterministic retry is due,
+    its report inbox is empty, and ``ARTIFACT_SKIP_GRACE_SECONDS`` have passed
+    since it finished, which covers a publication spooled just before exit
+    that the shared filesystem has not shown the controller yet. Also return
+    the earliest wall-clock time at which a pending producer should be
+    re-examined.
+    """
+
+    selected = select_task_attempts(resolution_jobs)
+    final: set[str] = set()
+    recheck_at: float | None = None
+    examined: set[str] = set()
+    for job in blocked_jobs:
+        satisfied = {
+            (item.get("task_id"), item.get("artifact_id"))
+            for item in job.get("condition_satisfactions") or []
+            if isinstance(item, dict)
+        }
+        for task_id, artifact_id in artifact_conditions(job):
+            if (task_id, artifact_id) in satisfied:
+                continue
+            producer = selected.get((job_project(job), str(job["workflow_id"]), task_id))
+            producer_id = producer.get("id") if producer is not None else None
+            if (
+                producer is None
+                or not isinstance(producer_id, str)
+                or producer_id in examined
+                or producer.get("state") not in TERMINAL_JOB_STATES
+            ):
+                continue
+            examined.add(producer_id)
+            if producer.get("state") in {"skipped", "rejected"}:
+                final.add(producer_id)
+                continue
+            if _retry_pending(controller, producer):
+                continue
+            finished = _wall_time(producer.get("finished_at") or producer.get("submitted_at"))
+            settles_at = (finished or 0.0) + ARTIFACT_SKIP_GRACE_SECONDS
+            if settles_at > now:
+                recheck_at = settles_at if recheck_at is None else min(recheck_at, settles_at)
+                continue
+            if report_inbox_pending(controller.root, producer_id):
+                retry = now + REPORT_INBOX_RECHECK_SECONDS
+                recheck_at = retry if recheck_at is None else min(recheck_at, retry)
+                continue
+            final.add(producer_id)
+    return final, recheck_at
+
+
+def _wall_time(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
 def _refresh_dirty_workflows(controller: Controller) -> None:
     jobs = controller.state["jobs"]
     workflows, blocked_by_workflow, signatures = _workflow_groups(jobs)
     previous = controller.workflow_signatures
+    now = time.time()
+    recheck = controller.workflow_recheck_at
+    for workflow_key in [key for key in recheck if key not in signatures]:
+        del recheck[workflow_key]
     dirty = (
         list(signatures)
         if previous is None
@@ -2418,21 +2520,29 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
             workflow_key
             for workflow_key, signature in signatures.items()
             if previous.get(workflow_key) != signature
+            or recheck.get(workflow_key, now + 1) <= now
         ]
     )
     if not dirty:
         controller.workflow_signatures = signatures
         return
 
-    retry_invalid: set[tuple[str, str]] = set()
-    for workflow_key in dirty:
+    uncached: set[tuple[str, str]] = set()
+    # Each skip writes an immutable result record; bound one tick's work so a
+    # backlog of thousands of stale waits drains over several short ticks.
+    budget = MAX_DEPENDENCY_SKIPS_PER_TICK
+    for index, workflow_key in enumerate(dirty):
+        if budget <= 0:
+            uncached.update(dirty[index:])
+            break
+        recheck.pop(workflow_key, None)
         project_id, workflow_id = workflow_key
         blocked_jobs = blocked_by_workflow.get(workflow_key, [])
         if not blocked_jobs:
             continue
         archived = _archived_workflow_jobs(controller, project_id, workflow_id)
         if archived is None:
-            retry_invalid.add(workflow_key)
+            uncached.add(workflow_key)
             continue
         try:
             resolution_jobs = _resolution_workflow_jobs(
@@ -2443,7 +2553,12 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
                 project_id,
                 workflow_id,
             )
-            resolutions = resolve_blocked_jobs(resolution_jobs)
+            final_producers, recheck_at = _final_artifact_producers(
+                controller, resolution_jobs, blocked_jobs, now
+            )
+            resolutions = resolve_blocked_jobs(
+                resolution_jobs, final_producers=final_producers
+            )
         except WorkflowError as exc:
             # Repair invalid persisted graphs one task at a time. Leaving the
             # cache dirty retries the remaining graph on the next tick.
@@ -2451,8 +2566,10 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
             _mark_workflow_rejected(job, exc)
             write_result_record(controller.root, job)
             emit(controller, "job.rejected", job=job)
-            retry_invalid.add(workflow_key)
+            uncached.add(workflow_key)
             continue
+        if recheck_at is not None:
+            recheck[workflow_key] = recheck_at
 
         jobs_by_key = {(project_id, workflow_id, job["task_id"]): job for job in blocked_jobs}
         # The batch resolver returns topological order, so predicted upstream
@@ -2461,6 +2578,11 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
             job = jobs_by_key[key]
             blockers = resolution["blockers"]
             decision = resolution["decision"]
+            if decision == "skipped" and budget <= 0:
+                # Later resolutions may assume this skip; stop the workflow
+                # here and finish it next tick.
+                uncached.add(workflow_key)
+                break
             if decision == "ready":
                 job["dependency_gate_passed"] = True
                 job["state"] = "queued"
@@ -2470,6 +2592,7 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
                 job["resolved_conditions"] = _resolved_condition_evidence(job)
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
+                budget -= 1
                 job["dependency_gate_passed"] = True
                 job["state"] = "skipped"
                 job["finished_at"] = utc_now()
@@ -2486,7 +2609,7 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
     controller.workflow_signatures = {
         workflow_key: signature
         for workflow_key, signature in current.items()
-        if workflow_key not in retry_invalid
+        if workflow_key not in uncached
     }
 
 

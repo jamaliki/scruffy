@@ -135,7 +135,10 @@ agents; reading does not consume events for anyone else. Use
 - The snapshot is authoritative. Never infer lifecycle success or failure from
   stdout, stderr, or a workload annotation.
 - `blocked` means an upstream task is missing or unfinished. `skipped` is
-  terminal and means a required successful dependency ended unsuccessfully.
+  terminal and means a required successful dependency ended unsuccessfully
+  (`dependency_unsatisfied`) or an awaited artifact's producer ended without
+  publishing it and cannot retry (`condition_unsatisfied`, after a 10-minute
+  settling time). Resubmit skipped work with a new `request_id`.
 - Match asynchronous cancel and drain outcomes using the returned `request_id`.
   `drain` survives controller restarts and disables launches until the outer
   allocation is replaced or an operator explicitly runs `scruffy resume`.

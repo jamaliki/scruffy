@@ -979,6 +979,19 @@ def report_streams(
     ]
 
 
+def report_inbox_pending(root: Path, job_id: str) -> bool:
+    """Return whether a job has spooled reports the controller has not read."""
+
+    try:
+        with os.scandir(root / "reports" / job_id) as entries:
+            return any(
+                not entry.name.startswith(".") and entry.name.endswith(".json")
+                for entry in entries
+            )
+    except FileNotFoundError:
+        return False
+
+
 def accept_reports(
     reports: Sequence[tuple[Path, str | None]], *, generation: int = 0
 ) -> None:

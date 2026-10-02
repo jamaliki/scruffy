@@ -9,7 +9,7 @@ placement; callers remain responsible for applying the returned decisions.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 
 from .models import TERMINAL_JOB_STATES, job_project
 
@@ -376,12 +376,16 @@ def select_task_attempts(jobs: Iterable[Job]) -> dict[TaskKey, Job]:
     return selected
 
 
+UNSATISFIED_REASONS = ("dependency_unsatisfied", "condition_unsatisfied")
+
+
 def _blockers(
     key: TaskKey,
     by_key: Mapping[TaskKey, Job],
     needs: Mapping[TaskKey, tuple[Need, ...]],
     conditions: Mapping[TaskKey, tuple[ArtifactCondition, ...]],
     states: Mapping[TaskKey, object] | None = None,
+    final_producers: Collection[object] = frozenset(),
 ) -> list[dict[str, object]]:
     project_id, workflow_id, _ = key
     blockers: list[dict[str, object]] = []
@@ -440,16 +444,22 @@ def _blockers(
             )
             continue
         state = dependency.get("state") if states is None else states[dependency_key]
+        # Publication may be durably spooled immediately before a producer
+        # exits and become visible on a later controller tick. A terminal
+        # producer therefore stays pending until the caller declares its
+        # result final (no publication can still arrive and no retry is due).
+        final = (
+            isinstance(state, str)
+            and state in TERMINAL_JOB_STATES
+            and dependency.get("id") in final_producers
+        )
         blockers.append(
             {
                 "kind": "artifact",
                 "task_id": task_id,
                 "artifact_id": artifact_id,
                 "state": state,
-                # Publication may be durably spooled immediately before a
-                # producer exits and become visible on a later controller
-                # tick. Never turn that observation race into a skipped job.
-                "reason": "condition_pending",
+                "reason": "condition_unsatisfied" if final else "condition_pending",
             }
         )
     return blockers
@@ -480,16 +490,18 @@ def _resolution(
     needs: Mapping[TaskKey, tuple[Need, ...]],
     conditions: Mapping[TaskKey, tuple[ArtifactCondition, ...]],
     states: Mapping[TaskKey, object] | None = None,
+    final_producers: Collection[object] = frozenset(),
 ) -> dict[str, object]:
     blockers = (
-        [] if key is None else _blockers(key, by_key, needs, conditions, states)
+        []
+        if key is None
+        else _blockers(key, by_key, needs, conditions, states, final_producers)
     )
-    unsatisfied = any(
-        blocker["reason"] == "dependency_unsatisfied" for blocker in blockers
-    )
+    reasons = {blocker["reason"] for blocker in blockers}
+    unsatisfied = [reason for reason in UNSATISFIED_REASONS if reason in reasons]
     if unsatisfied:
         decision = "skipped"
-        reason: str | None = "dependency_unsatisfied"
+        reason: str | None = unsatisfied[0]
     elif blockers:
         decision = "blocked"
         reason = None
@@ -499,21 +511,32 @@ def _resolution(
     return {"decision": decision, "reason": reason, "blockers": blockers}
 
 
-def resolve_blocked_jobs(jobs: Iterable[Job]) -> dict[TaskKey, dict[str, object]]:
-    """Resolve all blocked tasks to a fixed point from one graph build."""
+def resolve_blocked_jobs(
+    jobs: Iterable[Job], *, final_producers: Collection[object] = frozenset()
+) -> dict[TaskKey, dict[str, object]]:
+    """Resolve all blocked tasks to a fixed point from one graph build.
+
+    ``final_producers`` names terminal producer job IDs whose missing artifact
+    publications can no longer arrive; artifact waits on them become
+    ``condition_unsatisfied``. A task skipped in this pass never ran, so it is
+    final for its own artifact waiters, which lets a skip propagate through a
+    whole chain in one call.
+    """
 
     by_key, needs, conditions, order = _validated_graph(jobs)
     states = {key: job.get("state") for key, job in by_key.items()}
+    final = set(final_producers)
     resolutions: dict[TaskKey, dict[str, object]] = {}
     for key in order:
         if states[key] != "blocked":
             continue
-        resolution = _resolution(key, by_key, needs, conditions, states)
+        resolution = _resolution(key, by_key, needs, conditions, states, final)
         resolutions[key] = resolution
         if resolution["decision"] == "ready":
             states[key] = "queued"
         elif resolution["decision"] == "skipped":
             states[key] = "skipped"
+            final.add(by_key[key].get("id"))
     return resolutions
 
 

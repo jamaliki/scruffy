@@ -73,7 +73,7 @@ allocation-wide when no project is selected.
 | `cancelled` | Cancellation completed | no | yes |
 | `lost` | Allocation or controller ended with unresolved work | no | yes |
 | `rejected` | Request or workflow could not be admitted | no | yes |
-| `skipped` | A `succeeded` dependency ended unsuccessfully | no | yes |
+| `skipped` | A `succeeded` dependency ended unsuccessfully, or an awaited artifact can no longer be published | no | yes |
 
 Never infer a terminal result from output text or workload progress.
 
@@ -259,7 +259,15 @@ resolve inside that project. Task IDs cannot contain `:`. A succeeded task
 identity remains unique for the workflow and project. A terminal non-success attempt (`failed`, `cancelled`, `lost`,
 `rejected`, or `skipped`) may be replaced by a new job using the same
 `workflow_id` and `task_id` with a new `request_id`. Resolution and explanation
-use the newest valid attempt. Scruffy does not retry skipped dependants
+use the newest valid attempt.
+
+A skipped job's `reason` is `dependency_unsatisfied` when a `succeeded`
+dependency ended unsuccessfully, or `condition_unsatisfied` when the newest
+attempt of an artifact producer ended without the awaited typed publication
+and that result is final: no automatic retry is due, its report inbox is
+empty, and 10 minutes have passed since it finished (immediately when the
+producer itself never ran). Until then the blocker keeps reason
+`condition_pending` with the producer's terminal state. Scruffy does not retry skipped dependants
 automatically; submit their next attempts explicitly. Workflow tasks may opt
 into the strict recovery object below; its `max_attempts` includes the first
 attempt and is capped at 10:
