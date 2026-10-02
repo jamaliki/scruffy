@@ -308,6 +308,22 @@ def _replayable_result(
     return None
 
 
+def record_terminal_result(controller: Controller, job: dict[str, Any]) -> None:
+    """Persist a terminal job's immutable result, adopting one left by a crash.
+
+    The result record is written before its lifecycle event becomes durable.
+    If a controller stopped in between, the job is resolved again on restart
+    with a new timestamp; the existing record is then the authority for the
+    terminal fields instead of a conflicting second record.
+    """
+
+    prior = _replayable_result(controller, job)
+    if prior is not None:
+        _apply_result_record(job, prior)
+        return
+    write_result_record(controller.root, job)
+
+
 def _apply_result_record(job: dict[str, Any], record: Mapping[str, Any]) -> None:
     """Restore terminal fields from a result written before its lifecycle event."""
 

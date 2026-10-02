@@ -33,6 +33,7 @@ from .lifecycle import (
     begin_shutdown,
     drain_messages,
     poll_processes,
+    record_terminal_result,
     remaining_time_limit,
     request_cancellation,
     schedule,
@@ -702,7 +703,8 @@ def _admit_recovery_successor(
     event_kind = _initial_job_event(controller, successor, prospective)
     write_request_record(controller.root, successor)
     if successor.get("state") in TERMINAL_JOB_STATES:
-        write_result_record(controller.root, successor)
+        record_terminal_result(controller, successor)
+        event_kind = f"job.{successor['state']}"
     controller.state["jobs"][successor_id] = successor
     emit(
         controller,
@@ -2055,7 +2057,8 @@ def _admit_job(
     if all(key in job for key in ("argv", "cwd", "env", "request")):
         write_request_record(controller.root, job)
     if job.get("state") in TERMINAL_JOB_STATES:
-        write_result_record(controller.root, job)
+        record_terminal_result(controller, job)
+        event_kind = f"job.{job['state']}"
     controller.state["jobs"][job["id"]] = job
     emit(controller, event_kind, job=job)
 
@@ -2242,10 +2245,11 @@ def _admit_atomic_submission(
 
     complete = {**prospective, **{job["id"]: job for job in jobs}}
     events = [_initial_job_event(controller, job, complete) for job in jobs]
-    for job in jobs:
+    for index, job in enumerate(jobs):
         write_request_record(controller.root, job)
         if job.get("state") in TERMINAL_JOB_STATES:
-            write_result_record(controller.root, job)
+            record_terminal_result(controller, job)
+            events[index] = f"job.{job['state']}"
     controller.state["jobs"].update({job["id"]: job for job in jobs})
     controller.state["next_queue_order"] = next_order + len(jobs)
     emit_submission(controller, submission_id, jobs)
@@ -2569,8 +2573,8 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
             # cache dirty retries the remaining graph on the next tick.
             job = blocked_jobs[0]
             _mark_workflow_rejected(job, exc)
-            write_result_record(controller.root, job)
-            emit(controller, "job.rejected", job=job)
+            record_terminal_result(controller, job)
+            emit(controller, f"job.{job['state']}", job=job)
             uncached.add(workflow_key)
             continue
         if recheck_at is not None:
@@ -2603,8 +2607,8 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
                 job["finished_at"] = utc_now()
                 job["reason"] = resolution["reason"]
                 job["blockers"] = blockers
-                write_result_record(controller.root, job)
-                emit(controller, "job.skipped", job=job)
+                record_terminal_result(controller, job)
+                emit(controller, f"job.{job['state']}", job=job)
             elif blockers != job.get("blockers"):
                 job["blockers"] = blockers
 

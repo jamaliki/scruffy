@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 import unittest
@@ -356,6 +357,84 @@ class GroupCommitTests(unittest.TestCase):
                 self.assertEqual(0, write.call_count)
             self.assertEqual(1, write.call_count)
         self.assertFalse(controller.commit_pending)
+
+    def _failed_producer(self, controller: Controller) -> None:
+        producer = blocked_job("job-producer", 1)
+        producer.update(
+            {
+                "state": "failed",
+                "task_id": "train",
+                "needs": [],
+                "attempt": 1,
+                "finished_at": utc_now(),
+                "dependency_gate_passed": True,
+            }
+        )
+        controller.state["jobs"][producer["id"]] = producer
+
+    def _lose_unsynced_tail(self, controller: Controller, committed_size: int) -> None:
+        controller.journal.close()
+        with journal_path(self.root).open("r+b") as journal:
+            journal.truncate(committed_size)
+
+    def test_skip_replayed_after_a_lost_journal_tail_adopts_its_result(self) -> None:
+        controller = self._controller()
+        self._failed_producer(controller)
+        consumer = blocked_job("job-consumer", 2)
+        consumer.update({"needs": [{"task_id": "train", "condition": "succeeded"}], "attempt": 1})
+        controller.state["jobs"][consumer["id"]] = consumer
+        state_module.commit_snapshot(controller)
+        committed_size = journal_path(self.root).stat().st_size
+
+        with (
+            mock.patch("scruffy.state.sync_file", side_effect=OSError("EIO")),
+            self.assertRaises(OSError),
+        ):
+            controller_module._refresh_dependencies(controller)
+        recorded = json.loads(
+            (self.root / "provenance" / "job-consumer" / "result.json").read_text()
+        )
+        self._lose_unsynced_tail(controller, committed_size)
+
+        restarted = self._controller()
+        self.assertEqual("blocked", restarted.state["jobs"]["job-consumer"]["state"])
+        controller_module._refresh_dependencies(restarted)
+
+        job = load_state(self.root)["jobs"]["job-consumer"]
+        self.assertEqual("skipped", job["state"])
+        self.assertEqual(recorded["finished_at"], job["finished_at"])
+
+    def test_admission_replayed_after_a_lost_journal_tail_adopts_its_result(self) -> None:
+        controller = self._controller()
+        self._failed_producer(controller)
+        state_module.commit_snapshot(controller)
+        committed_size = journal_path(self.root).stat().st_size
+        consumer = submit_job(
+            self.root,
+            argv=["true"],
+            name="consumer",
+            cwd=Path.cwd(),
+            environment={},
+            request=REQUEST,
+            request_id="replay/consumer",
+            workflow_id="flow",
+            task_id="evaluate",
+            needs=({"task_id": "train", "condition": "succeeded"},),
+        )["job_id"]
+
+        with (
+            mock.patch("scruffy.state.sync_file", side_effect=OSError("EIO")),
+            self.assertRaises(OSError),
+        ):
+            _ingest_requests(controller)
+        self.assertTrue((self.root / "requests" / consumer).is_dir())
+        self._lose_unsynced_tail(controller, committed_size)
+
+        restarted = self._controller()
+        _ingest_requests(restarted)
+
+        self.assertEqual("skipped", load_state(self.root)["jobs"][consumer]["state"])
+        self.assertFalse((self.root / "requests" / consumer).exists())
 
     def test_replacement_recovery_publishes_one_snapshot(self) -> None:
         inventory = (NodeInventory("node", (0, 1, 2, 3), 8, 8),)
