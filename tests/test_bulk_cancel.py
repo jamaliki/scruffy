@@ -469,6 +469,19 @@ class BulkCancelControllerTests(unittest.TestCase):
             self._receipt_outcome("archived-midway")["counts"],
         )
 
+    def test_archive_read_errors_defer_instead_of_recording_unknown(self) -> None:
+        controller = self._controller()
+        self._seed(controller, job("known"))
+        cancel_jobs(self.root, job_ids=["known", "elsewhere"], request_id="flaky-read")
+        with mock.patch(
+            "scruffy.controller.find_archived_job", side_effect=OSError("ESTALE")
+        ):
+            _ingest_commands(controller)
+        self.assertEqual("blocked", controller.state["jobs"]["known"]["state"])
+        self.assertEqual(1, len(command_sources(self.root)))
+        _ingest_commands(controller)
+        self.assertEqual(1, self._receipt_outcome("flaky-read")["counts"]["unknown"])
+
     def test_named_job_awaiting_admission_defers_the_whole_command(self) -> None:
         controller = self._controller()
         self._seed(controller, job("known"))

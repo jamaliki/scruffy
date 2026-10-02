@@ -30,8 +30,11 @@ from scruffy.storage import (
     journal_path,
     load_state,
     read_events,
+    submission_identity_digest,
+    submit_submission,
     utc_now,
 )
+from scruffy.submissions import workflow_submission
 
 REQUEST = ResourceRequest(1, 1, 1, 1)
 INVENTORY = (NodeInventory("local", (0,), 2, 2),)
@@ -435,6 +438,43 @@ class GroupCommitTests(unittest.TestCase):
 
         self.assertEqual("skipped", load_state(self.root)["jobs"][consumer]["state"])
         self.assertFalse((self.root / "requests" / consumer).exists())
+
+    def test_rejected_workflow_envelope_is_retired_after_its_commit(self) -> None:
+        controller = self._controller()
+        document = workflow_submission(
+            request_id="bad-workflow",
+            workflow_id="bad",
+            tasks=[
+                {
+                    "task_id": "too-large",
+                    "argv": ["true"],
+                    "cwd": str(Path.cwd()),
+                    "resources": ResourceRequest(1, 1, 1, 1).to_dict(),
+                }
+            ],
+            project_id="default",
+            inventory=None,
+        )
+        document["jobs"][0]["resources"]["gpus_per_node"] = 99
+        document["identity_sha256"] = submission_identity_digest(document)
+        submit_submission(self.root, document)
+        envelope = self.root / "requests" / document["submission_id"]
+        observed: list[bool] = []
+        original_write = storage_module.write_state
+
+        def record_write(root: Path, state: dict[str, Any]) -> None:
+            observed.append(envelope.exists())
+            original_write(root, state)
+
+        with mock.patch("scruffy.state.write_state", side_effect=record_write):
+            _ingest_requests(controller)
+
+        self.assertEqual([True], observed)
+        self.assertFalse(envelope.exists())
+        rejected = [
+            event for event in read_events(self.root) if event["kind"] == "submission.rejected"
+        ]
+        self.assertEqual(document["submission_id"], rejected[0]["data"]["submission_id"])
 
     def test_replacement_recovery_publishes_one_snapshot(self) -> None:
         inventory = (NodeInventory("node", (0, 1, 2, 3), 8, 8),)

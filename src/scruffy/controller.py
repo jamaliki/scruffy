@@ -2240,7 +2240,12 @@ def _admit_atomic_submission(
                 "reason": str(exc),
             },
         )
-        _finish_atomic_submission(controller, submission_id, document)
+        # Retire the envelope (and burn its IDs) only once the rejection,
+        # the only record of why, is durable.
+        after_commit(
+            controller,
+            lambda: _finish_atomic_submission(controller, submission_id, document),
+        )
         return next_order
 
     complete = {**prospective, **{job["id"]: job for job in jobs}}
@@ -2314,16 +2319,21 @@ def _admit_pending_requests(controller: Controller) -> None:
             continue
         if document is None:
             # Decodable corruption is a permanent verdict; transient reads do
-            # not appear in list_submissions and are retried next tick.
-            try:
-                reject_request(controller.root, submission_id)
-                emit(
-                    controller,
-                    "submission.rejected",
-                    data={"submission_id": submission_id, "reason": "invalid document"},
-                )
-            except (OSError, StorageError) as exc:
-                _storage_notice(controller, "reject_submission", submission_id, exc)
+            # not appear in list_submissions and are retried next tick. The
+            # envelope is retired only after its rejection is durable.
+            emit(
+                controller,
+                "submission.rejected",
+                data={"submission_id": submission_id, "reason": "invalid document"},
+            )
+
+            def reject_envelope(submission_id: str = submission_id) -> None:
+                try:
+                    reject_request(controller.root, submission_id)
+                except (OSError, StorageError) as exc:
+                    _storage_notice(controller, "reject_submission", submission_id, exc)
+
+            after_commit(controller, reject_envelope)
             continue
         specs = document.get("jobs")
         job_ids = (
@@ -2490,7 +2500,11 @@ def _final_artifact_producers(
             if _retry_pending(controller, producer):
                 continue
             finished = _wall_time(producer.get("finished_at") or producer.get("submitted_at"))
-            settles_at = (finished or 0.0) + ARTIFACT_SKIP_GRACE_SECONDS
+            if finished is None:
+                # Without a trustworthy end time the settling time cannot be
+                # proven; keep waiting (an operator can cancel explicitly).
+                continue
+            settles_at = finished + ARTIFACT_SKIP_GRACE_SECONDS
             if settles_at > now:
                 recheck_at = settles_at if recheck_at is None else min(recheck_at, settles_at)
                 continue
@@ -2728,9 +2742,11 @@ def _start_bulk_cancel(
         for job_id in missing:
             try:
                 archived = find_archived_job(controller.root, job_id)
-            except TransientStorageError:
+            except (OSError, TransientStorageError):
+                # The outcome is immutable; never record a read failure as
+                # an unknown job. Retry the whole command next tick.
                 return None
-            except (OSError, StorageError) as exc:
+            except StorageError as exc:
                 _storage_notice(controller, "read_archived_job", job_id, exc)
                 archived = None
             if archived is not None and selector_matches(archived, unscoped):

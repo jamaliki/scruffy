@@ -277,6 +277,13 @@ class AutomaticSkipControllerTests(unittest.TestCase):
         _refresh_dependencies(controller)
         self.assertEqual("skipped", self._state(controller, "c"))
 
+    def test_unparseable_finish_time_keeps_waiting(self) -> None:
+        broken = producer("p", finished_at="not-a-time", submitted_at="also-not")
+        controller = self._controller(broken, consumer("c"))
+        _refresh_dependencies(controller)
+        self.assertEqual("blocked", self._state(controller, "c"))
+        self.assertNotIn(("default", "flow"), controller.workflow_recheck_at)
+
     def test_missing_producer_still_waits(self) -> None:
         controller = self._controller(consumer("c"))
         _refresh_dependencies(controller)
