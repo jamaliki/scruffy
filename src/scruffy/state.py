@@ -573,58 +573,60 @@ def archive_terminal_jobs(
         archived.append(job)
     if not archived:
         return 0
-    counts: dict[str, int] = {}
-    project_counts: dict[str, dict[str, int]] = {}
-    for job in archived:
-        state_name = str(job.get("state", "unknown"))
-        counts[state_name] = counts.get(state_name, 0) + 1
-        per_project = project_counts.setdefault(job_project(job), {})
-        per_project[state_name] = per_project.get(state_name, 0) + 1
-    retained = list(controller.state.get("retained_log_jobs") or [])
-    added = [str(job["id"]) for job in archived if job.get("started_at")]
+    # Log retention is one global FIFO of [job_id, project_id] pairs.
+    retained = [list(entry) for entry in controller.state.get("retained_log_jobs") or []]
+    added = [[str(job["id"]), job_project(job)] for job in archived if job.get("started_at")]
     overflow = max(0, len(retained) + len(added) - max(max_retained_logs, 0))
     released = (retained + added)[:overflow]
-    record = {
-        "job_ids": [str(job["id"]) for job in archived],
-        "counts": counts,
-        "project_counts": project_counts,
-        "retained_logs": added,
-        "released_logs": released,
-    }
-    apply_archive_record(controller.state, record)
-    emit(controller, "jobs.archived", data=record)
+    # One record per project keeps job IDs inside their project's event scope.
+    projects = sorted({job_project(job) for job in archived} | {entry[1] for entry in released})
+    for project_id in projects:
+        project_jobs = [job for job in archived if job_project(job) == project_id]
+        counts: dict[str, int] = {}
+        for job in project_jobs:
+            state_name = str(job.get("state", "unknown"))
+            counts[state_name] = counts.get(state_name, 0) + 1
+        record = {
+            "project_id": project_id,
+            "job_ids": [str(job["id"]) for job in project_jobs],
+            "counts": counts,
+            "retained_logs": [entry[0] for entry in added if entry[1] == project_id],
+            "released_logs": [entry[0] for entry in released if entry[1] == project_id],
+        }
+        apply_archive_record(controller.state, record)
+        emit(controller, "jobs.archived", data=record)
     if released:
+        released_ids = [entry[0] for entry in released]
         after_commit(
-            controller, lambda: remove_job_directories(controller.root, released)
+            controller, lambda: remove_job_directories(controller.root, released_ids)
         )
     return len(archived)
 
 
 def apply_archive_record(state: dict[str, Any], record: dict[str, Any]) -> None:
-    """Apply one ``jobs.archived`` transition to a state image."""
+    """Apply one project's ``jobs.archived`` transition to a state image."""
 
+    project_id = record["project_id"]
     jobs = state.setdefault("jobs", {})
     for job_id in record.get("job_ids") or []:
         jobs.pop(job_id, None)
     archived_counts = state.setdefault("archived_counts", {})
+    project_counts = state.setdefault("archived_project_counts", {}).setdefault(
+        project_id, {}
+    )
     for name, count in (record.get("counts") or {}).items():
         archived_counts[name] = int(archived_counts.get(name, 0)) + int(count)
-    by_project = state.setdefault("archived_project_counts", {})
-    for project_id, per_state in (record.get("project_counts") or {}).items():
-        target = by_project.setdefault(project_id, {})
-        for name, count in per_state.items():
-            target[name] = int(target.get(name, 0)) + int(count)
+        project_counts[name] = int(project_counts.get(name, 0)) + int(count)
     state["archived_jobs"] = sum(int(count) for count in archived_counts.values())
     released = set(record.get("released_logs") or [])
-    retained = [
-        job_id
-        for job_id in [
+    state["retained_log_jobs"] = [
+        entry
+        for entry in [
             *(state.get("retained_log_jobs") or []),
-            *(record.get("retained_logs") or []),
+            *([job_id, project_id] for job_id in record.get("retained_logs") or []),
         ]
-        if job_id not in released
+        if entry[0] not in released
     ]
-    state["retained_log_jobs"] = retained
 
 
 def apply_bulk_event(state: dict[str, Any], kind: str, data: dict[str, Any]) -> None:
@@ -646,7 +648,10 @@ def apply_bulk_event(state: dict[str, Any], kind: str, data: dict[str, Any]) -> 
 def log_directories_to_keep(state: dict[str, Any]) -> set[str]:
     """Return job IDs whose log directories must survive cleanup."""
 
-    return {*state.get("jobs", {}), *(state.get("retained_log_jobs") or [])}
+    return {
+        *state.get("jobs", {}),
+        *(entry[0] for entry in state.get("retained_log_jobs") or []),
+    }
 
 
 def rotate_journal(controller: Controller) -> None:

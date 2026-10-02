@@ -174,7 +174,9 @@ class HotStateTests(unittest.TestCase):
         self.assertEqual(set(job_ids[50:]), {job["id"] for job in terminal})
         self.assertEqual({"succeeded": 50}, hot["archived_counts"])
         self.assertEqual({"succeeded": 50}, hot["archived_project_counts"]["koochak"])
-        self.assertEqual(job_ids[:50], hot["retained_log_jobs"])
+        self.assertEqual(
+            [[job_id, "koochak"] for job_id in job_ids[:50]], hot["retained_log_jobs"]
+        )
         archived = status(self.root, job_ids[0])
         self.assertTrue(archived["archived"])
         self.assertEqual("succeeded", archived["state"])
@@ -184,6 +186,30 @@ class HotStateTests(unittest.TestCase):
         self.assertEqual(["jobs.archived"], [event["kind"] for event in response["events"]])
         self.assertEqual(job_ids[:50], response["events"][0]["data"]["job_ids"])
         self.assertEqual(150, summary(self.root)["counts"]["succeeded"])
+
+    def test_archive_records_stay_inside_their_project(self) -> None:
+        controller = self._controller()
+        with group_commit(controller):
+            for index in range(6):
+                project_id = "alpha" if index % 2 else "beta"
+                job = image(
+                    f"job-{index}",
+                    "failed",
+                    index + 1,
+                    project_id=project_id,
+                    finished_seconds_ago=1000 - index,
+                )
+                controller.state["jobs"][job["id"]] = job
+                emit(controller, "job.failed", job=job)
+        cursor = observe(self.root)["next_cursor"]
+        with group_commit(controller):
+            compact_journal(controller, max_terminal_jobs=0, terminal_slack=0)
+
+        alpha = observe(self.root, after=cursor, project_id="alpha")["events"]
+        self.assertEqual(["jobs.archived"], [event["kind"] for event in alpha])
+        self.assertEqual(["job-1", "job-3", "job-5"], alpha[0]["data"]["job_ids"])
+        self.assertEqual({"failed": 3}, load_state(self.root)["archived_project_counts"]["beta"])
+        self.assertEqual({"failed": 6}, load_state(self.root)["archived_counts"])
 
     def test_archive_record_replays_once_after_a_lost_snapshot(self) -> None:
         controller = self._controller()
@@ -271,7 +297,10 @@ class HotStateTests(unittest.TestCase):
 
         def record(root: Path, released: list[str]) -> int:
             # Directories are released only after the retention list is durable.
-            self.assertEqual(job_ids[3:6], load_state(self.root)["retained_log_jobs"])
+            self.assertEqual(
+                [entry[0] for entry in load_state(self.root)["retained_log_jobs"]],
+                job_ids[3:6],
+            )
             removed.extend(released)
             return original(root, released)
 
@@ -283,7 +312,10 @@ class HotStateTests(unittest.TestCase):
                 controller, max_terminal_jobs=2, terminal_slack=0, max_retained_logs=3
             )
         # Jobs that never ran have no logs and never displace ones that did.
-        self.assertEqual(job_ids[3:6], controller.state["retained_log_jobs"])
+        self.assertEqual(
+            [[job_id, "koochak"] for job_id in job_ids[3:6]],
+            controller.state["retained_log_jobs"],
+        )
         self.assertEqual(job_ids[:3], removed)
         for job_id in job_ids[:3]:
             self.assertFalse((self.root / "jobs" / job_id).exists())
