@@ -22,6 +22,7 @@ from scruffy.controller import (
 )
 from scruffy.models import NodeInventory, ResourceRequest
 from scruffy.runtime import Controller, RunningProcess
+from scruffy.slurm import AllocationIncarnation
 from scruffy.state import emit, group_commit
 from scruffy.storage import (
     command_sources,
@@ -355,6 +356,72 @@ class GroupCommitTests(unittest.TestCase):
                 self.assertEqual(0, write.call_count)
             self.assertEqual(1, write.call_count)
         self.assertFalse(controller.commit_pending)
+
+    def test_replacement_recovery_publishes_one_snapshot(self) -> None:
+        inventory = (NodeInventory("node", (0, 1, 2, 3), 8, 8),)
+        old = AllocationIncarnation("old", 0, inventory)
+        new = AllocationIncarnation("new", 0, inventory)
+        policy = {
+            "max_attempts": 3,
+            "retry_on": ["allocation_replaced"],
+            "evacuation": {"signal": "USR1", "grace_seconds": 60},
+        }
+        jobs = {}
+        for index in range(4):
+            job_id = f"job-lost-{index}"
+            jobs[job_id] = {
+                **blocked_job(job_id, index + 1),
+                "state": "running",
+                "attempt": 1,
+                "task_id": f"train-{index}",
+                "recovery": policy,
+                "launch_token": f"token-{index}",
+                "assignment": {
+                    "job_id": job_id,
+                    "request": REQUEST.to_dict(),
+                    "reservations": [
+                        {"node": "node", "gpu_ids": [index], "cpus": 1, "memory_gb": 1}
+                    ],
+                },
+                "needs": [],
+            }
+        storage_module.write_state(
+            self.root,
+            {
+                "v": 1,
+                "queue_id": "queue",
+                "last_seq": 0,
+                "allocation": {"id": "old", "incarnation": old.to_dict()},
+                "nodes": {},
+                "jobs": jobs,
+                "next_queue_order": 4,
+                "draining": False,
+            },
+        )
+        with mock.patch(
+            "scruffy.state.write_state", wraps=state_module.write_state
+        ) as write:
+            controller = _initialize_controller(
+                root=self.root,
+                inventory=inventory,
+                launcher="slurm",
+                allocation_id="new",
+                slurm_job_id="new",
+                allocation_incarnation=new,
+                poll_interval=0.01,
+                cancel_grace=0,
+                start_paused=True,
+            )
+        self.addCleanup(lambda: controller.journal.close())
+
+        self.assertEqual(1, write.call_count)
+        persisted = load_state(self.root)["jobs"]
+        self.assertEqual(
+            {"lost"}, {persisted[job_id]["state"] for job_id in jobs}
+        )
+        successors = [job for job in persisted.values() if job.get("attempt") == 2]
+        self.assertEqual(4, len(successors))
+        self.assertTrue(load_state(self.root)["launches_paused"])
 
     def test_startup_removes_abandoned_snapshot_temporaries(self) -> None:
         controller = self._controller()

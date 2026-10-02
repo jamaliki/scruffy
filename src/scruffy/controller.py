@@ -292,198 +292,202 @@ def _initialize_controller(
         ),
     )
 
-    if replacement:
-        evacuation = state.get("evacuation")
-        request = (
-            state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
-            if isinstance(evacuation, dict)
-            else None
-        )
-        if (
-            isinstance(evacuation, dict)
-            and evacuation.get("state") not in {"complete", "partial", "cancelled"}
-            and isinstance(request, dict)
-        ):
-            for target in evacuation.get("targets", {}).values():
-                if isinstance(target, dict) and target.get("outcome") not in EVACUATION_TERMINAL_OUTCOMES:
-                    target.update({"outcome": "lost", "reason": "allocation_replaced"})
-            evacuation["state"] = "partial"
-            _evacuation_emit(controller, evacuation, request, "evacuation.partial")
-
-    lost_reason = None
-    if same_slurm_allocation:
-        _reattach_slurm_jobs(controller, active)
-    else:
-        if legacy_slurm_allocation:
-            active_lost_reason = "allocation_incarnation_unavailable"
-        elif previous.get("id") == allocation_id:
-            active_lost_reason = "allocation_incarnation_changed"
-        else:
-            active_lost_reason = "allocation_replaced"
-        lost_active: list[dict[str, Any]] = []
-        recovered_terminal: list[dict[str, Any]] = []
-        # A replaced or restarted Slurm incarnation cannot retain its old
-        # steps. Legacy active records are not upgraded to a new incarnation;
-        # launches remain paused below until an operator audits the old work.
-        for job in active:
-            prior = read_result_record(root, str(job["id"]))
-            # A persisted loss result is the first half of the loss
-            # transaction, not a completed workflow outcome.  Replay must
-            # retain its immutable timestamp/assignment while still emitting
-            # job.lost and admitting the deterministic successor.
+    # Recovery is pure state: one group commit publishes every loss, retry
+    # admission, and the allocation record with one snapshot write, which
+    # matters when a large legacy snapshot is adopted.
+    with group_commit(controller):
+        if replacement:
+            evacuation = state.get("evacuation")
+            request = (
+                state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
+                if isinstance(evacuation, dict)
+                else None
+            )
             if (
-                prior is not None
-                and prior.get("state") in TERMINAL_JOB_STATES
-                and prior.get("state") != "lost"
-                and type(job.get("attempt")) is int
+                isinstance(evacuation, dict)
+                and evacuation.get("state") not in {"complete", "partial", "cancelled"}
+                and isinstance(request, dict)
             ):
-                job.update(
-                    {
-                        "state": prior["state"],
-                        "finished_at": prior.get("finished_at"),
-                        "exit_code": prior.get("exit_code"),
-                        "signal": prior.get("signal"),
-                        "reason": prior.get("reason"),
-                        "error": prior.get("error"),
-                        "last_assignment": prior.get("assignment"),
-                        "assignment": None,
-                    }
+                for target in evacuation.get("targets", {}).values():
+                    if isinstance(target, dict) and target.get("outcome") not in EVACUATION_TERMINAL_OUTCOMES:
+                        target.update({"outcome": "lost", "reason": "allocation_replaced"})
+                evacuation["state"] = "partial"
+                _evacuation_emit(controller, evacuation, request, "evacuation.partial")
+
+        lost_reason = None
+        if same_slurm_allocation:
+            _reattach_slurm_jobs(controller, active)
+        else:
+            if legacy_slurm_allocation:
+                active_lost_reason = "allocation_incarnation_unavailable"
+            elif previous.get("id") == allocation_id:
+                active_lost_reason = "allocation_incarnation_changed"
+            else:
+                active_lost_reason = "allocation_replaced"
+            lost_active: list[dict[str, Any]] = []
+            recovered_terminal: list[dict[str, Any]] = []
+            # A replaced or restarted Slurm incarnation cannot retain its old
+            # steps. Legacy active records are not upgraded to a new incarnation;
+            # launches remain paused below until an operator audits the old work.
+            for job in active:
+                prior = read_result_record(root, str(job["id"]))
+                # A persisted loss result is the first half of the loss
+                # transaction, not a completed workflow outcome.  Replay must
+                # retain its immutable timestamp/assignment while still emitting
+                # job.lost and admitting the deterministic successor.
+                if (
+                    prior is not None
+                    and prior.get("state") in TERMINAL_JOB_STATES
+                    and prior.get("state") != "lost"
+                    and type(job.get("attempt")) is int
+                ):
+                    job.update(
+                        {
+                            "state": prior["state"],
+                            "finished_at": prior.get("finished_at"),
+                            "exit_code": prior.get("exit_code"),
+                            "signal": prior.get("signal"),
+                            "reason": prior.get("reason"),
+                            "error": prior.get("error"),
+                            "last_assignment": prior.get("assignment"),
+                            "assignment": None,
+                        }
+                    )
+                    recovered_terminal.append(job)
+                    continue
+                lost_active.append(job)
+                job["state"] = "lost"
+                job["finished_at"] = (
+                    (prior.get("finished_at") if prior is not None else None)
+                    or job.get("finished_at")
+                    or job.get("started_at")
+                    or job.get("submitted_at")
+                    or utc_now()
                 )
-                recovered_terminal.append(job)
-                continue
-            lost_active.append(job)
-            job["state"] = "lost"
-            job["finished_at"] = (
-                (prior.get("finished_at") if prior is not None else None)
-                or job.get("finished_at")
-                or job.get("started_at")
-                or job.get("submitted_at")
-                or utc_now()
-            )
-            job["reason"] = active_lost_reason
-            _mark_retry_exhaustion(job, active_lost_reason)
-            job["last_assignment"] = (
-                prior.get("assignment") if prior is not None else job.get("assignment")
-            )
-            job["assignment"] = None
-            write_result_record(root, job)
-        if lost_active:
-            lost_reason = active_lost_reason
-        for job in lost_active:
-            emit(controller, "job.lost", job=job, snapshot=False)
-        for job in recovered_terminal:
-            emit(controller, f"job.{job['state']}", job=job, snapshot=False)
-        if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
-            _recover_lost_workflow_jobs(controller, active_lost_reason)
+                job["reason"] = active_lost_reason
+                _mark_retry_exhaustion(job, active_lost_reason)
+                job["last_assignment"] = (
+                    prior.get("assignment") if prior is not None else job.get("assignment")
+                )
+                job["assignment"] = None
+                write_result_record(root, job)
+            if lost_active:
+                lost_reason = active_lost_reason
+            for job in lost_active:
+                emit(controller, "job.lost", job=job, snapshot=False)
+            for job in recovered_terminal:
+                emit(controller, f"job.{job['state']}", job=job, snapshot=False)
+            if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
+                _recover_lost_workflow_jobs(controller, active_lost_reason)
 
-    # Queued and later workflow jobs have already crossed their dependency
-    # gate. Persist the marker for snapshots created before the field existed.
-    for job in state["jobs"].values():
-        if isinstance(job.get("workflow_id"), str):
-            job.setdefault("dependency_gate_passed", job.get("state") != "blocked")
+        # Queued and later workflow jobs have already crossed their dependency
+        # gate. Persist the marker for snapshots created before the field existed.
+        for job in state["jobs"].values():
+            if isinstance(job.get("workflow_id"), str):
+                job.setdefault("dependency_gate_passed", job.get("state") != "blocked")
 
-    now = utc_now()
-    metadata = allocation_metadata(allocation_id, launcher)
-    metadata["controller_release"] = controller_release
-    metadata["legacy_report_projects"] = list(legacy_report_projects)
-    if allocation_incarnation is not None:
-        metadata["incarnation"] = allocation_incarnation.to_dict()
-    metadata.update(
-        {
-            "state": "running",
-            "started_at": (previous.get("started_at", now) if same_slurm_allocation else now),
-            "controller_started_at": now,
-            "heartbeat_at": now,
-        }
-    )
-    if slurm_job_id:
-        metadata["slurm_job_id"] = slurm_job_id
-    if same_slurm_allocation and isinstance(previous.get("handover"), dict):
-        metadata["handover"] = previous["handover"]
-    deadline_at = metadata.get("deadline_at")
-    if drain_before_end_seconds and isinstance(deadline_at, str):
-        deadline = datetime.fromisoformat(deadline_at)
-        metadata["automatic_drain_at"] = (
-            (deadline - timedelta(seconds=drain_before_end_seconds))
-            .astimezone(UTC)
-            .isoformat(timespec="seconds")
+        now = utc_now()
+        metadata = allocation_metadata(allocation_id, launcher)
+        metadata["controller_release"] = controller_release
+        metadata["legacy_report_projects"] = list(legacy_report_projects)
+        if allocation_incarnation is not None:
+            metadata["incarnation"] = allocation_incarnation.to_dict()
+        metadata.update(
+            {
+                "state": "running",
+                "started_at": (previous.get("started_at", now) if same_slurm_allocation else now),
+                "controller_started_at": now,
+                "heartbeat_at": now,
+            }
         )
-    if evacuate_before_end_seconds and isinstance(deadline_at, str):
-        deadline = datetime.fromisoformat(deadline_at)
-        metadata["automatic_evacuate_at"] = (
-            (deadline - timedelta(seconds=evacuate_before_end_seconds))
-            .astimezone(UTC)
-            .isoformat(timespec="seconds")
-        )
-    drain_requested = bool(
-        state.get(
-            "drain_requested",
-            state.get("draining") and previous.get("state") == "draining",
-        )
-    )
-    # A drain belongs to one physical allocation incarnation. Slurm can reuse
-    # the same job ID after requeue, but none of the old steps survive it.
-    preserve_drain = drain_requested and (
-        same_slurm_allocation or (launcher == "local" and previous.get("id") == allocation_id)
-    )
-    if preserve_drain:
-        metadata["state"] = "draining"
-    state["allocation"] = metadata
-    state["draining"] = preserve_drain
-    state["drain_requested"] = preserve_drain
-    # Recovery owns existing steps but never admits additional work implicitly.
-    # An operator must explicitly resume after checking the recovered snapshot.
-    state["launches_paused"] = same_slurm_allocation or legacy_slurm_allocation or start_paused
-    ineligible = [
-        job["id"]
-        for job in state["jobs"].values()
-        if job["state"] in {"queued", "blocked"}
-        and not request_can_ever_fit(inventory, ResourceRequest.from_dict(job["request"]))
-    ]
-    if replacement:
-        metadata["handover"] = {
-            "previous_allocation_id": previous_allocation_id,
-            "lost_jobs": len(active),
-            "queued_jobs": sum(job["state"] == "queued" for job in state["jobs"].values()),
-            "blocked_jobs": sum(job["state"] == "blocked" for job in state["jobs"].values()),
-            "ineligible_jobs": len(ineligible),
-        }
-        if previous_incarnation is not None:
-            metadata["handover"]["previous_incarnation_sha256"] = (
-                previous_incarnation.fingerprint_sha256
+        if slurm_job_id:
+            metadata["slurm_job_id"] = slurm_job_id
+        if same_slurm_allocation and isinstance(previous.get("handover"), dict):
+            metadata["handover"] = previous["handover"]
+        deadline_at = metadata.get("deadline_at")
+        if drain_before_end_seconds and isinstance(deadline_at, str):
+            deadline = datetime.fromisoformat(deadline_at)
+            metadata["automatic_drain_at"] = (
+                (deadline - timedelta(seconds=drain_before_end_seconds))
+                .astimezone(UTC)
+                .isoformat(timespec="seconds")
             )
-    emit(
-        controller,
-        "allocation.resumed" if same_slurm_allocation else "allocation.started",
-        data={
-            "nodes": [item.to_dict() for item in inventory],
-            "incarnation": (
-                allocation_incarnation.to_dict() if allocation_incarnation is not None else None
-            ),
-            "controller_release": controller_release,
-            "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
-            "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
-            "lost_reason": lost_reason,
-            "removed_stale_temporaries": removed_temporaries,
-            **({"handover": metadata["handover"]} if replacement else {}),
-        },
-    )
-    if state["launches_paused"]:
+        if evacuate_before_end_seconds and isinstance(deadline_at, str):
+            deadline = datetime.fromisoformat(deadline_at)
+            metadata["automatic_evacuate_at"] = (
+                (deadline - timedelta(seconds=evacuate_before_end_seconds))
+                .astimezone(UTC)
+                .isoformat(timespec="seconds")
+            )
+        drain_requested = bool(
+            state.get(
+                "drain_requested",
+                state.get("draining") and previous.get("state") == "draining",
+            )
+        )
+        # A drain belongs to one physical allocation incarnation. Slurm can reuse
+        # the same job ID after requeue, but none of the old steps survive it.
+        preserve_drain = drain_requested and (
+            same_slurm_allocation or (launcher == "local" and previous.get("id") == allocation_id)
+        )
+        if preserve_drain:
+            metadata["state"] = "draining"
+        state["allocation"] = metadata
+        state["draining"] = preserve_drain
+        state["drain_requested"] = preserve_drain
+        # Recovery owns existing steps but never admits additional work implicitly.
+        # An operator must explicitly resume after checking the recovered snapshot.
+        state["launches_paused"] = same_slurm_allocation or legacy_slurm_allocation or start_paused
+        ineligible = [
+            job["id"]
+            for job in state["jobs"].values()
+            if job["state"] in {"queued", "blocked"}
+            and not request_can_ever_fit(inventory, ResourceRequest.from_dict(job["request"]))
+        ]
+        if replacement:
+            metadata["handover"] = {
+                "previous_allocation_id": previous_allocation_id,
+                "lost_jobs": len(active),
+                "queued_jobs": sum(job["state"] == "queued" for job in state["jobs"].values()),
+                "blocked_jobs": sum(job["state"] == "blocked" for job in state["jobs"].values()),
+                "ineligible_jobs": len(ineligible),
+            }
+            if previous_incarnation is not None:
+                metadata["handover"]["previous_incarnation_sha256"] = (
+                    previous_incarnation.fingerprint_sha256
+                )
         emit(
             controller,
-            "allocation.launches_paused",
+            "allocation.resumed" if same_slurm_allocation else "allocation.started",
             data={
-                "reason": (
-                    "controller_restart"
-                    if same_slurm_allocation
-                    else (
-                        "legacy_incarnation_audit_required"
-                        if legacy_slurm_allocation
-                        else "operator_requested"
-                    )
-                )
+                "nodes": [item.to_dict() for item in inventory],
+                "incarnation": (
+                    allocation_incarnation.to_dict() if allocation_incarnation is not None else None
+                ),
+                "controller_release": controller_release,
+                "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
+                "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
+                "lost_reason": lost_reason,
+                "removed_stale_temporaries": removed_temporaries,
+                **({"handover": metadata["handover"]} if replacement else {}),
             },
         )
+        if state["launches_paused"]:
+            emit(
+                controller,
+                "allocation.launches_paused",
+                data={
+                    "reason": (
+                        "controller_restart"
+                        if same_slurm_allocation
+                        else (
+                            "legacy_incarnation_audit_required"
+                            if legacy_slurm_allocation
+                            else "operator_requested"
+                        )
+                    )
+                },
+            )
     return controller
 
 
