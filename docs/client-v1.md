@@ -274,10 +274,11 @@ attempt of an artifact producer ended without the awaited typed publication
 and that result is final: no automatic retry is due, its report inbox is
 empty, and 10 minutes have passed since it finished (immediately when the
 producer itself never ran). Until then the blocker keeps reason
-`condition_pending` with the producer's terminal state. Scruffy does not retry skipped dependants
-automatically; submit their next attempts explicitly. Workflow tasks may opt
-into the strict recovery object below; its `max_attempts` includes the first
-attempt and is capped at 10:
+`condition_pending` with the producer's terminal state. Scruffy does not retry
+skipped dependants automatically; submit their next attempts explicitly.
+
+Workflow tasks may opt into the strict recovery object below; its
+`max_attempts` includes the first attempt and is capped at 10:
 
 ```json
 {
