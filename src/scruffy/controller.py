@@ -78,6 +78,7 @@ from .state import (
     ensure_committed,
     group_commit,
     load_recovered_state,
+    log_directories_to_keep,
 )
 from .storage import (
     StorageError,
@@ -3626,6 +3627,57 @@ def _drain_for_deadline(controller: Controller) -> None:
     )
 
 
+def _pinned_terminal_job_ids(controller: Controller) -> set[str]:
+    """Return terminal jobs that must stay in hot state for a later step.
+
+    An in-progress evacuation needs its targets' full images to admit
+    successors, and a lost task awaiting its automatic retry needs its argv
+    and cwd until the next controller start admits that retry.
+    """
+
+    pinned: set[str] = set()
+    evacuation = controller.state.get("evacuation")
+    if isinstance(evacuation, dict) and evacuation.get("state") not in {
+        "complete",
+        "partial",
+        "cancelled",
+    }:
+        pinned.update(evacuation.get("targets") or {})
+    pinned.update(
+        job["id"]
+        for job in controller.state["jobs"].values()
+        if job.get("state") in TERMINAL_JOB_STATES and _retry_pending(controller, job)
+    )
+    return pinned
+
+
+def _apply_tick(controller: Controller) -> None:
+    """Apply one poll iteration's transitions as one group commit.
+
+    Every transition is journaled without a sync, then published by one
+    journal sync and one snapshot replacement before any inbox item is
+    acknowledged. Launch decisions follow this commit.
+    """
+
+    with group_commit(controller):
+        _ingest_requests(controller)
+        _ingest_commands(controller)
+        _drain_for_deadline(controller)
+        _evacuate_for_deadline(controller)
+        _advance_evacuation(controller)
+        drain_messages(controller)
+        poll_processes(controller)
+        _maintain_health_monitor(controller)
+        _ingest_gpu_health(controller)
+        _ingest_reports(controller)
+        # Replay can restore an armed operation and its exact publication
+        # evidence without another report file being present.
+        _activate_armed_evacuation(controller)
+        _advance_evacuation(controller)
+        _refresh_dependencies(controller)
+        compact_journal(controller, pinned=_pinned_terminal_job_ids(controller))
+
+
 def _serve(controller: Controller) -> None:
     def stop(_signum: int, _frame: Any) -> None:
         controller.stopping = True
@@ -3640,32 +3692,12 @@ def _serve(controller: Controller) -> None:
     compact_report_receipts(controller.root)
     _discard_journaled_reports(controller)
     _discard_journaled_commands(controller)
-    remove_cold_job_directories(controller.root, controller.state["jobs"].keys())
+    remove_cold_job_directories(controller.root, log_directories_to_keep(controller.state))
     previous_term = signal.signal(signal.SIGTERM, stop)
     previous_int = signal.signal(signal.SIGINT, stop)
     try:
         while True:
-            # One poll iteration is one group commit: every transition below
-            # is journaled without a sync, then published by one journal sync
-            # and one snapshot replacement before any inbox item is
-            # acknowledged. Launch decisions follow the commit.
-            with group_commit(controller):
-                _ingest_requests(controller)
-                _ingest_commands(controller)
-                _drain_for_deadline(controller)
-                _evacuate_for_deadline(controller)
-                _advance_evacuation(controller)
-                drain_messages(controller)
-                poll_processes(controller)
-                _maintain_health_monitor(controller)
-                _ingest_gpu_health(controller)
-                _ingest_reports(controller)
-                # Replay can restore an armed operation and its exact
-                # publication evidence without another report file.
-                _activate_armed_evacuation(controller)
-                _advance_evacuation(controller)
-                _refresh_dependencies(controller)
-                compact_journal(controller)
+            _apply_tick(controller)
             if controller.stopping:
                 begin_shutdown(controller)
                 _stop_health_monitor(controller)

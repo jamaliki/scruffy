@@ -746,12 +746,16 @@ with one snapshot commit per tick, and records one immutable summary
 receipt and a `jobs.cancel_completed` event. Retrying with the same
 `--request-id` and selector is safe; a different selector conflicts.
 
-The hot snapshot keeps every nonterminal job and, after compaction, the newest
-1,000 terminal jobs. Older terminal jobs remain addressable by job ID with
-`archived: true`; compact records keep lifecycle and workflow identity,
-resource requests, final placement, and provenance references. Cwd, argv,
-environment, live assignment, blockers, logs, and workload state expire.
-`summary.counts` includes archived terminal jobs;
+The hot snapshot (`state.json`) holds live work, not history: every
+nonterminal job, terminal jobs still needed by an in-progress evacuation or a
+pending automatic retry, and the newest 100 other terminal jobs. Older
+terminal jobs are archived as an ordinary journaled `jobs.archived` record, at
+most 512 per tick, without rotating the journal or resetting cursors. They
+remain addressable by job ID with `archived: true`; compact records keep
+lifecycle and workflow identity, resource requests, final placement, and
+provenance references. Cwd, argv, environment, live assignment, blockers, and
+workload state expire. Logs stay readable for the 1,000 most recently archived
+jobs that ran. `summary.counts` includes archived terminal jobs;
 `summary.archived_jobs` and `status.archived_counts` expose the archived totals.
 The active and immediately previous journal generations are retained.
 Compact request receipts and workflow indexes last for the queue root's lifetime,

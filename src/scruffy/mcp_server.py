@@ -52,7 +52,7 @@ MAX_TRANSIENT_READ_FAILURES = 3
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_LOG_RANGE_BYTES = 256 * 1024
 MAX_CANCEL_WAIT_SECONDS = 300
-QUIET_EVENT_KINDS = frozenset({"job.output", "workload.progress"})
+QUIET_EVENT_KINDS = frozenset({"job.output", "workload.progress", "jobs.archived"})
 PROJECT_HEADER = "x-scruffy-project"
 
 SERVER_INSTRUCTIONS = """\

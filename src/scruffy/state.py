@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Iterator
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ from .storage import (
     queue_id,
     read_event_page,
     remove_cold_job_directories,
+    remove_job_directories,
     sync_file,
     sync_report_inboxes,
     utc_now,
@@ -43,8 +45,16 @@ from .storage import (
 )
 
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
-MAX_TERMINAL_JOBS = 1000
-TERMINAL_COMPACTION_SLACK = 100
+# The snapshot holds every nonterminal job, terminal jobs still needed in hot
+# state (pinned), and only this many recent terminal jobs for summaries.
+MAX_TERMINAL_JOBS = 100
+TERMINAL_COMPACTION_SLACK = 25
+# Archiving writes two small files per job; a large backlog (for example when
+# an old queue root is first adopted) drains over several ticks.
+MAX_ARCHIVED_PER_TICK = 512
+# Log directories outlive hot state for the most recently archived jobs that
+# ran, independently of how many terminal jobs the snapshot retains.
+MAX_RETAINED_LOG_JOBS = 1000
 
 
 def _event_key(occurred_at: str, event_id: str) -> tuple[datetime, str]:
@@ -487,38 +497,64 @@ def compact_journal(
     max_bytes: int = MAX_JOURNAL_BYTES,
     max_terminal_jobs: int = MAX_TERMINAL_JOBS,
     terminal_slack: int = TERMINAL_COMPACTION_SLACK,
+    max_archived: int = MAX_ARCHIVED_PER_TICK,
+    max_retained_logs: int = MAX_RETAINED_LOG_JOBS,
+    pinned: AbstractSet[str] = frozenset(),
 ) -> bool:
-    """Rotate history and move old terminal details out of the hot snapshot."""
+    """Archive old terminal jobs, and rotate the journal when it is too large.
 
+    Archiving is an ordinary journaled transition (``jobs.archived``), so it
+    neither rotates the journal nor resets observer cursors.
+    """
+
+    archived = archive_terminal_jobs(
+        controller,
+        max_terminal_jobs=max_terminal_jobs,
+        terminal_slack=terminal_slack,
+        limit=max_archived,
+        max_retained_logs=max_retained_logs,
+        pinned=pinned,
+    )
+    if max_bytes > 0 and controller.journal.tell() > max_bytes:
+        rotate_journal(controller)
+        return True
+    return archived > 0
+
+
+def archive_terminal_jobs(
+    controller: Controller,
+    *,
+    max_terminal_jobs: int = MAX_TERMINAL_JOBS,
+    terminal_slack: int = TERMINAL_COMPACTION_SLACK,
+    limit: int = MAX_ARCHIVED_PER_TICK,
+    max_retained_logs: int = MAX_RETAINED_LOG_JOBS,
+    pinned: AbstractSet[str] = frozenset(),
+) -> int:
+    """Move the oldest unpinned terminal jobs into the per-job archive.
+
+    Compact records are written first; the hot-state removal is then journaled
+    as one ``jobs.archived`` record and becomes durable with the enclosing
+    commit. A crash in between leaves the jobs hot, and re-archiving them later
+    overwrites the same records. Returns the number of jobs archived.
+    """
+
+    if max_terminal_jobs < 0:
+        return 0
     terminal = [
         job
         for job in controller.state["jobs"].values()
-        if job.get("state") in TERMINAL_JOB_STATES
+        if job.get("state") in TERMINAL_JOB_STATES and job.get("id") not in pinned
     ]
-    oversized = max_bytes > 0 and controller.journal.tell() > max_bytes
-    overfull = (
-        max_terminal_jobs >= 0
-        and len(terminal) > max_terminal_jobs + max(terminal_slack, 0)
-    )
-    if not oversized and not overfull:
-        return False
-    commit_snapshot(controller)
+    if len(terminal) <= max_terminal_jobs + max(terminal_slack, 0):
+        return 0
     terminal.sort(
         key=lambda job: (
             str(job.get("finished_at") or job.get("submitted_at") or ""),
             int(job.get("queue_order", 0)),
-        ),
-        reverse=True,
+        )
     )
-    archived_counts = controller.state.setdefault("archived_counts", {})
-    archived_project_counts = controller.state.setdefault(
-        "archived_project_counts", {}
-    )
-    retain_count = len(terminal) if max_terminal_jobs < 0 else max_terminal_jobs
-    remaining = len(terminal)
-    for job in reversed(terminal):
-        if remaining <= retain_count:
-            break
+    archived: list[dict[str, Any]] = []
+    for job in terminal[: max(0, min(len(terminal) - max_terminal_jobs, limit))]:
         try:
             archive_terminal_job(controller.root, job)
         except (OSError, StorageError) as exc:
@@ -534,15 +570,73 @@ def compact_journal(
                 snapshot=False,
             )
             continue
+        archived.append(job)
+    if not archived:
+        return 0
+    counts: dict[str, int] = {}
+    project_counts: dict[str, dict[str, int]] = {}
+    for job in archived:
         state_name = str(job.get("state", "unknown"))
-        archived_counts[state_name] = int(archived_counts.get(state_name, 0)) + 1
-        project_counts = archived_project_counts.setdefault(job_project(job), {})
-        project_counts[state_name] = int(project_counts.get(state_name, 0)) + 1
-        del controller.state["jobs"][job["id"]]
-        remaining -= 1
-    controller.state["archived_jobs"] = sum(
-        int(count) for count in archived_counts.values()
-    )
+        counts[state_name] = counts.get(state_name, 0) + 1
+        per_project = project_counts.setdefault(job_project(job), {})
+        per_project[state_name] = per_project.get(state_name, 0) + 1
+    retained = list(controller.state.get("retained_log_jobs") or [])
+    added = [str(job["id"]) for job in archived if job.get("started_at")]
+    overflow = max(0, len(retained) + len(added) - max(max_retained_logs, 0))
+    released = (retained + added)[:overflow]
+    record = {
+        "job_ids": [str(job["id"]) for job in archived],
+        "counts": counts,
+        "project_counts": project_counts,
+        "retained_logs": added,
+        "released_logs": released,
+    }
+    apply_archive_record(controller.state, record)
+    emit(controller, "jobs.archived", data=record)
+    if released:
+        after_commit(
+            controller, lambda: remove_job_directories(controller.root, released)
+        )
+    return len(archived)
+
+
+def apply_archive_record(state: dict[str, Any], record: dict[str, Any]) -> None:
+    """Apply one ``jobs.archived`` transition to a state image."""
+
+    jobs = state.setdefault("jobs", {})
+    for job_id in record.get("job_ids") or []:
+        jobs.pop(job_id, None)
+    archived_counts = state.setdefault("archived_counts", {})
+    for name, count in (record.get("counts") or {}).items():
+        archived_counts[name] = int(archived_counts.get(name, 0)) + int(count)
+    by_project = state.setdefault("archived_project_counts", {})
+    for project_id, per_state in (record.get("project_counts") or {}).items():
+        target = by_project.setdefault(project_id, {})
+        for name, count in per_state.items():
+            target[name] = int(target.get(name, 0)) + int(count)
+    state["archived_jobs"] = sum(int(count) for count in archived_counts.values())
+    released = set(record.get("released_logs") or [])
+    retained = [
+        job_id
+        for job_id in [
+            *(state.get("retained_log_jobs") or []),
+            *(record.get("retained_logs") or []),
+        ]
+        if job_id not in released
+    ]
+    state["retained_log_jobs"] = retained
+
+
+def log_directories_to_keep(state: dict[str, Any]) -> set[str]:
+    """Return job IDs whose log directories must survive cleanup."""
+
+    return {*state.get("jobs", {}), *(state.get("retained_log_jobs") or [])}
+
+
+def rotate_journal(controller: Controller) -> None:
+    """Start a new journal generation from a checkpoint of the current state."""
+
+    commit_snapshot(controller)
     current = int(controller.state.get("journal_generation", 0))
     generation = next_journal_generation(controller.root, current)
     checkpoint = copy.deepcopy(controller.state)
@@ -563,8 +657,7 @@ def compact_journal(
     prune_journal_generations(controller.root, retained_generations)
     sync_report_inboxes(controller.root)
     prune_report_receipts(controller.root, retained_generations)
-    remove_cold_job_directories(controller.root, controller.state["jobs"].keys())
-    return True
+    remove_cold_job_directories(controller.root, log_directories_to_keep(controller.state))
 
 
 def load_recovered_state(root: Path) -> dict[str, Any]:
@@ -602,6 +695,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "evacuation_history": {},
                 "evacuation_cancel_requests": {},
                 "bulk_operations": {},
+                "retained_log_jobs": [],
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -676,6 +770,8 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                         "data": event["data"],
                     },
                 )
+        if event.get("kind") == "jobs.archived" and isinstance(event.get("data"), dict):
+            apply_archive_record(state, event["data"])
         if event.get("kind") == "resource.gpu_health_changed":
             data = event.get("data")
             recovered_health = data.get("gpu_health") if isinstance(data, dict) else None
@@ -799,4 +895,5 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     state.setdefault("evacuation_history", {})
     state.setdefault("evacuation_cancel_requests", {})
     state.setdefault("bulk_operations", {})
+    state.setdefault("retained_log_jobs", [])
     return state

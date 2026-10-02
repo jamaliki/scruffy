@@ -369,14 +369,26 @@ status changes and operator actions, not every periodic metric sample.
 
 ## Retention
 
-After compaction, hot state contains every nonterminal job and the newest 1,000
-terminal jobs. Older terminal jobs move to records marked `archived: true`.
+Hot state contains every nonterminal job, terminal jobs that a later
+controller step still needs (targets of an in-progress evacuation and `lost`
+tasks awaiting their automatic retry), and the newest 100 other terminal jobs.
+The controller archives older terminal jobs as soon as more than 125 are hot,
+at most 512 per tick, so a large backlog drains over a few ticks. Archived
+jobs move to records marked `archived: true`.
 These retain identity, lifecycle results and timestamps, workflow metadata,
 recovery lineage and policy, resource request, final placement, and immutable
 provenance references. They drop cwd, argv, environment, live assignment,
-blockers, workload projection, output paths, and per-job logs. The state exposes per-state `archived_counts`;
+blockers, workload projection, and output paths. The state exposes per-state `archived_counts`;
 `summary.counts` combines these with hot counts, while detailed summary lists
 and unqualified `status(root)` remain hot views.
+
+Archiving is a journaled `jobs.archived` record (job IDs and count deltas).
+It neither rotates the journal nor resets observer cursors; MCP waits do not
+wake for it by default. Per-job stdout and stderr outlive hot state: the
+`retained_log_jobs` list keeps the log directories of the 1,000 most recently
+archived jobs that started, and older directories are removed after the
+record that releases them is committed. Dependency resolution, explanations,
+and `status(root, job_id)` read archived records by job ID or workflow.
 
 Journal history and workload-report idempotency receipts retain the active and
 immediately previous generations. Request idempotency is different: its compact

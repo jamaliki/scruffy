@@ -125,11 +125,14 @@ agents; reading does not consume events for anyone else. Use
   loopback URL and tool schemas remain stable. Restart the remote hub and retry an
   overlapping wait with its last cursor. Tool-list or schema changes additionally
   require Codex's lightweight MCP configuration reload.
-- Hot state keeps all nonterminal jobs and, after compaction, the newest 1,000
-  terminal jobs. Older lookups carry `archived: true` and retain lifecycle,
-  workflow, resource request, final placement, and provenance references. Cwd,
-  argv, environment, live assignment, blockers, logs, and workload expire.
-  `summary.counts` includes them and `archived_jobs` reports their total.
+- Hot state keeps all nonterminal jobs, terminal jobs still needed by an
+  in-progress evacuation or a pending automatic retry, and only the newest 100
+  other terminal jobs. Older lookups carry `archived: true` and retain
+  lifecycle, workflow, resource request, final placement, and provenance
+  references. Cwd, argv, environment, live assignment, blockers, and workload
+  expire. Logs stay readable for the 1,000 most recently archived jobs that
+  ran. `summary.counts` includes them and `archived_jobs` reports their total.
+  `status JOB_ID` finds an archived job from its own small record.
 - Compact request receipts and workflow indexes persist for the queue root's
   lifetime, so they grow as O(total jobs) small files and inodes.
 - The snapshot is authoritative. Never infer lifecycle success or failure from

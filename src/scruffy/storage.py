@@ -784,13 +784,28 @@ def list_archived_workflow(
     )
 
 
-def remove_cold_job_directories(root: Path, hot_job_ids: AbstractSet[str]) -> int:
-    """Delete log directories for terminal jobs already moved out of hot state."""
+def remove_cold_job_directories(root: Path, keep_job_ids: AbstractSet[str]) -> int:
+    """Delete every job log directory not named in ``keep_job_ids``."""
 
     jobs_root = ensure_layout(root) / "jobs"
     removed = 0
     for directory in jobs_root.iterdir():
-        if directory.is_dir() and directory.name not in hot_job_ids:
+        if directory.is_dir() and directory.name not in keep_job_ids:
+            shutil.rmtree(directory)
+            removed += 1
+    if removed:
+        _fsync_directory(jobs_root)
+    return removed
+
+
+def remove_job_directories(root: Path, job_ids: Sequence[str]) -> int:
+    """Delete the named jobs' log directories whose retention has ended."""
+
+    jobs_root = ensure_layout(root) / "jobs"
+    removed = 0
+    for job_id in job_ids:
+        directory = jobs_root / job_id
+        if "/" not in job_id and directory.is_dir():
             shutil.rmtree(directory)
             removed += 1
     if removed:

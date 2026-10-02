@@ -151,6 +151,19 @@ cost of N queued commands is therefore one snapshot write per iteration rather
 than N, and a per-iteration bound keeps one iteration short when thousands of
 command files are pending.
 
+### Retention
+
+The snapshot is sized by live work, not by history. Terminal jobs leave hot
+state through the same journal as every other transition: compact per-job
+archive records (and per-workflow indexes) are written first, then one
+`jobs.archived` record removes the jobs and adds their counts, replayed like
+any other record after a crash. Only an in-progress evacuation's targets and
+`lost` tasks awaiting an automatic retry stay pinned in hot state, plus a
+small recent window for summaries. Journal rotation is independent and occurs
+only when the journal itself grows large. Log directories follow a separate
+bounded retention list so archiving never makes a just-finished job's output
+disappear.
+
 ### Observation
 
 Read interfaces project the same authoritative state for different costs:
