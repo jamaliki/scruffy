@@ -2769,6 +2769,8 @@ def _start_bulk_cancel(
         "unknown_job_ids": unknown[:MAX_REPORTED_UNKNOWN_JOB_IDS],
     }
     controller.state.setdefault("bulk_operations", {})[request_id] = operation
+    # The journaled operation (and later progress records) let recovery
+    # rebuild it exactly even when the snapshot holding it is lost.
     emit(
         controller,
         "jobs.cancel_started",
@@ -2776,6 +2778,7 @@ def _start_bulk_cancel(
             "request_id": request_id,
             "selector": selector_summary(selector),
             "counts": copy.deepcopy(operation["counts"]),
+            "operation": copy.deepcopy(operation),
             **_bulk_project(selector),
         },
     )
@@ -2832,6 +2835,17 @@ def _apply_bulk_cancel(
         else:
             counts["ignored"] += 1
     if operation["position"] < len(targets):
+        if used:
+            emit(
+                controller,
+                "jobs.cancel_progress",
+                data={
+                    "request_id": request_id,
+                    "position": operation["position"],
+                    "counts": copy.deepcopy(counts),
+                    **_bulk_project(operation["selector"]),
+                },
+            )
         return False, None, used
     del operations[request_id]
     # The receipt already holds the command and its selector.

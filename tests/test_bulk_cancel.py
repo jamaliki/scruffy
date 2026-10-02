@@ -327,8 +327,10 @@ class BulkCancelControllerTests(unittest.TestCase):
             _ingest_commands(controller, bulk_limit=4)
         controller.journal.close()
 
+        # The journaled progress record restores the second batch exactly.
         restarted = self._controller()
-        self.assertEqual(4, restarted.state["bulk_operations"]["ticks"]["position"])
+        self.assertEqual(8, restarted.state["bulk_operations"]["ticks"]["position"])
+        self.assertEqual(8, restarted.state["bulk_operations"]["ticks"]["counts"]["cancelled"])
         _discard_journaled_commands(restarted)
         self.assertEqual(1, len(command_sources(self.root)))
         _ingest_commands(restarted, bulk_limit=4)
@@ -424,6 +426,48 @@ class BulkCancelControllerTests(unittest.TestCase):
         self.assertEqual("huge", submit_command(self.root, command))
         with self.assertRaises(StorageError):
             submit_command(self.root, {**command, "note": "different"})
+
+    def test_completion_replayed_after_a_lost_snapshot_leaves_no_operation(self) -> None:
+        controller = self._controller()
+        self._seed(controller, *(job(f"job-{index}", order=index) for index in range(6)))
+        cancel_jobs(self.root, states=["blocked"], request_id="finish")
+        _ingest_commands(controller, bulk_limit=4)
+        with (
+            mock.patch("scruffy.state.write_state", side_effect=OSError("EIO")),
+            self.assertRaises(OSError),
+        ):
+            _ingest_commands(controller, bulk_limit=4)
+        controller.journal.close()
+
+        restarted = self._controller()
+        self.assertEqual({}, restarted.state["bulk_operations"])
+        _discard_journaled_commands(restarted)
+        self.assertEqual([], command_sources(self.root))
+        self.assertEqual(6, self._receipt_outcome("finish")["counts"]["cancelled"])
+
+    def test_progress_survives_a_lost_snapshot_that_also_archived_jobs(self) -> None:
+        controller = self._controller()
+        self._seed(controller, *(job(f"job-{index:02d}", order=index) for index in range(10)))
+        cancel_jobs(self.root, states=["blocked"], request_id="archived-midway")
+        with (
+            mock.patch("scruffy.state.write_state", side_effect=OSError("EIO")),
+            self.assertRaises(OSError),
+            state_module.group_commit(controller),
+        ):
+            _ingest_commands(controller, bulk_limit=5)
+            state_module.compact_journal(controller, max_terminal_jobs=0, terminal_slack=0)
+        controller.journal.close()
+
+        restarted = self._controller()
+        operation = restarted.state["bulk_operations"]["archived-midway"]
+        self.assertEqual(5, operation["position"])
+        self.assertTrue(all(f"job-{index:02d}" not in restarted.state["jobs"] for index in range(5)))
+        _ingest_commands(restarted, bulk_limit=5)
+
+        self.assertEqual(
+            {"matched": 10, "cancelled": 10, "cancelling": 0, "ignored": 0, "unknown": 0},
+            self._receipt_outcome("archived-midway")["counts"],
+        )
 
     def test_named_job_awaiting_admission_defers_the_whole_command(self) -> None:
         controller = self._controller()

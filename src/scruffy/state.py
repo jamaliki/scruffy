@@ -627,6 +627,22 @@ def apply_archive_record(state: dict[str, Any], record: dict[str, Any]) -> None:
     state["retained_log_jobs"] = retained
 
 
+def apply_bulk_event(state: dict[str, Any], kind: str, data: dict[str, Any]) -> None:
+    """Apply one journaled bulk-operation transition to a state image."""
+
+    operations = state.setdefault("bulk_operations", {})
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str):
+        return
+    if kind == "jobs.cancel_started" and isinstance(data.get("operation"), dict):
+        operations[request_id] = copy.deepcopy(data["operation"])
+    elif kind == "jobs.cancel_progress" and isinstance(operations.get(request_id), dict):
+        operations[request_id]["position"] = data["position"]
+        operations[request_id]["counts"] = copy.deepcopy(data["counts"])
+    elif kind == "jobs.cancel_completed":
+        operations.pop(request_id, None)
+
+
 def log_directories_to_keep(state: dict[str, Any]) -> set[str]:
     """Return job IDs whose log directories must survive cleanup."""
 
@@ -772,6 +788,12 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 )
         if event.get("kind") == "jobs.archived" and isinstance(event.get("data"), dict):
             apply_archive_record(state, event["data"])
+        if event.get("kind") in {
+            "jobs.cancel_started",
+            "jobs.cancel_progress",
+            "jobs.cancel_completed",
+        } and isinstance(event.get("data"), dict):
+            apply_bulk_event(state, event["kind"], event["data"])
         if event.get("kind") == "resource.gpu_health_changed":
             data = event.get("data")
             recovered_health = data.get("gpu_health") if isinstance(data, dict) else None
