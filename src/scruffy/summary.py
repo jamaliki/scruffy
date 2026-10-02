@@ -557,6 +557,14 @@ def build_summary(
         allocation["remaining_seconds"] = max(
             0, int((allocation_deadline - current).total_seconds())
         )
+    heartbeat = _parse_time(allocation.get("heartbeat_at"))
+    if heartbeat is not None:
+        # The controller refreshes its heartbeat every few seconds; a large
+        # age means no controller is serving this root (for example after
+        # the hold allocation was replaced without restarting it).
+        allocation["heartbeat_age_seconds"] = max(
+            0, int((current - heartbeat).total_seconds())
+        )
     return {
         "v": 1,
         "queue_id": identity,

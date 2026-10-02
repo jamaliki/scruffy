@@ -166,6 +166,7 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
             "id",
             "state",
             "heartbeat_at",
+            "heartbeat_age_seconds",
             "deadline_at",
             "remaining_seconds",
             "automatic_drain_at",

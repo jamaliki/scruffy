@@ -100,6 +100,9 @@ agents; reading does not consume events for anyone else. Use
   intermediate immutable artifact. This reserves no resources while blocked.
   Only a strict typed publication from that task releases the condition;
   lifecycle `needs` remain separate and may be combined with it.
+- `summary.allocation.heartbeat_age_seconds` (also in the MCP overview) shows
+  how long ago the controller last refreshed its heartbeat; minutes or more
+  mean no controller is serving the root.
 - Prefer `summary` for bounded orientation; `resources`, `running`, `queue`, or
   `blocked` for compact operational views; `explain` for one dependency chain;
   and `observe` for incremental monitoring.

@@ -257,6 +257,7 @@ class ProjectionTests(unittest.TestCase):
                 "state": "running",
                 "controller_release": "unknown",
                 "heartbeat_at": "2026-08-06T12:00:00+00:00",
+                "heartbeat_age_seconds": None,
                 "deadline_at": None,
                 "remaining_seconds": None,
                 "automatic_drain_at": "2026-08-07T11:45:00+00:00",

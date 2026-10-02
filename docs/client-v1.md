@@ -83,7 +83,10 @@ Never infer a terminal result from output text or workload progress.
 requests not yet admitted by the controller. `status(root, job_id)` also looks
 up compactly archived terminal jobs, and raises `KeyError` if the ID does not
 exist. An archived result carries `"archived": true` and has the reduced field
-set described under Retention.
+set described under Retention. An archived job is read from its own small
+record without decoding `state.json`; live jobs come from the snapshot, which
+holds only live work and a small recent terminal window, so `summary`,
+`queue`, `running`, `blocked`, and `resources` never read queue history.
 
 Important hot-job fields are:
 
@@ -103,6 +106,10 @@ grouped as `submitted`, `active`, `queued`, `blocked`, `requires_attention`, and
 `recent_terminal`. It also returns exact state `counts`, including archived
 terminal jobs, an `archived_jobs` total, node availability, and an
 `as_of_cursor` suitable for starting incremental observation.
+`allocation.heartbeat_age_seconds` is the age of the controller's last
+heartbeat (refreshed every few seconds); a large value means no controller is
+serving the queue root, for example after its hold allocation was replaced.
+The MCP overview carries the same field.
 
 The focused CLI and MCP views return that same cursor with compact job
 identities. `queue` contains `submitted` and `queued`; `running` contains every

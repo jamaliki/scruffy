@@ -765,6 +765,14 @@ def status(
     selected_project = (
         normalize_project_id(project_id) if project_id is not None else None
     )
+    if job_id is not None:
+        # An archived terminal job is final and has its own small record, so
+        # finding it never requires decoding the hot snapshot.
+        archived = find_archived_job(root, job_id)
+        if archived is not None:
+            if selected_project is not None and job_project(archived) != selected_project:
+                raise KeyError(f"unknown job {job_id}")
+            return archived
     state = load_state(root)
     if state is None:
         state = {
@@ -817,11 +825,6 @@ def status(
         if selected_project is not None and job_project(job) != selected_project:
             raise KeyError(f"unknown job {job_id}")
         return job
-    archived = find_archived_job(root, job_id)
-    if archived is not None:
-        if selected_project is not None and job_project(archived) != selected_project:
-            raise KeyError(f"unknown job {job_id}")
-        return archived
     raise KeyError(f"unknown job {job_id}")
 
 

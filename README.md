@@ -824,6 +824,16 @@ python -m compileall -q src tests
 python -m ruff check src tests
 ```
 
+`benchmarks/state_scaling.py` builds a production-shaped root (about 8,500
+jobs, 7,455 of them stale artifact waiters) and reports snapshot size,
+`status`/`summary` latency, snapshot writes per batch of cancel commands, and
+the ticks needed to shrink the root. Point `PYTHONPATH` at another release's
+`src` to compare:
+
+```bash
+PYTHONPATH=src python benchmarks/state_scaling.py
+```
+
 The local launcher exercises one-node lifecycle behavior without Slurm or GPUs:
 
 ```bash
