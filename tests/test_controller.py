@@ -651,6 +651,11 @@ class ControllerIntegrationTests(unittest.TestCase):
         self.assertFalse(
             any(job_id.startswith("invalid-") for job_id in snapshot["jobs"])
         )
+        # Inbox entries are retired right after the commit that publishes
+        # their rejection, so the snapshot can be visible slightly earlier.
+        deadline = time.monotonic() + TIMEOUT
+        while list(request_root.glob("job-*")) and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertEqual([], list((self.root / "requests").glob("job-*")))
         valid = self._submit("after-corrupt", "print('still alive')")
         self.assertEqual(
