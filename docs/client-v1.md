@@ -34,6 +34,9 @@ falls back to `state.json`, preserving compatibility with older queue roots.
 | Wait and inspect one job | - | MCP `wait_job(...)` |
 | Publish workload state | `scruffy report KIND` | `publish_event(...)` |
 | Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
+| Cancel many jobs | `scruffy cancel-jobs ...` | `cancel_jobs(root, ...)`, MCP `cancel_jobs` |
+| Preview a bulk cancel | `scruffy cancel-jobs ... --dry-run` | `preview_cancel_jobs(root, ...)` |
+| Wait for a command receipt | `scruffy cancel-jobs ... --wait` | `wait_for_command(root, request_id)` |
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
 | Resume after recovery | `scruffy resume` | `resume_queue(root)` |
 | Evacuate selected jobs | `scruffy evacuate ...` | `request_evacuation(root, ...)` |
@@ -70,7 +73,7 @@ allocation-wide when no project is selected.
 | `cancelled` | Cancellation completed | no | yes |
 | `lost` | Allocation or controller ended with unresolved work | no | yes |
 | `rejected` | Request or workflow could not be admitted | no | yes |
-| `skipped` | A `succeeded` dependency ended unsuccessfully | no | yes |
+| `skipped` | A `succeeded` dependency ended unsuccessfully, or an awaited artifact can no longer be published | no | yes |
 
 Never infer a terminal result from output text or workload progress.
 
@@ -80,7 +83,10 @@ Never infer a terminal result from output text or workload progress.
 requests not yet admitted by the controller. `status(root, job_id)` also looks
 up compactly archived terminal jobs, and raises `KeyError` if the ID does not
 exist. An archived result carries `"archived": true` and has the reduced field
-set described under Retention.
+set described under Retention. An archived job is read from its own small
+record without decoding `state.json`; live jobs come from the snapshot, which
+holds only live work and a small recent terminal window, so `summary`,
+`queue`, `running`, `blocked`, and `resources` never read queue history.
 
 Important hot-job fields are:
 
@@ -100,6 +106,10 @@ grouped as `submitted`, `active`, `queued`, `blocked`, `requires_attention`, and
 `recent_terminal`. It also returns exact state `counts`, including archived
 terminal jobs, an `archived_jobs` total, node availability, and an
 `as_of_cursor` suitable for starting incremental observation.
+`allocation.heartbeat_age_seconds` is the age of the controller's last
+heartbeat (refreshed every few seconds); a large value means no controller is
+serving the queue root, for example after its hold allocation was replaced.
+The MCP overview carries the same field.
 
 The focused CLI and MCP views return that same cursor with compact job
 identities. `queue` contains `submitted` and `queued`; `running` contains every
@@ -117,11 +127,10 @@ GPU scheduler states are `free`, `assigned`, `stopped`, `node_held`,
 `health_unknown`, and `quarantined_observed`. `stopped` identifies the
 quarantined UUID. `node_held` means the node is withheld because health evidence
 or the configured placement contract cannot safely isolate one physical GPU.
-Slurm always withholds a quarantined GPU's whole node from new GPU work;
-healthy peers are `node_held`, even with the default `gpu` isolation. Eligible
-nodes use count-based Slurm allocation, not exact physical-GPU masks. The local
-launcher can isolate individual GPUs. CPU-only work and existing jobs are
-unaffected by the whole-node GPU hold.
+With the default `gpu` isolation, healthy peers remain `free` and their Slurm
+workers use count-based allocation. A job placed on a node with a mappable
+quarantined GPU uses an explicit physical-GPU mask and verifies the physical
+mapping before exec; `node` isolation is the conservative fallback.
 
 Operational job views use scheduler-relevant order: running jobs are newest
 started first, blocked jobs are newest admitted first, and queued jobs are
@@ -220,6 +229,14 @@ active request without cancelling it. Python callers use `after_task` and
 `after_artifact` on `request_evacuation`; publishers may use
 `publish_event(..., wait=True, timeout=SECONDS)` to await the immutable receipt.
 
+For a live campaign pinned to a pre-capability report client, an operator may
+start `serve --legacy-report-project PROJECT` (repeatable). Only those projects
+retain the earlier queue-root-write trust for reports with no launch token.
+Incorrect supplied tokens remain rejected; other projects remain strict. The
+allowlist is attested in allocation metadata and must be supplied on restart.
+Unsigned publications still cannot activate capability-authenticated armed
+evacuations. Upgrade the campaign client before removing this exception.
+
 The CLI prints a generated request ID before submitting a request when one was
 not supplied. Reusing an ID with the same scope and options is a replay; using
 it with different options is rejected. The current operation and durable
@@ -249,10 +266,19 @@ resolve inside that project. Task IDs cannot contain `:`. A succeeded task
 identity remains unique for the workflow and project. A terminal non-success attempt (`failed`, `cancelled`, `lost`,
 `rejected`, or `skipped`) may be replaced by a new job using the same
 `workflow_id` and `task_id` with a new `request_id`. Resolution and explanation
-use the newest valid attempt. Scruffy does not retry skipped dependants
-automatically; submit their next attempts explicitly. Workflow tasks may opt
-into the strict recovery object below; its `max_attempts` includes the first
-attempt and is capped at 10:
+use the newest valid attempt.
+
+A skipped job's `reason` is `dependency_unsatisfied` when a `succeeded`
+dependency ended unsuccessfully, or `condition_unsatisfied` when the newest
+attempt of an artifact producer ended without the awaited typed publication
+and that result is final: no automatic retry is due, its report inbox is
+empty, and 10 minutes have passed since it finished (immediately when the
+producer itself never ran). Until then the blocker keeps reason
+`condition_pending` with the producer's terminal state. Scruffy does not retry
+skipped dependants automatically; submit their next attempts explicitly.
+
+Workflow tasks may opt into the strict recovery object below; its
+`max_attempts` includes the first attempt and is capped at 10:
 
 ```json
 {
@@ -351,14 +377,28 @@ status changes and operator actions, not every periodic metric sample.
 
 ## Retention
 
-After compaction, hot state contains every nonterminal job and the newest 1,000
-terminal jobs. Older terminal jobs move to records marked `archived: true`.
+Hot state contains every nonterminal job, terminal jobs that a later
+controller step still needs (targets of an in-progress evacuation and `lost`
+tasks awaiting their automatic retry), and the newest 100 other terminal jobs.
+The controller archives older terminal jobs as soon as more than 125 are hot,
+at most 512 per tick, so a large backlog drains over a few ticks. Archived
+jobs move to records marked `archived: true`.
 These retain identity, lifecycle results and timestamps, workflow metadata,
 recovery lineage and policy, resource request, final placement, and immutable
 provenance references. They drop cwd, argv, environment, live assignment,
-blockers, workload projection, output paths, and per-job logs. The state exposes per-state `archived_counts`;
+blockers, workload projection, and output paths. The state exposes per-state `archived_counts`;
 `summary.counts` combines these with hot counts, while detailed summary lists
 and unqualified `status(root)` remain hot views.
+
+Archiving is journaled as one `jobs.archived` record per project (its
+`project_id`, job IDs, and count deltas), so project-filtered observers see
+only their own project's records.
+It neither rotates the journal nor resets observer cursors; MCP waits do not
+wake for it by default. Per-job stdout and stderr outlive hot state: the
+`retained_log_jobs` list keeps the log directories of the 1,000 most recently
+archived jobs that started, and older directories are removed after the
+record that releases them is committed. Dependency resolution, explanations,
+and `status(root, job_id)` read archived records by job ID or workflow.
 
 Journal history and workload-report idempotency receipts retain the active and
 immediately previous generations. Request idempotency is different: its compact
@@ -385,10 +425,47 @@ return immediately:
 {"request_id": "...", "state": "resume_requested"}
 ```
 
-The corresponding outcome event repeats `request_id`. Cancellation retains its
+The corresponding outcome event repeats `request_id`. The controller applies
+pending commands in batches and publishes each batch with one snapshot commit,
+so an outcome becomes visible within one controller tick of being applied; the
+command file is removed only after that commit. Cancellation retains its
 assignment until launcher exit, output closure, and Slurm reconciliation prove
 release safe. Cancelling any terminal job, including an archived one, produces
 `job.cancel_ignored` rather than `command.rejected`.
+
+`cancel_jobs` spools one bulk command for many jobs:
+
+```json
+{"request_id": "ops-cleanup-1", "state": "cancel_requested",
+ "selector": {"states": ["blocked"], "project_id": "koochak"}}
+```
+
+The selector names `job_ids` (at most 10,000 IDs of at most 128 characters;
+the encoded selector is at most 1 MiB), filters, or both (their
+intersection). Filters are `states` (a non-empty subset of `queued`,
+`blocked`, `starting`, `running`, and `finishing`; required unless `job_ids`
+is given), `project_id`, `workflow_id`, `workflow_id_prefix`,
+`request_id_prefix`, `name_prefix`, and `submitted_before` (ISO 8601 with a
+UTC offset). The controller resolves the selector once against its hot state.
+A named job still awaiting admission defers the whole command to a later
+tick. It then cancels at most 512 jobs per tick, each with its ordinary
+`job.cancelled` or `job.cancelling` event carrying `data.bulk_request_id`, and
+each job records `cancel_request_id`. `jobs.cancel_started` (which journals
+the resolved operation), `jobs.cancel_progress` after each tick that advances
+it (not a wake-up for MCP waits by default), and the outcome
+`jobs.cancel_completed` repeat `request_id` and carry `counts`:
+`matched = cancelled + cancelling + ignored`, where `ignored` jobs were already
+terminal or cancelling, plus `unknown` named IDs. The same summary is kept as
+`outcome` in the command's immutable receipt, which `wait_for_command` returns.
+Events carry the selector with an explicit ID list replaced by
+`job_id_count`; the receipt keeps the full command (a command too large for a
+4 MiB receipt is kept by its SHA256, which retries still match).
+An invalid selector produces `command.rejected` and a rejected outcome.
+Progress of an unfinished operation appears in `summary.bulk_operations`.
+Reusing a `request_id` with the same selector is an idempotent retry. On MCP,
+`cancel_jobs` exists only on project-pinned servers and always adds that
+project to the selector; `dry_run=true` previews and `wait_seconds` waits up
+to 300 seconds for the outcome.
 
 `quarantine_gpu`, `clear_gpu_quarantine`, and `reprobe_gpu` use the same
 immutable command inbox. Their correlated outcome is
@@ -399,11 +476,12 @@ clears itself after later good samples. A failed NVIDIA query produces no valid
 sample; in `serve --gpu-health enforce`, missing or stale telemetry withholds
 the node from new GPU work.
 The default `observe` mode records and displays automatic health state without
-withholding capacity. An explicit operator quarantine withholds the whole node
-from new Slurm GPU work until `gpu-clear`, regardless of monitor mode. Slurm
-task binding masks do not reserve specific physical devices. For the local
-launcher, `--gpu-isolation=gpu` (the default) withholds only that GPU, while
-`--gpu-isolation=node` withholds the whole node's GPU capacity.
+withholding capacity. An explicit operator quarantine withholds only that GPU
+when `--gpu-isolation=gpu` (the default), or the whole node with
+`--gpu-isolation=node`, until `gpu-clear`, regardless of monitor mode. Exact
+multi-node GPU binding uses one common slot set on every node; if that cannot
+be represented, Scruffy does not guess. Start with `--gpu-isolation=node` when
+whole-node withholding is the required fallback.
 `gpu-reprobe` uses the controller's latest clean, non-stale monitor sample to
 release an automatic quarantine and emits the same correlated health event. It
 rejects stale or failing evidence and never overrides an operator-owned

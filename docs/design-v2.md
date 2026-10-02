@@ -103,13 +103,14 @@ clean evidence, and materially future-dated samples are rejected.
 The durable key is `(node, NVIDIA UUID)`. Scheduler slot, NVIDIA index, Linux
 minor, and PCI bus ID are reportable mappings, not stable identity. Missing or
 stale evidence fails closed only in enforce mode. The default `gpu` isolation
-maps a quarantined slot out of the local scheduler. Slurm always withholds the
-whole affected node from new GPU work: task GRES binding masks do not control
-physical step allocation. New Slurm jobs use count-based allocation and accept
-Slurm's physical device choice on eligible nodes. Public capacity uses the same
-launcher-aware exclusion policy as scheduling. CPU-only work remains eligible.
-Existing leases remain owned and are not terminated implicitly; persisted
-exact-binding launches retain their original validation during recovery.
+maps a quarantined slot out of the scheduler. Jobs on healthy nodes use
+count-based Slurm allocation; jobs touching a node with a mappable quarantined
+GPU use an explicit GRES mask and verify the physical mapping before exec, so a
+Slurm substitution cannot silently use the stopped GPU. A multi-node exact step
+uses one common slot set on every node; when that contract cannot be
+represented, Scruffy does not construct the unsafe placement. `node` isolation
+remains available as an explicit conservative fallback. Existing leases remain
+owned and are not terminated implicitly.
 
 ### Workflow attempts
 
@@ -133,6 +134,35 @@ outcomes through grace deadlines without auto-kill. A successor copies the
 predecessor's immutable task inputs and records both lineage links plus the
 retry reason. Replay checks the deterministic successor identity before
 admission, so controller recovery cannot fan out duplicate attempts.
+
+### Group commit
+
+The journal is the write-ahead log and `state.json` is a replaceable
+checkpoint of it. One controller poll iteration is one group commit: every
+admission, command, report, and dependency transition in the iteration is
+appended without a sync; the iteration then syncs the journal once, replaces
+the snapshot once, and only afterwards retires request, command, and report
+inbox files. A failure before that commit acknowledges nothing, so a
+restarted controller either replays the journaled outcome or applies the
+still-pending inbox item. Transitions that guard an external effect (the
+`job.starting` reservation before a launch, `job.cancelling` before a signal,
+and the evacuation signal decision) force a commit before that effect. The
+cost of N queued commands is therefore one snapshot write per iteration rather
+than N, and a per-iteration bound keeps one iteration short when thousands of
+command files are pending.
+
+### Retention
+
+The snapshot is sized by live work, not by history. Terminal jobs leave hot
+state through the same journal as every other transition: compact per-job
+archive records (and per-workflow indexes) are written first, then one
+`jobs.archived` record removes the jobs and adds their counts, replayed like
+any other record after a crash. Only an in-progress evacuation's targets and
+`lost` tasks awaiting an automatic retry stay pinned in hot state, plus a
+small recent window for summaries. Journal rotation is independent and occurs
+only when the journal itself grows large. Log directories follow a separate
+bounded retention list so archiving never makes a just-finished job's output
+disappear.
 
 ### Observation
 

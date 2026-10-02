@@ -492,16 +492,10 @@ def unavailable_gpu_ids(
     health: Mapping[str, object],
     inventory: Sequence[NodeInventory],
     *,
-    slurm_managed: bool = False,
     now: datetime | None = None,
     stale_seconds: float = DEFAULT_SAMPLE_STALE_SECONDS,
 ) -> dict[str, Collection[int]]:
-    """Return unavailable slots, withholding quarantined nodes under Slurm.
-
-    Slurm allocates step GPUs before applying task binding masks. A mask cannot
-    reserve our chosen physical devices, so partial-node quarantine is only
-    implementable by the local launcher, which owns device selection.
-    """
+    """Return slots unavailable to new GPU work under the configured policy."""
 
     enforce_automatic = health.get("mode") == "enforce"
     current = now or datetime.now(UTC)
@@ -533,7 +527,7 @@ def unavailable_gpu_ids(
         }
         if not quarantined:
             continue
-        if slurm_managed or health.get("isolation") != "gpu":
+        if health.get("isolation") != "gpu":
             unavailable[inventory_node.name] = inventory_node.gpu_ids
             continue
 

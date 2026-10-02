@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ._compat import UTC
-from .health import unavailable_gpu_ids
+from .health import nodes_requiring_exact_gpu_binding, unavailable_gpu_ids
 from .models import (
     Assignment,
     NodeReservation,
@@ -37,7 +37,7 @@ from .slurm import (
     new_step_name,
 )
 from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
-from .state import active_assignments, emit
+from .state import active_assignments, emit, ensure_committed
 from .storage import (
     StorageError,
     atomic_write_json,
@@ -308,6 +308,22 @@ def _replayable_result(
     return None
 
 
+def record_terminal_result(controller: Controller, job: dict[str, Any]) -> None:
+    """Persist a terminal job's immutable result, adopting one left by a crash.
+
+    The result record is written before its lifecycle event becomes durable.
+    If a controller stopped in between, the job is resolved again on restart
+    with a new timestamp; the existing record is then the authority for the
+    terminal fields instead of a conflicting second record.
+    """
+
+    prior = _replayable_result(controller, job)
+    if prior is not None:
+        _apply_result_record(job, prior)
+        return
+    write_result_record(controller.root, job)
+
+
 def _apply_result_record(job: dict[str, Any], record: Mapping[str, Any]) -> None:
     """Restore terminal fields from a result written before its lifecycle event."""
 
@@ -348,6 +364,21 @@ def remaining_time_limit(job: dict[str, Any]) -> float | None:
     return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
 
 
+def _requires_exact_gpu_binding(
+    controller: Controller, assignment: Assignment
+) -> bool:
+    if (
+        assignment.request.gpus_per_node == 0
+        or getattr(controller, "gpu_isolation", "node") != "gpu"
+    ):
+        return False
+    state = getattr(controller, "state", {})
+    health = state.get("gpu_health", {}) if isinstance(state, Mapping) else {}
+    inventory = getattr(controller, "inventory", ())
+    exact_nodes = nodes_requiring_exact_gpu_binding(health, inventory)
+    return any(item.node in exact_nodes for item in assignment.reservations)
+
+
 def _launch_arguments(
     controller: Controller,
     job: dict[str, Any],
@@ -357,8 +388,12 @@ def _launch_arguments(
     stderr_file: Path,
 ) -> tuple[list[str], dict[str, str] | None]:
     if controller.launcher == "slurm":
-        # Preserve the contract of persisted launches from older controllers.
-        exact_gpu_binding = job.get("gpu_binding") == "exact"
+        binding = job.get("gpu_binding")
+        exact_gpu_binding = (
+            binding == "exact"
+            if binding is not None
+            else _requires_exact_gpu_binding(controller, assignment)
+        )
         return (
             build_srun_argv(
                 slurm_job_id=controller.slurm_job_id or "",
@@ -461,7 +496,9 @@ def start_job(
             f"jobs/{job['id']}/runtime-placement-{index}.json"
             for index, _ in enumerate(assignment.reservations)
         ]
-        job["gpu_binding"] = "count"
+        job["gpu_binding"] = (
+            "exact" if _requires_exact_gpu_binding(controller, assignment) else "count"
+        )
 
     directory = job_directory(controller.root, job["id"])
     assignment_file = directory / "assignment.json"
@@ -517,6 +554,7 @@ def start_job(
         # can be launched. The immutable launch record is already available to
         # the worker by the time that transition is published.
         emit(controller, "job.starting", job=job)
+        ensure_committed(controller)
         atomic_write_json(assignment_file, worker_document)
         argv, environment = _launch_arguments(
             controller,
@@ -599,15 +637,20 @@ def schedule(controller: Controller) -> None:
             QueuedJob(job["id"], ResourceRequest.from_dict(job["request"]))
             for job in queued_images
         ]
+        exact_gpu_nodes = (
+            nodes_requiring_exact_gpu_binding(
+                controller.state.get("gpu_health", {}), controller.inventory
+            )
+            if controller.launcher == "slurm"
+            else frozenset()
+        )
         choice = choose_first_fitting_job(
             controller.inventory,
             active_assignments(controller.state),
             queued,
-            unavailable_gpu_ids(
-                controller.state.get("gpu_health", {}),
-                controller.inventory,
-                slurm_managed=controller.launcher == "slurm",
-            ),
+            unavailable_gpu_ids(controller.state.get("gpu_health", {}), controller.inventory),
+            exact_gpu_nodes=exact_gpu_nodes,
+            slurm_count_binding=controller.launcher == "slurm",
         )
         if choice is None:
             return
@@ -616,9 +659,25 @@ def schedule(controller: Controller) -> None:
 
 
 def request_cancellation(
-    controller: Controller, job: dict[str, Any], request_id: str | None = None
+    controller: Controller,
+    job: dict[str, Any],
+    request_id: str | None = None,
+    *,
+    bulk: bool = False,
+    deferred_stops: list[RunningProcess] | None = None,
 ) -> bool:
-    data = {"request_id": request_id} if request_id else None
+    """Cancel one job, returning false when its state cannot be cancelled.
+
+    The job records ``cancel_request_id``. A bulk operation correlates its
+    per-job events by ``bulk_request_id`` because only the operation's final
+    summary is that command's outcome. When ``deferred_stops`` is given,
+    launchers are collected for the caller to stop after one commit instead of
+    being signalled one by one.
+    """
+
+    data = None
+    if request_id:
+        data = {"bulk_request_id" if bulk else "request_id": request_id}
     if job["state"] in {"queued", "blocked"}:
         prior = _replayable_result(controller, job)
         if prior is not None:
@@ -628,6 +687,8 @@ def request_cancellation(
         job["state"] = "cancelled"
         job["finished_at"] = utc_now()
         job["reason"] = "cancelled_before_start"
+        if request_id:
+            job["cancel_request_id"] = request_id
         write_result_record(controller.root, job)
         emit(controller, "job.cancelled", job=job, data=data)
         return True
@@ -635,13 +696,21 @@ def request_cancellation(
         return False
     job["state"] = "cancelling"
     job["reason"] = "cancel_requested"
+    if request_id:
+        job["cancel_request_id"] = request_id
     emit(controller, "job.cancelling", job=job, data=data)
     running = controller.running.get(job["id"])
     if running is not None:
         if running.final_state is None:
             running.final_state = "cancelled"
             running.final_reason = "cancelled"
-        stop_launcher(controller, running)
+        if deferred_stops is not None:
+            deferred_stops.append(running)
+        else:
+            # The cancelling transition must be durable before the launcher
+            # can observe the request.
+            ensure_committed(controller)
+            stop_launcher(controller, running)
     return True
 
 

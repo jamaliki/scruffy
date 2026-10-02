@@ -8,6 +8,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
@@ -111,8 +112,12 @@ class Controller:
     slurm_query_error: str | None = None
     report_cursor: str | None = None
     workflow_signatures: dict[tuple[str, str], tuple[tuple[str, object], ...]] | None = None
+    # Wall-clock times at which a workflow must be re-resolved even without a
+    # state change, such as when an artifact producer's settling time ends.
+    workflow_recheck_at: dict[tuple[str, str], float] = field(default_factory=dict)
     gpu_health_mode: str = "off"
     gpu_isolation: str = "gpu"
+    legacy_report_projects: tuple[str, ...] = ()
     gpu_health_interval: float = 10.0
     health_worker_release_sha256: str = ""
     health_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
@@ -124,6 +129,12 @@ class Controller:
     health_replaced_step_ids: dict[str, set[str]] = field(default_factory=dict)
     health_monitor_errors: dict[str, str] = field(default_factory=dict)
     health_ingest_errors: dict[str, str] = field(default_factory=dict)
+    # Group commit: while commit_depth is positive, emit() appends events
+    # without syncing the journal or replacing the snapshot. One commit then
+    # publishes the batch and runs actions that must follow durability.
+    commit_depth: int = 0
+    commit_pending: bool = False
+    after_commit: list[Callable[[], None]] = field(default_factory=list)
 
 
 def copy_stream(

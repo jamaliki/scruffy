@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._compat import UTC
+from .bulk import cancel_selector, selector_matches, selector_summary
 from .health import (
     GPU_ISOLATION_MODES,
     HEALTH_MODES,
@@ -32,6 +33,7 @@ from .lifecycle import (
     begin_shutdown,
     drain_messages,
     poll_processes,
+    record_terminal_result,
     remaining_time_limit,
     request_cancellation,
     schedule,
@@ -55,6 +57,7 @@ from .runtime import (
     RunningProcess,
     abandon_processes,
     signal_process,
+    stop_launcher,
 )
 from .scheduler import InvariantError, assert_invariants, request_can_ever_fit
 from .slurm import (
@@ -67,12 +70,16 @@ from .slurm import (
     signal_step,
 )
 from .state import (
+    after_commit,
     apply_workload_event,
     commit_snapshot,
     compact_journal,
     emit,
     emit_submission,
+    ensure_committed,
+    group_commit,
     load_recovered_state,
+    log_directories_to_keep,
 )
 from .storage import (
     StorageError,
@@ -82,7 +89,9 @@ from .storage import (
     accept_reports,
     accept_request,
     accept_submission,
+    acknowledge_commands,
     archive_terminal_job,
+    command_sources,
     compact_report_receipts,
     controller_lock,
     create_immutable_json,
@@ -105,7 +114,9 @@ from .storage import (
     reject_request,
     remove_cold_job_directories,
     remove_command,
+    remove_stale_state_temporaries,
     report_identity_digest,
+    report_inbox_pending,
     report_streams,
     report_was_accepted,
     request_pending,
@@ -125,8 +136,23 @@ from .workflows import (
 )
 
 MAX_REPORTS_PER_TICK = 128
+# Commands are applied in one group commit per tick. The bound keeps one tick
+# short when thousands of command files are pending on a shared filesystem.
+MAX_COMMANDS_PER_TICK = 512
+# Each cancelled job writes an immutable result record, so a bulk operation
+# over thousands of jobs advances over several ticks, one commit per tick.
+MAX_BULK_CANCELS_PER_TICK = 512
+MAX_REPORTED_UNKNOWN_JOB_IDS = 20
+# Skips write immutable result records; a backlog drains over several ticks.
+MAX_DEPENDENCY_SKIPS_PER_TICK = 512
+# A producer's publication may be spooled just before it exits and become
+# visible to the controller later on a shared filesystem. Its artifact
+# waiters are skipped only after this settling time and an empty inbox.
+ARTIFACT_SKIP_GRACE_SECONDS = 600
+REPORT_INBOX_RECHECK_SECONDS = 5
 STORAGE_RETRY_SECONDS = 5
 COMMAND_OUTCOME_KINDS = {
+    "jobs.cancel_completed",
     "job.cancelled",
     "job.cancelling",
     "job.cancel_ignored",
@@ -166,8 +192,13 @@ def _initialize_controller(
     gpu_health_mode: str = "observe",
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
+    legacy_report_projects: tuple[str, ...] = (),
 ) -> Controller:
     controller_release = _normalize_controller_release(controller_release)
+    legacy_report_projects = tuple(normalize_project_id(p) for p in legacy_report_projects)
+    # Only the lock-holding controller writes snapshots, so any temporary
+    # replacement left by an interrupted predecessor is garbage.
+    removed_temporaries = remove_stale_state_temporaries(root)
     state = load_recovered_state(root)
     health = ensure_health_state(state, mode=gpu_health_mode, isolation=gpu_isolation)
     worker_release = _health_worker_release_sha256()
@@ -250,6 +281,7 @@ def _initialize_controller(
         output=OutputNotifier(messages),
         gpu_health_mode=gpu_health_mode,
         gpu_isolation=gpu_isolation,
+        legacy_report_projects=legacy_report_projects,
         gpu_health_interval=gpu_health_interval,
         health_worker_release_sha256=worker_release,
         health_step_name=(
@@ -261,196 +293,202 @@ def _initialize_controller(
         ),
     )
 
-    if replacement:
-        evacuation = state.get("evacuation")
-        request = (
-            state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
-            if isinstance(evacuation, dict)
-            else None
-        )
-        if (
-            isinstance(evacuation, dict)
-            and evacuation.get("state") not in {"complete", "partial", "cancelled"}
-            and isinstance(request, dict)
-        ):
-            for target in evacuation.get("targets", {}).values():
-                if isinstance(target, dict) and target.get("outcome") not in EVACUATION_TERMINAL_OUTCOMES:
-                    target.update({"outcome": "lost", "reason": "allocation_replaced"})
-            evacuation["state"] = "partial"
-            _evacuation_emit(controller, evacuation, request, "evacuation.partial")
-
-    lost_reason = None
-    if same_slurm_allocation:
-        _reattach_slurm_jobs(controller, active)
-    else:
-        if legacy_slurm_allocation:
-            active_lost_reason = "allocation_incarnation_unavailable"
-        elif previous.get("id") == allocation_id:
-            active_lost_reason = "allocation_incarnation_changed"
-        else:
-            active_lost_reason = "allocation_replaced"
-        lost_active: list[dict[str, Any]] = []
-        recovered_terminal: list[dict[str, Any]] = []
-        # A replaced or restarted Slurm incarnation cannot retain its old
-        # steps. Legacy active records are not upgraded to a new incarnation;
-        # launches remain paused below until an operator audits the old work.
-        for job in active:
-            prior = read_result_record(root, str(job["id"]))
-            # A persisted loss result is the first half of the loss
-            # transaction, not a completed workflow outcome.  Replay must
-            # retain its immutable timestamp/assignment while still emitting
-            # job.lost and admitting the deterministic successor.
+    # Recovery is pure state: one group commit publishes every loss, retry
+    # admission, and the allocation record with one snapshot write, which
+    # matters when a large legacy snapshot is adopted.
+    with group_commit(controller):
+        if replacement:
+            evacuation = state.get("evacuation")
+            request = (
+                state.get("evacuation_requests", {}).get(evacuation.get("request_id"))
+                if isinstance(evacuation, dict)
+                else None
+            )
             if (
-                prior is not None
-                and prior.get("state") in TERMINAL_JOB_STATES
-                and prior.get("state") != "lost"
-                and type(job.get("attempt")) is int
+                isinstance(evacuation, dict)
+                and evacuation.get("state") not in {"complete", "partial", "cancelled"}
+                and isinstance(request, dict)
             ):
-                job.update(
-                    {
-                        "state": prior["state"],
-                        "finished_at": prior.get("finished_at"),
-                        "exit_code": prior.get("exit_code"),
-                        "signal": prior.get("signal"),
-                        "reason": prior.get("reason"),
-                        "error": prior.get("error"),
-                        "last_assignment": prior.get("assignment"),
-                        "assignment": None,
-                    }
+                for target in evacuation.get("targets", {}).values():
+                    if isinstance(target, dict) and target.get("outcome") not in EVACUATION_TERMINAL_OUTCOMES:
+                        target.update({"outcome": "lost", "reason": "allocation_replaced"})
+                evacuation["state"] = "partial"
+                _evacuation_emit(controller, evacuation, request, "evacuation.partial")
+
+        lost_reason = None
+        if same_slurm_allocation:
+            _reattach_slurm_jobs(controller, active)
+        else:
+            if legacy_slurm_allocation:
+                active_lost_reason = "allocation_incarnation_unavailable"
+            elif previous.get("id") == allocation_id:
+                active_lost_reason = "allocation_incarnation_changed"
+            else:
+                active_lost_reason = "allocation_replaced"
+            lost_active: list[dict[str, Any]] = []
+            recovered_terminal: list[dict[str, Any]] = []
+            # A replaced or restarted Slurm incarnation cannot retain its old
+            # steps. Legacy active records are not upgraded to a new incarnation;
+            # launches remain paused below until an operator audits the old work.
+            for job in active:
+                prior = read_result_record(root, str(job["id"]))
+                # A persisted loss result is the first half of the loss
+                # transaction, not a completed workflow outcome.  Replay must
+                # retain its immutable timestamp/assignment while still emitting
+                # job.lost and admitting the deterministic successor.
+                if (
+                    prior is not None
+                    and prior.get("state") in TERMINAL_JOB_STATES
+                    and prior.get("state") != "lost"
+                    and type(job.get("attempt")) is int
+                ):
+                    job.update(
+                        {
+                            "state": prior["state"],
+                            "finished_at": prior.get("finished_at"),
+                            "exit_code": prior.get("exit_code"),
+                            "signal": prior.get("signal"),
+                            "reason": prior.get("reason"),
+                            "error": prior.get("error"),
+                            "last_assignment": prior.get("assignment"),
+                            "assignment": None,
+                        }
+                    )
+                    recovered_terminal.append(job)
+                    continue
+                lost_active.append(job)
+                job["state"] = "lost"
+                job["finished_at"] = (
+                    (prior.get("finished_at") if prior is not None else None)
+                    or job.get("finished_at")
+                    or job.get("started_at")
+                    or job.get("submitted_at")
+                    or utc_now()
                 )
-                recovered_terminal.append(job)
-                continue
-            lost_active.append(job)
-            job["state"] = "lost"
-            job["finished_at"] = (
-                (prior.get("finished_at") if prior is not None else None)
-                or job.get("finished_at")
-                or job.get("started_at")
-                or job.get("submitted_at")
-                or utc_now()
-            )
-            job["reason"] = active_lost_reason
-            _mark_retry_exhaustion(job, active_lost_reason)
-            job["last_assignment"] = (
-                prior.get("assignment") if prior is not None else job.get("assignment")
-            )
-            job["assignment"] = None
-            write_result_record(root, job)
-        if lost_active:
-            lost_reason = active_lost_reason
-        for job in lost_active:
-            emit(controller, "job.lost", job=job, snapshot=False)
-        for job in recovered_terminal:
-            emit(controller, f"job.{job['state']}", job=job, snapshot=False)
-        if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
-            _recover_lost_workflow_jobs(controller, active_lost_reason)
+                job["reason"] = active_lost_reason
+                _mark_retry_exhaustion(job, active_lost_reason)
+                job["last_assignment"] = (
+                    prior.get("assignment") if prior is not None else job.get("assignment")
+                )
+                job["assignment"] = None
+                write_result_record(root, job)
+            if lost_active:
+                lost_reason = active_lost_reason
+            for job in lost_active:
+                emit(controller, "job.lost", job=job, snapshot=False)
+            for job in recovered_terminal:
+                emit(controller, f"job.{job['state']}", job=job, snapshot=False)
+            if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
+                _recover_lost_workflow_jobs(controller, active_lost_reason)
 
-    # Queued and later workflow jobs have already crossed their dependency
-    # gate. Persist the marker for snapshots created before the field existed.
-    for job in state["jobs"].values():
-        if isinstance(job.get("workflow_id"), str):
-            job.setdefault("dependency_gate_passed", job.get("state") != "blocked")
+        # Queued and later workflow jobs have already crossed their dependency
+        # gate. Persist the marker for snapshots created before the field existed.
+        for job in state["jobs"].values():
+            if isinstance(job.get("workflow_id"), str):
+                job.setdefault("dependency_gate_passed", job.get("state") != "blocked")
 
-    now = utc_now()
-    metadata = allocation_metadata(allocation_id, launcher)
-    metadata["controller_release"] = controller_release
-    if allocation_incarnation is not None:
-        metadata["incarnation"] = allocation_incarnation.to_dict()
-    metadata.update(
-        {
-            "state": "running",
-            "started_at": (previous.get("started_at", now) if same_slurm_allocation else now),
-            "controller_started_at": now,
-            "heartbeat_at": now,
-        }
-    )
-    if slurm_job_id:
-        metadata["slurm_job_id"] = slurm_job_id
-    if same_slurm_allocation and isinstance(previous.get("handover"), dict):
-        metadata["handover"] = previous["handover"]
-    deadline_at = metadata.get("deadline_at")
-    if drain_before_end_seconds and isinstance(deadline_at, str):
-        deadline = datetime.fromisoformat(deadline_at)
-        metadata["automatic_drain_at"] = (
-            (deadline - timedelta(seconds=drain_before_end_seconds))
-            .astimezone(UTC)
-            .isoformat(timespec="seconds")
+        now = utc_now()
+        metadata = allocation_metadata(allocation_id, launcher)
+        metadata["controller_release"] = controller_release
+        metadata["legacy_report_projects"] = list(legacy_report_projects)
+        if allocation_incarnation is not None:
+            metadata["incarnation"] = allocation_incarnation.to_dict()
+        metadata.update(
+            {
+                "state": "running",
+                "started_at": (previous.get("started_at", now) if same_slurm_allocation else now),
+                "controller_started_at": now,
+                "heartbeat_at": now,
+            }
         )
-    if evacuate_before_end_seconds and isinstance(deadline_at, str):
-        deadline = datetime.fromisoformat(deadline_at)
-        metadata["automatic_evacuate_at"] = (
-            (deadline - timedelta(seconds=evacuate_before_end_seconds))
-            .astimezone(UTC)
-            .isoformat(timespec="seconds")
-        )
-    drain_requested = bool(
-        state.get(
-            "drain_requested",
-            state.get("draining") and previous.get("state") == "draining",
-        )
-    )
-    # A drain belongs to one physical allocation incarnation. Slurm can reuse
-    # the same job ID after requeue, but none of the old steps survive it.
-    preserve_drain = drain_requested and (
-        same_slurm_allocation or (launcher == "local" and previous.get("id") == allocation_id)
-    )
-    if preserve_drain:
-        metadata["state"] = "draining"
-    state["allocation"] = metadata
-    state["draining"] = preserve_drain
-    state["drain_requested"] = preserve_drain
-    # Recovery owns existing steps but never admits additional work implicitly.
-    # An operator must explicitly resume after checking the recovered snapshot.
-    state["launches_paused"] = same_slurm_allocation or legacy_slurm_allocation or start_paused
-    ineligible = [
-        job["id"]
-        for job in state["jobs"].values()
-        if job["state"] in {"queued", "blocked"}
-        and not request_can_ever_fit(inventory, ResourceRequest.from_dict(job["request"]))
-    ]
-    if replacement:
-        metadata["handover"] = {
-            "previous_allocation_id": previous_allocation_id,
-            "lost_jobs": len(active),
-            "queued_jobs": sum(job["state"] == "queued" for job in state["jobs"].values()),
-            "blocked_jobs": sum(job["state"] == "blocked" for job in state["jobs"].values()),
-            "ineligible_jobs": len(ineligible),
-        }
-        if previous_incarnation is not None:
-            metadata["handover"]["previous_incarnation_sha256"] = (
-                previous_incarnation.fingerprint_sha256
+        if slurm_job_id:
+            metadata["slurm_job_id"] = slurm_job_id
+        if same_slurm_allocation and isinstance(previous.get("handover"), dict):
+            metadata["handover"] = previous["handover"]
+        deadline_at = metadata.get("deadline_at")
+        if drain_before_end_seconds and isinstance(deadline_at, str):
+            deadline = datetime.fromisoformat(deadline_at)
+            metadata["automatic_drain_at"] = (
+                (deadline - timedelta(seconds=drain_before_end_seconds))
+                .astimezone(UTC)
+                .isoformat(timespec="seconds")
             )
-    emit(
-        controller,
-        "allocation.resumed" if same_slurm_allocation else "allocation.started",
-        data={
-            "nodes": [item.to_dict() for item in inventory],
-            "incarnation": (
-                allocation_incarnation.to_dict() if allocation_incarnation is not None else None
-            ),
-            "controller_release": controller_release,
-            "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
-            "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
-            "lost_reason": lost_reason,
-            **({"handover": metadata["handover"]} if replacement else {}),
-        },
-    )
-    if state["launches_paused"]:
+        if evacuate_before_end_seconds and isinstance(deadline_at, str):
+            deadline = datetime.fromisoformat(deadline_at)
+            metadata["automatic_evacuate_at"] = (
+                (deadline - timedelta(seconds=evacuate_before_end_seconds))
+                .astimezone(UTC)
+                .isoformat(timespec="seconds")
+            )
+        drain_requested = bool(
+            state.get(
+                "drain_requested",
+                state.get("draining") and previous.get("state") == "draining",
+            )
+        )
+        # A drain belongs to one physical allocation incarnation. Slurm can reuse
+        # the same job ID after requeue, but none of the old steps survive it.
+        preserve_drain = drain_requested and (
+            same_slurm_allocation or (launcher == "local" and previous.get("id") == allocation_id)
+        )
+        if preserve_drain:
+            metadata["state"] = "draining"
+        state["allocation"] = metadata
+        state["draining"] = preserve_drain
+        state["drain_requested"] = preserve_drain
+        # Recovery owns existing steps but never admits additional work implicitly.
+        # An operator must explicitly resume after checking the recovered snapshot.
+        state["launches_paused"] = same_slurm_allocation or legacy_slurm_allocation or start_paused
+        ineligible = [
+            job["id"]
+            for job in state["jobs"].values()
+            if job["state"] in {"queued", "blocked"}
+            and not request_can_ever_fit(inventory, ResourceRequest.from_dict(job["request"]))
+        ]
+        if replacement:
+            metadata["handover"] = {
+                "previous_allocation_id": previous_allocation_id,
+                "lost_jobs": len(active),
+                "queued_jobs": sum(job["state"] == "queued" for job in state["jobs"].values()),
+                "blocked_jobs": sum(job["state"] == "blocked" for job in state["jobs"].values()),
+                "ineligible_jobs": len(ineligible),
+            }
+            if previous_incarnation is not None:
+                metadata["handover"]["previous_incarnation_sha256"] = (
+                    previous_incarnation.fingerprint_sha256
+                )
         emit(
             controller,
-            "allocation.launches_paused",
+            "allocation.resumed" if same_slurm_allocation else "allocation.started",
             data={
-                "reason": (
-                    "controller_restart"
-                    if same_slurm_allocation
-                    else (
-                        "legacy_incarnation_audit_required"
-                        if legacy_slurm_allocation
-                        else "operator_requested"
-                    )
-                )
+                "nodes": [item.to_dict() for item in inventory],
+                "incarnation": (
+                    allocation_incarnation.to_dict() if allocation_incarnation is not None else None
+                ),
+                "controller_release": controller_release,
+                "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
+                "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
+                "lost_reason": lost_reason,
+                "removed_stale_temporaries": removed_temporaries,
+                **({"handover": metadata["handover"]} if replacement else {}),
             },
         )
+        if state["launches_paused"]:
+            emit(
+                controller,
+                "allocation.launches_paused",
+                data={
+                    "reason": (
+                        "controller_restart"
+                        if same_slurm_allocation
+                        else (
+                            "legacy_incarnation_audit_required"
+                            if legacy_slurm_allocation
+                            else "operator_requested"
+                        )
+                    )
+                },
+            )
     return controller
 
 
@@ -665,7 +703,8 @@ def _admit_recovery_successor(
     event_kind = _initial_job_event(controller, successor, prospective)
     write_request_record(controller.root, successor)
     if successor.get("state") in TERMINAL_JOB_STATES:
-        write_result_record(controller.root, successor)
+        record_terminal_result(controller, successor)
+        event_kind = f"job.{successor['state']}"
     controller.state["jobs"][successor_id] = successor
     emit(
         controller,
@@ -1278,6 +1317,7 @@ def _signal_evacuation_target(
     # drained if delivery was not confirmed.
     _write_signal_receipt(controller, job, target)
     _evacuation_emit(controller, evacuation, request, "evacuation.signalling")
+    ensure_committed(controller)
     try:
         if controller.launcher == "slurm":
             job["slurm_step_id"] = target_step
@@ -1941,11 +1981,15 @@ def _check_artifact_condition_conflict(
             )
 
 
-def _report_capability_valid(job: dict[str, Any], event: dict[str, Any]) -> bool:
-    """Verify a worker capability when present; queue-root access is legacy trust."""
+def _report_capability_valid(
+    job: dict[str, Any], event: dict[str, Any], legacy_projects: tuple[str, ...] = (),
+) -> bool:
+    """Permit old unsigned clients only in explicitly operator-opted-in projects."""
 
     expected = job.get("launch_token")
     supplied = event.get("source", {}).get("launch_token")
+    if supplied is None and job_project(job) in legacy_projects:
+        return True
     return not isinstance(expected, str) or supplied == expected
 
 
@@ -2013,7 +2057,8 @@ def _admit_job(
     if all(key in job for key in ("argv", "cwd", "env", "request")):
         write_request_record(controller.root, job)
     if job.get("state") in TERMINAL_JOB_STATES:
-        write_result_record(controller.root, job)
+        record_terminal_result(controller, job)
+        event_kind = f"job.{job['state']}"
     controller.state["jobs"][job["id"]] = job
     emit(controller, event_kind, job=job)
 
@@ -2195,15 +2240,21 @@ def _admit_atomic_submission(
                 "reason": str(exc),
             },
         )
-        _finish_atomic_submission(controller, submission_id, document)
+        # Retire the envelope (and burn its IDs) only once the rejection,
+        # the only record of why, is durable.
+        after_commit(
+            controller,
+            lambda: _finish_atomic_submission(controller, submission_id, document),
+        )
         return next_order
 
     complete = {**prospective, **{job["id"]: job for job in jobs}}
     events = [_initial_job_event(controller, job, complete) for job in jobs]
-    for job in jobs:
+    for index, job in enumerate(jobs):
         write_request_record(controller.root, job)
         if job.get("state") in TERMINAL_JOB_STATES:
-            write_result_record(controller.root, job)
+            record_terminal_result(controller, job)
+            events[index] = f"job.{job['state']}"
     controller.state["jobs"].update({job["id"]: job for job in jobs})
     controller.state["next_queue_order"] = next_order + len(jobs)
     emit_submission(controller, submission_id, jobs)
@@ -2222,6 +2273,13 @@ def _admit_atomic_submission(
 
 
 def _ingest_requests(controller: Controller) -> None:
+    """Admit pending requests with one commit, then retire their inbox files."""
+
+    with group_commit(controller):
+        _admit_pending_requests(controller)
+
+
+def _admit_pending_requests(controller: Controller) -> None:
     known = controller.state["jobs"]
     next_order = max(
         int(controller.state.get("next_queue_order", 0)),
@@ -2261,16 +2319,21 @@ def _ingest_requests(controller: Controller) -> None:
             continue
         if document is None:
             # Decodable corruption is a permanent verdict; transient reads do
-            # not appear in list_submissions and are retried next tick.
-            try:
-                reject_request(controller.root, submission_id)
-                emit(
-                    controller,
-                    "submission.rejected",
-                    data={"submission_id": submission_id, "reason": "invalid document"},
-                )
-            except (OSError, StorageError) as exc:
-                _storage_notice(controller, "reject_submission", submission_id, exc)
+            # not appear in list_submissions and are retried next tick. The
+            # envelope is retired only after its rejection is durable.
+            emit(
+                controller,
+                "submission.rejected",
+                data={"submission_id": submission_id, "reason": "invalid document"},
+            )
+
+            def reject_envelope(submission_id: str = submission_id) -> None:
+                try:
+                    reject_request(controller.root, submission_id)
+                except (OSError, StorageError) as exc:
+                    _storage_notice(controller, "reject_submission", submission_id, exc)
+
+            after_commit(controller, reject_envelope)
             continue
         specs = document.get("jobs")
         job_ids = (
@@ -2312,7 +2375,14 @@ def _ingest_requests(controller: Controller) -> None:
     controller.state["next_queue_order"] = next_order
     for job, malformed_identity in staged:
         _admit_job(controller, job, prospective)
-        _finish_staged_request(controller, job, malformed_identity)
+    if staged:
+        # A request directory is the only full copy of its job until the
+        # admission event is durable; retire inbox entries only afterwards.
+        def finish_staged() -> None:
+            for job, malformed_identity in staged:
+                _finish_staged_request(controller, job, malformed_identity)
+
+        after_commit(controller, finish_staged)
 
 
 def _workflow_groups(
@@ -2360,9 +2430,112 @@ def _workflow_groups(
 def _refresh_dependencies(controller: Controller) -> None:
     """Refresh dirty workflows, including terminal dependency cascades."""
 
+    with group_commit(controller):
+        _refresh_dirty_workflows(controller)
+
+
+def _retry_pending(controller: Controller, producer: dict[str, Any]) -> bool:
+    """Return whether a terminal attempt still expects a deterministic retry."""
+
+    if producer.get("successor_job_id") is not None:
+        return False
+    reason = producer.get("reason")
+    if not isinstance(reason, str) or _recovery_candidate(producer, reason) is None:
+        return False
+    if reason in AUTO_RECOVERY_REASONS:
+        # Admitted by the next controller start in this or a later allocation.
+        return True
+    evacuation = controller.state.get("evacuation")
+    return (
+        reason == "evacuated"
+        and isinstance(evacuation, dict)
+        and evacuation.get("state") not in {"complete", "partial", "cancelled"}
+        and producer.get("id") in (evacuation.get("targets") or {})
+    )
+
+
+def _final_artifact_producers(
+    controller: Controller,
+    resolution_jobs: list[dict[str, Any]],
+    blocked_jobs: list[dict[str, Any]],
+    now: float,
+) -> tuple[set[str], float | None]:
+    """Find terminal producers whose awaited publications can no longer arrive.
+
+    A producer that never ran (skipped or rejected) is final at once. Any
+    other terminal producer is final only when no deterministic retry is due,
+    its report inbox is empty, and ``ARTIFACT_SKIP_GRACE_SECONDS`` have passed
+    since it finished, which covers a publication spooled just before exit
+    that the shared filesystem has not shown the controller yet. Also return
+    the earliest wall-clock time at which a pending producer should be
+    re-examined.
+    """
+
+    selected = select_task_attempts(resolution_jobs)
+    final: set[str] = set()
+    recheck_at: float | None = None
+    examined: set[str] = set()
+    for job in blocked_jobs:
+        satisfied = {
+            (item.get("task_id"), item.get("artifact_id"))
+            for item in job.get("condition_satisfactions") or []
+            if isinstance(item, dict)
+        }
+        for task_id, artifact_id in artifact_conditions(job):
+            if (task_id, artifact_id) in satisfied:
+                continue
+            producer = selected.get((job_project(job), str(job["workflow_id"]), task_id))
+            producer_id = producer.get("id") if producer is not None else None
+            if (
+                producer is None
+                or not isinstance(producer_id, str)
+                or producer_id in examined
+                or producer.get("state") not in TERMINAL_JOB_STATES
+            ):
+                continue
+            examined.add(producer_id)
+            if producer.get("state") in {"skipped", "rejected"}:
+                final.add(producer_id)
+                continue
+            if _retry_pending(controller, producer):
+                continue
+            finished = _wall_time(producer.get("finished_at") or producer.get("submitted_at"))
+            if finished is None:
+                # Without a trustworthy end time the settling time cannot be
+                # proven; keep waiting (an operator can cancel explicitly).
+                continue
+            settles_at = finished + ARTIFACT_SKIP_GRACE_SECONDS
+            if settles_at > now:
+                recheck_at = settles_at if recheck_at is None else min(recheck_at, settles_at)
+                continue
+            if report_inbox_pending(controller.root, producer_id):
+                retry = now + REPORT_INBOX_RECHECK_SECONDS
+                recheck_at = retry if recheck_at is None else min(recheck_at, retry)
+                continue
+            final.add(producer_id)
+    return final, recheck_at
+
+
+def _wall_time(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _refresh_dirty_workflows(controller: Controller) -> None:
     jobs = controller.state["jobs"]
     workflows, blocked_by_workflow, signatures = _workflow_groups(jobs)
     previous = controller.workflow_signatures
+    now = time.time()
+    recheck = controller.workflow_recheck_at
+    for workflow_key in [key for key in recheck if key not in signatures]:
+        del recheck[workflow_key]
     dirty = (
         list(signatures)
         if previous is None
@@ -2370,21 +2543,29 @@ def _refresh_dependencies(controller: Controller) -> None:
             workflow_key
             for workflow_key, signature in signatures.items()
             if previous.get(workflow_key) != signature
+            or recheck.get(workflow_key, now + 1) <= now
         ]
     )
     if not dirty:
         controller.workflow_signatures = signatures
         return
 
-    retry_invalid: set[tuple[str, str]] = set()
-    for workflow_key in dirty:
+    uncached: set[tuple[str, str]] = set()
+    # Each skip writes an immutable result record; bound one tick's work so a
+    # backlog of thousands of stale waits drains over several short ticks.
+    budget = MAX_DEPENDENCY_SKIPS_PER_TICK
+    for index, workflow_key in enumerate(dirty):
+        if budget <= 0:
+            uncached.update(dirty[index:])
+            break
+        recheck.pop(workflow_key, None)
         project_id, workflow_id = workflow_key
         blocked_jobs = blocked_by_workflow.get(workflow_key, [])
         if not blocked_jobs:
             continue
         archived = _archived_workflow_jobs(controller, project_id, workflow_id)
         if archived is None:
-            retry_invalid.add(workflow_key)
+            uncached.add(workflow_key)
             continue
         try:
             resolution_jobs = _resolution_workflow_jobs(
@@ -2395,16 +2576,23 @@ def _refresh_dependencies(controller: Controller) -> None:
                 project_id,
                 workflow_id,
             )
-            resolutions = resolve_blocked_jobs(resolution_jobs)
+            final_producers, recheck_at = _final_artifact_producers(
+                controller, resolution_jobs, blocked_jobs, now
+            )
+            resolutions = resolve_blocked_jobs(
+                resolution_jobs, final_producers=final_producers
+            )
         except WorkflowError as exc:
             # Repair invalid persisted graphs one task at a time. Leaving the
             # cache dirty retries the remaining graph on the next tick.
             job = blocked_jobs[0]
             _mark_workflow_rejected(job, exc)
-            write_result_record(controller.root, job)
-            emit(controller, "job.rejected", job=job)
-            retry_invalid.add(workflow_key)
+            record_terminal_result(controller, job)
+            emit(controller, f"job.{job['state']}", job=job)
+            uncached.add(workflow_key)
             continue
+        if recheck_at is not None:
+            recheck[workflow_key] = recheck_at
 
         jobs_by_key = {(project_id, workflow_id, job["task_id"]): job for job in blocked_jobs}
         # The batch resolver returns topological order, so predicted upstream
@@ -2413,6 +2601,11 @@ def _refresh_dependencies(controller: Controller) -> None:
             job = jobs_by_key[key]
             blockers = resolution["blockers"]
             decision = resolution["decision"]
+            if decision == "skipped" and budget <= 0:
+                # Later resolutions may assume this skip; stop the workflow
+                # here and finish it next tick.
+                uncached.add(workflow_key)
+                break
             if decision == "ready":
                 job["dependency_gate_passed"] = True
                 job["state"] = "queued"
@@ -2422,13 +2615,14 @@ def _refresh_dependencies(controller: Controller) -> None:
                 job["resolved_conditions"] = _resolved_condition_evidence(job)
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
+                budget -= 1
                 job["dependency_gate_passed"] = True
                 job["state"] = "skipped"
                 job["finished_at"] = utc_now()
                 job["reason"] = resolution["reason"]
                 job["blockers"] = blockers
-                write_result_record(controller.root, job)
-                emit(controller, "job.skipped", job=job)
+                record_terminal_result(controller, job)
+                emit(controller, f"job.{job['state']}", job=job)
             elif blockers != job.get("blockers"):
                 job["blockers"] = blockers
 
@@ -2438,7 +2632,7 @@ def _refresh_dependencies(controller: Controller) -> None:
     controller.workflow_signatures = {
         workflow_key: signature
         for workflow_key, signature in current.items()
-        if workflow_key not in retry_invalid
+        if workflow_key not in uncached
     }
 
 
@@ -2472,130 +2666,358 @@ def _finish_missing_cancel(controller: Controller, command: dict[str, Any], job_
     return True
 
 
-def _ingest_commands(controller: Controller) -> None:
-    for source, command in list_commands(controller.root):
-        deferred = False
-        kind = command.get("kind")
-        if kind == "cancel":
-            job_id = str(command.get("job_id"))
-            job = controller.state["jobs"].get(job_id)
-            if job is None:
-                # Submit returns only after its request is durable. If command
-                # ingestion won a polling race, retain the cancel for next tick.
-                deferred = not _finish_missing_cancel(controller, command, job_id)
-            elif not request_cancellation(controller, job, str(command.get("request_id") or "")):
-                emit(
-                    controller,
-                    "job.cancel_ignored",
-                    data={
-                        "request_id": command.get("request_id"),
-                        "job_id": job_id,
-                        "reason": f"job_is_{job['state']}",
-                    },
+def _ingest_commands(
+    controller: Controller,
+    limit: int = MAX_COMMANDS_PER_TICK,
+    bulk_limit: int = MAX_BULK_CANCELS_PER_TICK,
+) -> None:
+    """Apply a bounded batch of commands and persist their effects once.
+
+    Every command's transitions are emitted inside one group commit. A command
+    file is acknowledged (immutable receipt, then removal) only after the
+    journal and snapshot containing its effect are durable, so a crash at any
+    point either replays the outcome from the journal or retries the command.
+    """
+
+    handled: list[tuple[Path, dict[str, Any], dict[str, Any] | None]] = []
+    stops: list[RunningProcess] = []
+    bulk_budget = bulk_limit
+    with group_commit(controller):
+        for source in command_sources(controller.root)[:limit]:
+            command = read_json(source)
+            if command.get("kind") == "cancel_jobs":
+                finished, outcome, used = _apply_bulk_cancel(
+                    controller, command, stops, bulk_budget
                 )
-        elif kind == "drain":
-            data = {"request_id": command.get("request_id")}
-            if controller.state["draining"]:
-                emit(
-                    controller,
-                    "allocation.drain_ignored",
-                    data={**data, "reason": "already_draining"},
-                )
-            else:
-                controller.state["draining"] = True
-                controller.state["drain_requested"] = True
-                controller.state["allocation"]["state"] = "draining"
-                emit(controller, "allocation.draining", data=data)
-        elif kind == "resume":
-            data = {"request_id": command.get("request_id")}
-            was_draining = bool(controller.state["draining"])
-            if not was_draining and not controller.state.get("launches_paused", False):
-                emit(
-                    controller,
-                    "allocation.resume_ignored",
-                    data={**data, "reason": "launches_not_paused"},
-                )
-            else:
-                controller.state["draining"] = False
-                controller.state["drain_requested"] = False
-                controller.state["launches_paused"] = False
-                controller.state["allocation"]["state"] = "running"
-                emit(
-                    controller,
-                    "allocation.launches_resumed",
-                    data={**data, "cleared_drain": was_draining},
-                )
-        elif kind == "evacuate":
+                bulk_budget -= used
+                if finished:
+                    handled.append((source, command, outcome))
+            elif _apply_command(controller, command, stops):
+                handled.append((source, command, None))
+        if stops:
+            # Cancelling transitions are durable before any launcher sees them.
+            ensure_committed(controller)
+            for running in stops:
+                stop_launcher(controller, running)
+        if handled:
+            after_commit(
+                controller, lambda: acknowledge_commands(controller.root, handled)
+            )
+
+
+def _bulk_project(selector: dict[str, Any]) -> dict[str, str]:
+    """Scope an operation's events to its project for filtered observers."""
+
+    project_id = selector.get("project_id")
+    return {"project_id": project_id} if isinstance(project_id, str) else {}
+
+
+def _start_bulk_cancel(
+    controller: Controller, command: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve a new bulk cancellation into a fixed, ordered target list.
+
+    Return None to retry next tick while a named job still awaits admission
+    or an archived lookup hits a transient storage error.
+    """
+
+    request_id = command.get("request_id")
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or "/" in request_id
+        or len(request_id) > 200
+    ):
+        raise ValueError("bulk cancellation request_id must be a path-safe string")
+    selector = cancel_selector(command.get("selector"))
+    jobs = controller.state["jobs"]
+    archived_terminal = 0
+    unknown: list[str] = []
+    unscoped = {key: value for key, value in selector.items() if key != "states"}
+    missing = [job_id for job_id in selector.get("job_ids") or () if job_id not in jobs]
+    if missing:
+        pending = {job_id for job_id, _ in list_requests(controller.root)}
+        if pending.intersection(missing):
+            return None
+        for job_id in missing:
             try:
-                _begin_evacuation(controller, command)
-            except (KeyError, StorageError, TypeError, ValueError) as exc:
-                emit(
-                    controller,
-                    "command.rejected",
-                    data={
-                        "request_id": command.get("request_id"),
-                        "reason": str(exc),
-                    },
-                )
-        elif kind in {"evacuate_cancel", "evacuate-cancel"}:
-            try:
-                _evacuation_cancel(controller, command)
-            except (StorageError, TypeError, ValueError) as exc:
-                emit(
-                    controller,
-                    "command.rejected",
-                    data={
-                        "request_id": command.get("request_id"),
-                        "evacuation_request_id": command.get("evacuation_request_id"),
-                        "reason": str(exc),
-                    },
-                )
-        elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
-            request_id = command.get("request_id")
-            try:
-                node = str(command.get("node") or "")
-                uuid = str(command.get("uuid") or "")
-                at = utc_now()
-                if kind == "gpu.reprobe":
-                    transition = reprobe_quarantine(
-                        controller.state["gpu_health"],
-                        node=node,
-                        uuid=uuid,
-                        at=at,
-                    )
-                else:
-                    transition = set_quarantine(
-                        controller.state["gpu_health"],
-                        node=node,
-                        uuid=uuid,
-                        quarantined=kind == "gpu.quarantine",
-                        at=at,
-                        reason=(
-                            str(command["reason"])
-                            if isinstance(command.get("reason"), str)
-                            else None
-                        ),
-                    )
-            except HealthError as exc:
-                emit(
-                    controller,
-                    "command.rejected",
-                    data={"request_id": request_id, "reason": str(exc)},
-                )
+                archived = find_archived_job(controller.root, job_id)
+            except (OSError, TransientStorageError) as exc:
+                # The outcome is immutable; never record a read failure as
+                # an unknown job. Report it and retry the command next tick.
+                _storage_notice(controller, "read_archived_job", job_id, exc)
+                return None
+            except StorageError as exc:
+                _storage_notice(controller, "read_archived_job", job_id, exc)
+                archived = None
+            if archived is not None and selector_matches(archived, unscoped):
+                archived_terminal += 1
             else:
-                _emit_gpu_health(controller, [transition], request_id=request_id)
+                unknown.append(job_id)
+    # Jobs this request already cancelled before a crash lost the operation
+    # record (but not its journaled cancellations) still count as cancelled.
+    targets = sorted(
+        (
+            job
+            for job in jobs.values()
+            if selector_matches(job, selector)
+            or (
+                job.get("cancel_request_id") == request_id
+                and selector_matches(job, unscoped)
+            )
+        ),
+        key=lambda job: (int(job.get("queue_order", 0)), str(job["id"])),
+    )
+    operation = {
+        "v": 1,
+        "kind": "cancel_jobs",
+        "request_id": request_id,
+        # Explicit IDs are resolved into targets; keep only the filters.
+        "selector": selector_summary(selector),
+        "started_at": utc_now(),
+        "targets": [job["id"] for job in targets],
+        "position": 0,
+        "counts": {
+            "matched": len(targets) + archived_terminal,
+            "cancelled": 0,
+            "cancelling": 0,
+            "ignored": archived_terminal,
+            "unknown": len(unknown),
+        },
+        "unknown_job_ids": unknown[:MAX_REPORTED_UNKNOWN_JOB_IDS],
+    }
+    controller.state.setdefault("bulk_operations", {})[request_id] = operation
+    # The journaled operation (and later progress records) let recovery
+    # rebuild it exactly even when the snapshot holding it is lost.
+    emit(
+        controller,
+        "jobs.cancel_started",
+        data={
+            "request_id": request_id,
+            "selector": operation["selector"],
+            "counts": copy.deepcopy(operation["counts"]),
+            "operation": copy.deepcopy(operation),
+            **_bulk_project(selector),
+        },
+    )
+    return operation
+
+
+def _apply_bulk_cancel(
+    controller: Controller,
+    command: dict[str, Any],
+    stops: list[RunningProcess],
+    budget: int,
+) -> tuple[bool, dict[str, Any] | None, int]:
+    """Advance one bulk cancellation by at most ``budget`` jobs.
+
+    Return whether the operation finished, its outcome, and the jobs used.
+    The operation and its counts live in the snapshot between ticks. Each
+    cancelled job records the operation's request ID, so a crash between a
+    durable journal batch and its snapshot still counts that job once.
+    """
+
+    request_id = command.get("request_id")
+    operations = controller.state.setdefault("bulk_operations", {})
+    operation = operations.get(request_id) if isinstance(request_id, str) else None
+    if operation is None:
+        try:
+            operation = _start_bulk_cancel(controller, command)
+        except (TypeError, ValueError) as exc:
+            emit(
+                controller,
+                "command.rejected",
+                data={"request_id": request_id, "reason": str(exc)},
+            )
+            return True, {"state": "rejected", "reason": str(exc)}, 0
+        if operation is None:
+            return False, None, 0
+    jobs = controller.state["jobs"]
+    counts = operation["counts"]
+    targets = operation["targets"]
+    used = 0
+    while operation["position"] < len(targets) and used < budget:
+        job = jobs.get(targets[operation["position"]])
+        operation["position"] += 1
+        used += 1
+        if job is None:
+            # Archived since the operation started, therefore terminal.
+            counts["ignored"] += 1
+            continue
+        replayed = job.get("cancel_request_id") == request_id
+        if replayed or request_cancellation(
+            controller, job, request_id, bulk=True, deferred_stops=stops
+        ):
+            bucket = job.get("state")
+            counts[bucket if bucket in {"cancelled", "cancelling"} else "ignored"] += 1
         else:
+            counts["ignored"] += 1
+    if operation["position"] < len(targets):
+        if used:
+            emit(
+                controller,
+                "jobs.cancel_progress",
+                data={
+                    "request_id": request_id,
+                    "position": operation["position"],
+                    "counts": copy.deepcopy(counts),
+                    **_bulk_project(operation["selector"]),
+                },
+            )
+        return False, None, used
+    del operations[request_id]
+    # The receipt already holds the command and its selector.
+    outcome = {
+        "state": "completed",
+        "request_id": request_id,
+        "started_at": operation["started_at"],
+        "completed_at": utc_now(),
+        "counts": dict(counts),
+        "unknown_job_ids": list(operation["unknown_job_ids"]),
+    }
+    emit(
+        controller,
+        "jobs.cancel_completed",
+        data={
+            **copy.deepcopy(outcome),
+            "selector": operation["selector"],
+            **_bulk_project(operation["selector"]),
+        },
+    )
+    return True, outcome, used
+
+
+def _apply_command(
+    controller: Controller,
+    command: dict[str, Any],
+    stops: list[RunningProcess],
+) -> bool:
+    """Apply one command's transitions; return false to retry it next tick."""
+
+    kind = command.get("kind")
+    if kind == "cancel":
+        job_id = str(command.get("job_id"))
+        job = controller.state["jobs"].get(job_id)
+        if job is None:
+            # Submit returns only after its request is durable. If command
+            # ingestion won a polling race, retain the cancel for next tick.
+            return _finish_missing_cancel(controller, command, job_id)
+        if not request_cancellation(
+            controller,
+            job,
+            str(command.get("request_id") or ""),
+            deferred_stops=stops,
+        ):
+            emit(
+                controller,
+                "job.cancel_ignored",
+                data={
+                    "request_id": command.get("request_id"),
+                    "job_id": job_id,
+                    "reason": f"job_is_{job['state']}",
+                },
+            )
+    elif kind == "drain":
+        data = {"request_id": command.get("request_id")}
+        if controller.state["draining"]:
+            emit(
+                controller,
+                "allocation.drain_ignored",
+                data={**data, "reason": "already_draining"},
+            )
+        else:
+            controller.state["draining"] = True
+            controller.state["drain_requested"] = True
+            controller.state["allocation"]["state"] = "draining"
+            emit(controller, "allocation.draining", data=data)
+    elif kind == "resume":
+        data = {"request_id": command.get("request_id")}
+        was_draining = bool(controller.state["draining"])
+        if not was_draining and not controller.state.get("launches_paused", False):
+            emit(
+                controller,
+                "allocation.resume_ignored",
+                data={**data, "reason": "launches_not_paused"},
+            )
+        else:
+            controller.state["draining"] = False
+            controller.state["drain_requested"] = False
+            controller.state["launches_paused"] = False
+            controller.state["allocation"]["state"] = "running"
+            emit(
+                controller,
+                "allocation.launches_resumed",
+                data={**data, "cleared_drain": was_draining},
+            )
+    elif kind == "evacuate":
+        try:
+            _begin_evacuation(controller, command)
+        except (KeyError, StorageError, TypeError, ValueError) as exc:
             emit(
                 controller,
                 "command.rejected",
                 data={
                     "request_id": command.get("request_id"),
-                    "reason": f"unknown_command:{kind}",
+                    "reason": str(exc),
                 },
             )
-        if not deferred:
-            record_command_receipt(controller.root, command)
-            remove_command(source)
+    elif kind in {"evacuate_cancel", "evacuate-cancel"}:
+        try:
+            _evacuation_cancel(controller, command)
+        except (StorageError, TypeError, ValueError) as exc:
+            emit(
+                controller,
+                "command.rejected",
+                data={
+                    "request_id": command.get("request_id"),
+                    "evacuation_request_id": command.get("evacuation_request_id"),
+                    "reason": str(exc),
+                },
+            )
+    elif kind in {"gpu.quarantine", "gpu.clear", "gpu.reprobe"}:
+        request_id = command.get("request_id")
+        try:
+            node = str(command.get("node") or "")
+            uuid = str(command.get("uuid") or "")
+            at = utc_now()
+            if kind == "gpu.reprobe":
+                transition = reprobe_quarantine(
+                    controller.state["gpu_health"],
+                    node=node,
+                    uuid=uuid,
+                    at=at,
+                )
+            else:
+                transition = set_quarantine(
+                    controller.state["gpu_health"],
+                    node=node,
+                    uuid=uuid,
+                    quarantined=kind == "gpu.quarantine",
+                    at=at,
+                    reason=(
+                        str(command["reason"])
+                        if isinstance(command.get("reason"), str)
+                        else None
+                    ),
+                )
+        except HealthError as exc:
+            emit(
+                controller,
+                "command.rejected",
+                data={"request_id": request_id, "reason": str(exc)},
+            )
+        else:
+            _emit_gpu_health(controller, [transition], request_id=request_id)
+    else:
+        emit(
+            controller,
+            "command.rejected",
+            data={
+                "request_id": command.get("request_id"),
+                "reason": f"unknown_command:{kind}",
+            },
+        )
+    return True
 
 
 def _discard_journaled_reports(controller: Controller) -> None:
@@ -2682,7 +3104,17 @@ def _discard_journaled_commands(controller: Controller) -> None:
         item = pending.pop(request_id, None)
         if item is not None:
             source, command = item
-            record_command_receipt(controller.root, command)
+            if event.get("kind") == "jobs.cancel_completed":
+                outcome = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in {"project_id", "selector"}
+                }
+            elif command.get("kind") == "cancel_jobs":
+                outcome = {"state": "rejected", "reason": data.get("reason")}
+            else:
+                outcome = None
+            record_command_receipt(controller.root, command, outcome=outcome)
             remove_command(source)
         if not pending:
             return
@@ -2760,8 +3192,13 @@ def _report_batch(controller: Controller, limit: int) -> list[tuple[Path, object
 
 
 def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -> None:
-    """Validate and commit one bounded report batch with one state rewrite."""
+    """Validate one bounded report batch and acknowledge it after its commit."""
 
+    with group_commit(controller):
+        _apply_report_batch(controller, limit)
+
+
+def _apply_report_batch(controller: Controller, limit: int) -> None:
     acknowledged: list[tuple[Path, str | None]] = []
     new_report_ids: list[str] = []
     for source, document in _report_batch(controller, limit):
@@ -2847,7 +3284,7 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
                     acknowledged.append((source, digest))
                     new_report_ids.append(_report_id(source))
                     continue
-        if not _report_capability_valid(job, event):
+        if not _report_capability_valid(job, event, controller.legacy_report_projects):
             _reject_report(controller, source, "invalid launch capability", digest=digest)
             acknowledged.append((source, digest))
             new_report_ids.append(_report_id(source))
@@ -2898,17 +3335,23 @@ def _ingest_reports(controller: Controller, limit: int = MAX_REPORTS_PER_TICK) -
     # the immutable report receipt becomes visible to the producer.
     _activate_armed_evacuation(controller)
     _advance_evacuation(controller)
+
+    def acknowledge() -> None:
+        accept_reports(
+            acknowledged,
+            generation=int(controller.state.get("journal_generation", 0)),
+        )
+        report_acks = controller.state.setdefault("report_acks", {})
+        for report_id in new_report_ids:
+            report_acks.pop(report_id, None)
+
     if new_report_ids:
         # The inbox is acknowledged only after both the ordered events and
         # their cumulative workload projection are durable.
-        commit_snapshot(controller)
-    accept_reports(
-        acknowledged,
-        generation=int(controller.state.get("journal_generation", 0)),
-    )
-    report_acks = controller.state.setdefault("report_acks", {})
-    for report_id in new_report_ids:
-        report_acks.pop(report_id, None)
+        after_commit(controller, acknowledge)
+    else:
+        # Only stale copies of already-receipted reports: nothing to commit.
+        acknowledge()
 
 
 def _heartbeat(controller: Controller) -> None:
@@ -3240,6 +3683,57 @@ def _drain_for_deadline(controller: Controller) -> None:
     )
 
 
+def _pinned_terminal_job_ids(controller: Controller) -> set[str]:
+    """Return terminal jobs that must stay in hot state for a later step.
+
+    An in-progress evacuation needs its targets' full images to admit
+    successors, and a lost task awaiting its automatic retry needs its argv
+    and cwd until the next controller start admits that retry.
+    """
+
+    pinned: set[str] = set()
+    evacuation = controller.state.get("evacuation")
+    if isinstance(evacuation, dict) and evacuation.get("state") not in {
+        "complete",
+        "partial",
+        "cancelled",
+    }:
+        pinned.update(evacuation.get("targets") or {})
+    pinned.update(
+        job["id"]
+        for job in controller.state["jobs"].values()
+        if job.get("state") in TERMINAL_JOB_STATES and _retry_pending(controller, job)
+    )
+    return pinned
+
+
+def _apply_tick(controller: Controller) -> None:
+    """Apply one poll iteration's transitions as one group commit.
+
+    Every transition is journaled without a sync, then published by one
+    journal sync and one snapshot replacement before any inbox item is
+    acknowledged. Launch decisions follow this commit.
+    """
+
+    with group_commit(controller):
+        _ingest_requests(controller)
+        _ingest_commands(controller)
+        _drain_for_deadline(controller)
+        _evacuate_for_deadline(controller)
+        _advance_evacuation(controller)
+        drain_messages(controller)
+        poll_processes(controller)
+        _maintain_health_monitor(controller)
+        _ingest_gpu_health(controller)
+        _ingest_reports(controller)
+        # Replay can restore an armed operation and its exact publication
+        # evidence without another report file being present.
+        _activate_armed_evacuation(controller)
+        _advance_evacuation(controller)
+        _refresh_dependencies(controller)
+        compact_journal(controller, pinned=_pinned_terminal_job_ids(controller))
+
+
 def _serve(controller: Controller) -> None:
     def stop(_signum: int, _frame: Any) -> None:
         controller.stopping = True
@@ -3254,27 +3748,12 @@ def _serve(controller: Controller) -> None:
     compact_report_receipts(controller.root)
     _discard_journaled_reports(controller)
     _discard_journaled_commands(controller)
-    remove_cold_job_directories(controller.root, controller.state["jobs"].keys())
+    remove_cold_job_directories(controller.root, log_directories_to_keep(controller.state))
     previous_term = signal.signal(signal.SIGTERM, stop)
     previous_int = signal.signal(signal.SIGINT, stop)
     try:
         while True:
-            _ingest_requests(controller)
-            _ingest_commands(controller)
-            _drain_for_deadline(controller)
-            _evacuate_for_deadline(controller)
-            _advance_evacuation(controller)
-            drain_messages(controller)
-            poll_processes(controller)
-            _maintain_health_monitor(controller)
-            _ingest_gpu_health(controller)
-            _ingest_reports(controller)
-            # Replay can restore an armed operation and its exact publication
-            # evidence without another report file being present.
-            _activate_armed_evacuation(controller)
-            _advance_evacuation(controller)
-            _refresh_dependencies(controller)
-            compact_journal(controller)
+            _apply_tick(controller)
             if controller.stopping:
                 begin_shutdown(controller)
                 _stop_health_monitor(controller)
@@ -3351,6 +3830,7 @@ def run_controller(
     gpu_health_mode: str = "observe",
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
+    legacy_report_projects: tuple[str, ...] = (),
 ) -> None:
     """Own a queue until interrupted, retrying transient storage failures."""
 
@@ -3407,6 +3887,7 @@ def run_controller(
                     evacuate_before_end_seconds=evacuate_before_end_seconds,
                     gpu_health_mode=gpu_health_mode,
                     gpu_isolation=gpu_isolation,
+                    legacy_report_projects=legacy_report_projects,
                     gpu_health_interval=gpu_health_interval,
                 )
                 _serve(controller)

@@ -132,6 +132,12 @@ The loop reconciles durable intent with live worker state before admitting more
 work. Scheduling is a pure calculation over the current inventory and active
 assignments; all filesystem writes, lifecycle transitions, and process launches
 remain in the single-writer controller.
+Each iteration is one group commit. New admissions, up to 512 commands, report
+batches, and the dependency transitions they cause are appended to the journal
+without a sync, then published with one journal sync and one `state.json`
+replacement. Request and command files are retired only after that commit, so
+a crash either replays a journaled outcome or retries the inbox item. Launches
+and signals still follow their own durable transition.
 Periodic metrics remain replaceable evidence rather than journal traffic. Only
 health transitions and operator actions are durable events, while enforce mode
 removes stale or quarantined nodes from the scheduler's eligible GPU inventory.
@@ -183,9 +189,9 @@ Every 10 seconds, one task on each node records:
 
 Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
 The default is `observe`: automatic failures become visible without changing
-placement. GPU isolation defaults to `gpu` for the local launcher. Under Slurm,
-an enforced or explicit operator quarantine always withholds the whole node
-from new GPU work, even with `--gpu-isolation=gpu`.
+placement. GPU isolation defaults to `gpu`, so an explicit `gpu-quarantine`
+withholds only the selected slot when Slurm can bind it exactly. Use
+`--gpu-isolation=node` for conservative whole-node withholding.
 In `enforce`, three consecutive bad samples within the bounded sampling window
 make the affected UUID's quarantine sticky; inconclusive samples do not count,
 and missing or older-than-45-second samples fail closed. Samples more than 30
@@ -204,12 +210,13 @@ scruffy --root "$SCRUFFY_ROOT" gpu-reprobe gpu-3 GPU-...
 scruffy --root "$SCRUFFY_ROOT" gpu-clear gpu-3 GPU-...
 ```
 
-Slurm owns physical GPU selection: worker steps request GPU counts and preserve
-Slurm's device visibility. A task GRES binding mask does not reserve particular
-physical GPUs, so it cannot safely implement partial-node quarantine. The bad
-GPU is `STOPPED` and its healthy peers are `node_held`; other eligible nodes
-remain schedulable. If none fit, the job stays queued rather than failing a
-physical-mapping check. CPU-only work may still use the affected node.
+GPU worker steps request their ledger-selected physical IDs with an explicit
+Slurm GRES mask, and the worker verifies `SLURM_STEP_GPUS` before executing user
+code. Enforced or operator quarantine therefore marks the bad GPU `STOPPED`
+while healthy peers remain schedulable. Multi-node exact steps use one common
+slot set on every node; if that cannot be represented, Scruffy refuses the
+unsafe placement rather than risk the quarantined GPU. Use
+`--gpu-isolation=node` when whole-node withholding is the required fallback.
 Existing jobs are not killed automatically; their assignment stays owned until
 normal exit or explicit cancellation.
 
@@ -431,7 +438,9 @@ Every server exposes focused monitoring tools:
 In stdio mode, start with `--project PROJECT` (or `SCRUFFY_PROJECT`) to pin the
 server to one project. In shared HTTP mode, Codex pins the project once through
 the `X-Scruffy-Project` connection header instead. A pinned server adds
-`submit_job`, `validate_workflow`, and `submit_workflow`. `submit_job` requires
+`submit_job`, `cancel_jobs`, `validate_workflow`, and `submit_workflow`.
+`cancel_jobs` is the project-scoped bulk cancellation described under
+[Lifecycle and operations](#lifecycle-and-operations). `submit_job` requires
 a stable `request_id`, name, argv array, absolute worker `cwd`, and explicit
 `gpus_per_node` (zero means CPU-only). It durably enqueues and returns without
 waiting for GPUs. Retry an uncertain call with identical arguments and the same
@@ -630,9 +639,18 @@ both `wait_for` and `needs` when it also requires successful producer exit. Only
 a strict typed publication from the named task satisfies the condition; ordinary
 artifact messages remain observations. Satisfaction is journaled on the
 consumer with the exact producer job, event, path, byte count, and SHA256, and
-therefore survives controller restarts and allocation handover. A terminal
-producer without matching evidence leaves the consumer safely blocked rather
-than racing a late report into `skipped`.
+therefore survives controller restarts and allocation handover.
+
+A producer that ends without publishing the awaited artifact (failed,
+cancelled, succeeded without it, or `lost` with a replaced allocation) releases
+its waiters as `skipped` with reason `condition_unsatisfied` once its result is
+final: 10 minutes after it finished and with an empty report inbox, so a
+publication spooled just before exit is never raced into a skip. A producer
+that never ran (`skipped` or `rejected`) is final at once, so a skip propagates
+through a whole chain in one pass. A pending automatic retry (a `lost` task
+whose recovery policy will admit a successor, or an evacuated target still
+being recovered) keeps waiters blocked, as does a producer task that has not
+been submitted yet. The blocker records the producer's terminal state.
 
 ## Workload progress and output
 
@@ -694,6 +712,7 @@ scruffy status [JOB_ID]
 scruffy explain JOB_ID
 scruffy wait JOB_ID
 scruffy cancel JOB_ID
+scruffy cancel-jobs [JOB_ID ...] [--state STATE ...] [filters] [--dry-run] [--wait]
 scruffy drain
 scruffy resume
 ```
@@ -707,12 +726,36 @@ clears a recovery or `--start-paused` launch pause.
 Cancelling an archived terminal job produces `job.cancel_ignored`, just like
 cancelling a terminal job still in hot state.
 
-The hot snapshot keeps every nonterminal job and, after compaction, the newest
-1,000 terminal jobs. Older terminal jobs remain addressable by job ID with
-`archived: true`; compact records keep lifecycle and workflow identity,
-resource requests, final placement, and provenance references. Cwd, argv,
-environment, live assignment, blockers, logs, and workload state expire.
-`summary.counts` includes archived terminal jobs;
+`cancel-jobs` cancels many jobs with one durable command instead of one command
+per job. It selects explicit job IDs (arguments or `--job-ids-file`), filters,
+or both: `--state` (required for filters), `--project` (or
+`SCRUFFY_PROJECT`), `--workflow-id`, `--workflow-prefix`, `--request-prefix`,
+`--name-prefix`, and `--submitted-before`. `--dry-run` reports what currently
+matches without writing anything.
+
+```bash
+scruffy cancel-jobs --state blocked --project koochak \
+  --workflow-prefix sweep-17/ --dry-run
+scruffy cancel-jobs --state blocked --project koochak \
+  --workflow-prefix sweep-17/ --request-id ops-cleanup-sweep-17 --wait
+```
+
+The controller resolves the selector once, cancels at most 512 jobs per tick
+with one snapshot commit per tick, and records one immutable summary
+(`matched`, `cancelled`, `cancelling`, `ignored`, `unknown`) in the command
+receipt and a `jobs.cancel_completed` event. Retrying with the same
+`--request-id` and selector is safe; a different selector conflicts.
+
+The hot snapshot (`state.json`) holds live work, not history: every
+nonterminal job, terminal jobs still needed by an in-progress evacuation or a
+pending automatic retry, and the newest 100 other terminal jobs. Older
+terminal jobs are archived as an ordinary journaled `jobs.archived` record, at
+most 512 per tick, without rotating the journal or resetting cursors. They
+remain addressable by job ID with `archived: true`; compact records keep
+lifecycle and workflow identity, resource requests, final placement, and
+provenance references. Cwd, argv, environment, live assignment, blockers, and
+workload state expire. Logs stay readable for the 1,000 most recently archived
+jobs that ran. `summary.counts` includes archived terminal jobs;
 `summary.archived_jobs` and `status.archived_counts` expose the archived totals.
 The active and immediately previous journal generations are retained.
 Compact request receipts and workflow indexes last for the queue root's lifetime,
@@ -779,6 +822,16 @@ files rather than secret values.
 PYTHONPATH=src python -m unittest discover -s tests -v
 python -m compileall -q src tests
 python -m ruff check src tests
+```
+
+`benchmarks/state_scaling.py` builds a production-shaped root (about 8,500
+jobs, 7,455 of them stale artifact waiters) and reports snapshot size,
+`status`/`summary` latency, snapshot writes per batch of cancel commands, and
+the ticks needed to shrink the root. Point `PYTHONPATH` at another release's
+`src` to compare:
+
+```bash
+PYTHONPATH=src python benchmarks/state_scaling.py
 ```
 
 The local launcher exercises one-node lifecycle behavior without Slurm or GPUs:

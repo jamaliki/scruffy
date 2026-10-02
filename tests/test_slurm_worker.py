@@ -59,7 +59,6 @@ class SlurmArgumentTests(unittest.TestCase):
                 "--ntasks=2",
                 "--ntasks-per-node=1",
                 "--gpus-per-task=2",
-                "--tres-bind=gres/gpu:mask:0x24",
                 "--cpus-per-task=28",
                 "--cpu-bind=none",
                 "--mem=256G",

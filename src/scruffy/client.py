@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .bulk import cancel_preview, cancel_selector
 from .models import (
     DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
@@ -22,6 +23,7 @@ from .models import (
 from .protocol import validate_event
 from .storage import (
     StorageError,
+    command_receipt,
     create_job_id,
     find_archived_job,
     list_archived_workflow,
@@ -39,7 +41,7 @@ from .storage import (
     utc_now,
 )
 from .submissions import submission_summary, workflow_submission
-from .summary import build_summary, explain_job
+from .summary import build_summary, explain_job, state_cursor
 from .workflows import (
     select_task_attempts,
     validate_recovery_policy,
@@ -269,6 +271,130 @@ def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
         {"kind": "cancel", "job_id": job_id, "submitted_at": utc_now()},
     )
     return {"job_id": job_id, "request_id": request_id, "state": "cancel_requested"}
+
+
+def _bulk_selector(
+    *,
+    job_ids: Sequence[str] | None,
+    states: Sequence[str] | None,
+    project_id: str | None,
+    workflow_id: str | None,
+    workflow_id_prefix: str | None,
+    request_id_prefix: str | None,
+    name_prefix: str | None,
+    submitted_before: str | None,
+) -> dict[str, Any]:
+    return cancel_selector(
+        {
+            "job_ids": None if job_ids is None else list(job_ids),
+            "states": None if states is None else list(states),
+            "project_id": project_id,
+            "workflow_id": workflow_id,
+            "workflow_id_prefix": workflow_id_prefix,
+            "request_id_prefix": request_id_prefix,
+            "name_prefix": name_prefix,
+            "submitted_before": submitted_before,
+        }
+    )
+
+
+def cancel_jobs(
+    root: Path,
+    *,
+    job_ids: Sequence[str] | None = None,
+    states: Sequence[str] | None = None,
+    project_id: str | None = None,
+    workflow_id: str | None = None,
+    workflow_id_prefix: str | None = None,
+    request_id_prefix: str | None = None,
+    name_prefix: str | None = None,
+    submitted_before: str | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Request cancellation of many jobs with one durable, idempotent command.
+
+    The controller resolves the selector once against its hot state, cancels
+    the matches over as many ticks as needed, and records one summary outcome.
+    Reusing ``request_id`` with the same selector is a safe retry.
+    """
+
+    selector = _bulk_selector(
+        job_ids=job_ids,
+        states=states,
+        project_id=project_id,
+        workflow_id=workflow_id,
+        workflow_id_prefix=workflow_id_prefix,
+        request_id_prefix=request_id_prefix,
+        name_prefix=name_prefix,
+        submitted_before=submitted_before,
+    )
+    if request_id is None:
+        request_id = f"cancel-jobs-{uuid.uuid4().hex}"
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or "/" in request_id
+        or len(request_id) > 200
+    ):
+        raise ValueError("request_id must be a non-empty path-safe string")
+    submit_command(
+        root,
+        {"kind": "cancel_jobs", "request_id": request_id, "selector": selector},
+    )
+    return {"request_id": request_id, "state": "cancel_requested", "selector": selector}
+
+
+def preview_cancel_jobs(
+    root: Path,
+    *,
+    job_ids: Sequence[str] | None = None,
+    states: Sequence[str] | None = None,
+    project_id: str | None = None,
+    workflow_id: str | None = None,
+    workflow_id_prefix: str | None = None,
+    request_id_prefix: str | None = None,
+    name_prefix: str | None = None,
+    submitted_before: str | None = None,
+) -> dict[str, Any]:
+    """Report what a bulk cancellation would match now, without changing it."""
+
+    selector = _bulk_selector(
+        job_ids=job_ids,
+        states=states,
+        project_id=project_id,
+        workflow_id=workflow_id,
+        workflow_id_prefix=workflow_id_prefix,
+        request_id_prefix=request_id_prefix,
+        name_prefix=name_prefix,
+        submitted_before=submitted_before,
+    )
+    state = status(root)
+    return {
+        "dry_run": True,
+        "selector": selector,
+        "as_of_cursor": state_cursor(state),
+        **cancel_preview(state["jobs"].values(), selector),
+    }
+
+
+def wait_for_command(
+    root: Path, request_id: str, *, timeout: float | None = None
+) -> dict[str, Any]:
+    """Wait until the controller has handled one command; return its receipt.
+
+    A bulk cancellation's receipt carries its summary ``outcome``.
+    """
+
+    if timeout is not None and timeout < 0:
+        raise ValueError("timeout must be non-negative")
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        receipt = command_receipt(root, request_id)
+        if receipt is not None:
+            return receipt
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for command {request_id}")
+        time.sleep(0.2)
 
 
 def drain_queue(root: Path) -> dict[str, Any]:
@@ -639,6 +765,14 @@ def status(
     selected_project = (
         normalize_project_id(project_id) if project_id is not None else None
     )
+    if job_id is not None:
+        # An archived terminal job is final and has its own small record, so
+        # finding it never requires decoding the hot snapshot.
+        archived = find_archived_job(root, job_id)
+        if archived is not None:
+            if selected_project is not None and job_project(archived) != selected_project:
+                raise KeyError(f"unknown job {job_id}")
+            return archived
     state = load_state(root)
     if state is None:
         state = {
@@ -691,11 +825,6 @@ def status(
         if selected_project is not None and job_project(job) != selected_project:
             raise KeyError(f"unknown job {job_id}")
         return job
-    archived = find_archived_job(root, job_id)
-    if archived is not None:
-        if selected_project is not None and job_project(archived) != selected_project:
-            raise KeyError(f"unknown job {job_id}")
-        return archived
     raise KeyError(f"unknown job {job_id}")
 
 

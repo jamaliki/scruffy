@@ -1366,6 +1366,7 @@ class SlurmLaunchTests(unittest.TestCase):
                     side_effect=write_launch,
                 ),
                 mock.patch("scruffy.lifecycle.emit"),
+                mock.patch("scruffy.lifecycle.ensure_committed"),
                 mock.patch("scruffy.lifecycle.atomic_write_json") as write,
                 mock.patch(
                     "scruffy.lifecycle._launch_arguments",
@@ -1417,7 +1418,7 @@ class SlurmLaunchTests(unittest.TestCase):
         self.assertNotIn("--overlap", argv)
         self.assertEqual(14, assigned.request.cpus_per_node)
 
-    def test_persisted_exact_worker_step_keeps_its_binding(self) -> None:
+    def test_quarantine_sensitive_worker_step_gets_exact_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             controller = mock.Mock(
@@ -1452,7 +1453,7 @@ class SlurmLaunchTests(unittest.TestCase):
 
             argv, _ = _launch_arguments(
                 controller,
-                {"launch_token": "scruffy-token", "gpu_binding": "exact"},
+                {"launch_token": "scruffy-token"},
                 assigned,
                 root / "assignment.json",
                 root / "stdout.log",
@@ -1460,7 +1461,7 @@ class SlurmLaunchTests(unittest.TestCase):
             )
 
         self.assertIn("--gpus-per-task=1", argv)
-        self.assertIn("--tres-bind=gres/gpu:mask:0x1", argv)
+        self.assertFalse(any(arg.startswith("--tres-bind=") for arg in argv))
 
     def test_start_job_passes_only_sanitized_environment_to_srun(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

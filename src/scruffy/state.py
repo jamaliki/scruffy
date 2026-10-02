@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable, Iterator
+from collections.abc import Set as AbstractSet
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,7 @@ from .storage import (
     queue_id,
     read_event_page,
     remove_cold_job_directories,
+    remove_job_directories,
     sync_file,
     sync_report_inboxes,
     utc_now,
@@ -41,8 +45,16 @@ from .storage import (
 )
 
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
-MAX_TERMINAL_JOBS = 1000
-TERMINAL_COMPACTION_SLACK = 100
+# The snapshot holds every nonterminal job, terminal jobs still needed in hot
+# state (pinned), and only this many recent terminal jobs for summaries.
+MAX_TERMINAL_JOBS = 100
+TERMINAL_COMPACTION_SLACK = 25
+# Archiving writes two small files per job; a large backlog (for example when
+# an old queue root is first adopted) drains over several ticks.
+MAX_ARCHIVED_PER_TICK = 512
+# Log directories outlive hot state for the most recently archived jobs that
+# ran, independently of how many terminal jobs the snapshot retains.
+MAX_RETAINED_LOG_JOBS = 1000
 
 
 def _event_key(occurred_at: str, event_id: str) -> tuple[datetime, str]:
@@ -230,11 +242,7 @@ def refresh_nodes(
     assignments = active_assignments(state)
     health = state.get("gpu_health")
     health_view = health if isinstance(health, dict) else {}
-    unavailable = unavailable_gpu_ids(
-        health_view,
-        inventory,
-        slurm_managed=state.get("allocation", {}).get("launcher") == "slurm",
-    )
+    unavailable = unavailable_gpu_ids(health_view, inventory)
     free_by_node = {
         item.name: item
         for item in available_resources(inventory, assignments, unavailable)
@@ -357,8 +365,17 @@ def emit(
         event["data"] = data
         if "job_id" in data and "job_id" not in event:
             event["job_id"] = data["job_id"]
-    append_event(controller.journal, event, sync=durable)
+    deferred = controller.commit_depth > 0
+    append_event(controller.journal, event, sync=durable and not deferred)
     state["journal_offset"] = controller.journal.tell()
+    if deferred:
+        # Inside a group commit the enclosing block publishes one cumulative
+        # snapshot after one journal sync. Nothing outside the controller can
+        # observe this event before then, because readers stop at the
+        # committed watermark.
+        if durable or snapshot:
+            controller.commit_pending = True
+        return event
     if snapshot:
         refresh_nodes(state, controller.inventory)
         write_state(controller.root, state)
@@ -409,12 +426,69 @@ def _reopen_journal(controller: Controller) -> None:
 
 
 def commit_snapshot(controller: Controller) -> None:
-    """Durably commit prior events, then publish one cumulative state image."""
+    """Durably commit prior events, then publish one cumulative state image.
+
+    Actions registered with :func:`after_commit` run only after both the
+    journal and the snapshot containing their effects are durable.
+    """
 
     sync_file(controller.journal)
     refresh_nodes(controller.state, controller.inventory)
     write_state(controller.root, controller.state)
     _reopen_journal(controller)
+    controller.commit_pending = False
+    actions, controller.after_commit = controller.after_commit, []
+    for action in actions:
+        action()
+
+
+@contextmanager
+def group_commit(controller: Controller) -> Iterator[None]:
+    """Apply a batch of transitions, then publish them with one commit.
+
+    Inside the block :func:`emit` appends events without a journal sync or a
+    snapshot replacement. When the outermost block exits normally, a single
+    :func:`commit_snapshot` syncs the journal, replaces ``state.json`` once,
+    and runs the deferred post-commit actions (for example removing the
+    command files whose effects are now durable). Nested blocks join the
+    outermost one. If the block raises, nothing is committed or acknowledged:
+    a restarted controller replays whatever reached the journal and retries
+    the unacknowledged inbox items.
+
+    Code inside the block that performs an external side effect which must
+    follow a durable transition (a signal, a launch) calls
+    :func:`ensure_committed` first.
+    """
+
+    controller.commit_depth += 1
+    try:
+        yield
+    except BaseException:
+        controller.commit_depth -= 1
+        if controller.commit_depth == 0:
+            controller.after_commit.clear()
+        raise
+    controller.commit_depth -= 1
+    if controller.commit_depth == 0 and (
+        controller.commit_pending or controller.after_commit
+    ):
+        commit_snapshot(controller)
+
+
+def ensure_committed(controller: Controller) -> None:
+    """Make every transition emitted so far durable before a side effect."""
+
+    if controller.commit_pending:
+        commit_snapshot(controller)
+
+
+def after_commit(controller: Controller, action: Callable[[], None]) -> None:
+    """Run ``action`` once the transitions emitted so far are durable."""
+
+    if controller.commit_depth == 0 and not controller.commit_pending:
+        action()
+    else:
+        controller.after_commit.append(action)
 
 
 def compact_journal(
@@ -423,38 +497,64 @@ def compact_journal(
     max_bytes: int = MAX_JOURNAL_BYTES,
     max_terminal_jobs: int = MAX_TERMINAL_JOBS,
     terminal_slack: int = TERMINAL_COMPACTION_SLACK,
+    max_archived: int = MAX_ARCHIVED_PER_TICK,
+    max_retained_logs: int = MAX_RETAINED_LOG_JOBS,
+    pinned: AbstractSet[str] = frozenset(),
 ) -> bool:
-    """Rotate history and move old terminal details out of the hot snapshot."""
+    """Archive old terminal jobs, and rotate the journal when it is too large.
 
+    Archiving is an ordinary journaled transition (``jobs.archived``), so it
+    neither rotates the journal nor resets observer cursors.
+    """
+
+    archived = archive_terminal_jobs(
+        controller,
+        max_terminal_jobs=max_terminal_jobs,
+        terminal_slack=terminal_slack,
+        limit=max_archived,
+        max_retained_logs=max_retained_logs,
+        pinned=pinned,
+    )
+    if max_bytes > 0 and controller.journal.tell() > max_bytes:
+        rotate_journal(controller)
+        return True
+    return archived > 0
+
+
+def archive_terminal_jobs(
+    controller: Controller,
+    *,
+    max_terminal_jobs: int = MAX_TERMINAL_JOBS,
+    terminal_slack: int = TERMINAL_COMPACTION_SLACK,
+    limit: int = MAX_ARCHIVED_PER_TICK,
+    max_retained_logs: int = MAX_RETAINED_LOG_JOBS,
+    pinned: AbstractSet[str] = frozenset(),
+) -> int:
+    """Move the oldest unpinned terminal jobs into the per-job archive.
+
+    Compact records are written first; the hot-state removal is then journaled
+    as one ``jobs.archived`` record and becomes durable with the enclosing
+    commit. A crash in between leaves the jobs hot, and re-archiving them later
+    overwrites the same records. Returns the number of jobs archived.
+    """
+
+    if max_terminal_jobs < 0:
+        return 0
     terminal = [
         job
         for job in controller.state["jobs"].values()
-        if job.get("state") in TERMINAL_JOB_STATES
+        if job.get("state") in TERMINAL_JOB_STATES and job.get("id") not in pinned
     ]
-    oversized = max_bytes > 0 and controller.journal.tell() > max_bytes
-    overfull = (
-        max_terminal_jobs >= 0
-        and len(terminal) > max_terminal_jobs + max(terminal_slack, 0)
-    )
-    if not oversized and not overfull:
-        return False
-    commit_snapshot(controller)
+    if len(terminal) <= max_terminal_jobs + max(terminal_slack, 0):
+        return 0
     terminal.sort(
         key=lambda job: (
             str(job.get("finished_at") or job.get("submitted_at") or ""),
             int(job.get("queue_order", 0)),
-        ),
-        reverse=True,
+        )
     )
-    archived_counts = controller.state.setdefault("archived_counts", {})
-    archived_project_counts = controller.state.setdefault(
-        "archived_project_counts", {}
-    )
-    retain_count = len(terminal) if max_terminal_jobs < 0 else max_terminal_jobs
-    remaining = len(terminal)
-    for job in reversed(terminal):
-        if remaining <= retain_count:
-            break
+    archived: list[dict[str, Any]] = []
+    for job in terminal[: max(0, min(len(terminal) - max_terminal_jobs, limit))]:
         try:
             archive_terminal_job(controller.root, job)
         except (OSError, StorageError) as exc:
@@ -470,15 +570,94 @@ def compact_journal(
                 snapshot=False,
             )
             continue
-        state_name = str(job.get("state", "unknown"))
-        archived_counts[state_name] = int(archived_counts.get(state_name, 0)) + 1
-        project_counts = archived_project_counts.setdefault(job_project(job), {})
-        project_counts[state_name] = int(project_counts.get(state_name, 0)) + 1
-        del controller.state["jobs"][job["id"]]
-        remaining -= 1
-    controller.state["archived_jobs"] = sum(
-        int(count) for count in archived_counts.values()
+        archived.append(job)
+    if not archived:
+        return 0
+    # Log retention is one global FIFO of [job_id, project_id] pairs.
+    retained = [list(entry) for entry in controller.state.get("retained_log_jobs") or []]
+    added = [[str(job["id"]), job_project(job)] for job in archived if job.get("started_at")]
+    overflow = max(0, len(retained) + len(added) - max(max_retained_logs, 0))
+    released = (retained + added)[:overflow]
+    # One record per project keeps job IDs inside their project's event scope.
+    projects = sorted({job_project(job) for job in archived} | {entry[1] for entry in released})
+    for project_id in projects:
+        project_jobs = [job for job in archived if job_project(job) == project_id]
+        counts: dict[str, int] = {}
+        for job in project_jobs:
+            state_name = str(job.get("state", "unknown"))
+            counts[state_name] = counts.get(state_name, 0) + 1
+        record = {
+            "project_id": project_id,
+            "job_ids": [str(job["id"]) for job in project_jobs],
+            "counts": counts,
+            "retained_logs": [entry[0] for entry in added if entry[1] == project_id],
+            "released_logs": [entry[0] for entry in released if entry[1] == project_id],
+        }
+        apply_archive_record(controller.state, record)
+        emit(controller, "jobs.archived", data=record)
+    if released:
+        released_ids = [entry[0] for entry in released]
+        after_commit(
+            controller, lambda: remove_job_directories(controller.root, released_ids)
+        )
+    return len(archived)
+
+
+def apply_archive_record(state: dict[str, Any], record: dict[str, Any]) -> None:
+    """Apply one project's ``jobs.archived`` transition to a state image."""
+
+    project_id = record["project_id"]
+    jobs = state.setdefault("jobs", {})
+    for job_id in record.get("job_ids") or []:
+        jobs.pop(job_id, None)
+    archived_counts = state.setdefault("archived_counts", {})
+    project_counts = state.setdefault("archived_project_counts", {}).setdefault(
+        project_id, {}
     )
+    for name, count in (record.get("counts") or {}).items():
+        archived_counts[name] = int(archived_counts.get(name, 0)) + int(count)
+        project_counts[name] = int(project_counts.get(name, 0)) + int(count)
+    state["archived_jobs"] = sum(int(count) for count in archived_counts.values())
+    released = set(record.get("released_logs") or [])
+    state["retained_log_jobs"] = [
+        entry
+        for entry in [
+            *(state.get("retained_log_jobs") or []),
+            *([job_id, project_id] for job_id in record.get("retained_logs") or []),
+        ]
+        if entry[0] not in released
+    ]
+
+
+def apply_bulk_event(state: dict[str, Any], kind: str, data: dict[str, Any]) -> None:
+    """Apply one journaled bulk-operation transition to a state image."""
+
+    operations = state.setdefault("bulk_operations", {})
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str):
+        return
+    if kind == "jobs.cancel_started" and isinstance(data.get("operation"), dict):
+        operations[request_id] = copy.deepcopy(data["operation"])
+    elif kind == "jobs.cancel_progress" and isinstance(operations.get(request_id), dict):
+        operations[request_id]["position"] = data["position"]
+        operations[request_id]["counts"] = copy.deepcopy(data["counts"])
+    elif kind == "jobs.cancel_completed":
+        operations.pop(request_id, None)
+
+
+def log_directories_to_keep(state: dict[str, Any]) -> set[str]:
+    """Return job IDs whose log directories must survive cleanup."""
+
+    return {
+        *state.get("jobs", {}),
+        *(entry[0] for entry in state.get("retained_log_jobs") or []),
+    }
+
+
+def rotate_journal(controller: Controller) -> None:
+    """Start a new journal generation from a checkpoint of the current state."""
+
+    commit_snapshot(controller)
     current = int(controller.state.get("journal_generation", 0))
     generation = next_journal_generation(controller.root, current)
     checkpoint = copy.deepcopy(controller.state)
@@ -499,8 +678,7 @@ def compact_journal(
     prune_journal_generations(controller.root, retained_generations)
     sync_report_inboxes(controller.root)
     prune_report_receipts(controller.root, retained_generations)
-    remove_cold_job_directories(controller.root, controller.state["jobs"].keys())
-    return True
+    remove_cold_job_directories(controller.root, log_directories_to_keep(controller.state))
 
 
 def load_recovered_state(root: Path) -> dict[str, Any]:
@@ -537,6 +715,8 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "evacuation_requests": {},
                 "evacuation_history": {},
                 "evacuation_cancel_requests": {},
+                "bulk_operations": {},
+                "retained_log_jobs": [],
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -611,6 +791,14 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                         "data": event["data"],
                     },
                 )
+        if event.get("kind") == "jobs.archived" and isinstance(event.get("data"), dict):
+            apply_archive_record(state, event["data"])
+        if event.get("kind") in {
+            "jobs.cancel_started",
+            "jobs.cancel_progress",
+            "jobs.cancel_completed",
+        } and isinstance(event.get("data"), dict):
+            apply_bulk_event(state, event["kind"], event["data"])
         if event.get("kind") == "resource.gpu_health_changed":
             data = event.get("data")
             recovered_health = data.get("gpu_health") if isinstance(data, dict) else None
@@ -733,4 +921,6 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     state.setdefault("evacuation_requests", {})
     state.setdefault("evacuation_history", {})
     state.setdefault("evacuation_cancel_requests", {})
+    state.setdefault("bulk_operations", {})
+    state.setdefault("retained_log_jobs", [])
     return state

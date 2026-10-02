@@ -31,6 +31,9 @@ MAX_TAIL_BYTES = 1024 * 1024
 INVALID_REQUEST_DIGEST = "-"
 STATE_CURSOR_FILE = "cursor.json"
 MAX_STATE_CURSOR_BYTES = 4096
+# A bulk command may name up to 10,000 job IDs; its receipt retains it. A
+# larger command keeps only its digest so a receipt is always readable.
+MAX_COMMAND_RECEIPT_BYTES = 4 * 1024 * 1024
 
 
 class StorageError(RuntimeError):
@@ -177,7 +180,9 @@ def read_immutable_json(
     return value, hashlib.sha256(payload).hexdigest()
 
 
-def create_immutable_json(target: Path, value: Any) -> str:
+def create_immutable_json(
+    target: Path, value: Any, *, max_bytes: int = 64 * 1024
+) -> str:
     """Create one durable, no-replace, mode-0444 JSON authority."""
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +204,7 @@ def create_immutable_json(target: Path, value: Any) -> str:
     finally:
         os.close(descriptor)
     _fsync_directory(target.parent)
-    stored, digest = read_immutable_json(target)
+    stored, digest = read_immutable_json(target, max_bytes=max_bytes)
     if stored != value:
         raise StorageError(f"immutable JSON authority changed while publishing {target}")
     return digest
@@ -656,6 +661,7 @@ _ARCHIVED_JOB_FIELDS = (
     "allocation_incarnation_sha256",
     "workflow_invalid",
     "project_id",
+    "cancel_request_id",
 )
 
 
@@ -779,13 +785,28 @@ def list_archived_workflow(
     )
 
 
-def remove_cold_job_directories(root: Path, hot_job_ids: AbstractSet[str]) -> int:
-    """Delete log directories for terminal jobs already moved out of hot state."""
+def remove_cold_job_directories(root: Path, keep_job_ids: AbstractSet[str]) -> int:
+    """Delete every job log directory not named in ``keep_job_ids``."""
 
     jobs_root = ensure_layout(root) / "jobs"
     removed = 0
     for directory in jobs_root.iterdir():
-        if directory.is_dir() and directory.name not in hot_job_ids:
+        if directory.is_dir() and directory.name not in keep_job_ids:
+            shutil.rmtree(directory)
+            removed += 1
+    if removed:
+        _fsync_directory(jobs_root)
+    return removed
+
+
+def remove_job_directories(root: Path, job_ids: Sequence[str]) -> int:
+    """Delete the named jobs' log directories whose retention has ended."""
+
+    jobs_root = ensure_layout(root) / "jobs"
+    removed = 0
+    for job_id in job_ids:
+        directory = jobs_root / job_id
+        if "/" not in job_id and directory.is_dir():
             shutil.rmtree(directory)
             removed += 1
     if removed:
@@ -974,6 +995,19 @@ def report_streams(
     ]
 
 
+def report_inbox_pending(root: Path, job_id: str) -> bool:
+    """Return whether a job has spooled reports the controller has not read."""
+
+    try:
+        with os.scandir(root / "reports" / job_id) as entries:
+            return any(
+                not entry.name.startswith(".") and entry.name.endswith(".json")
+                for entry in entries
+            )
+    except FileNotFoundError:
+        return False
+
+
 def accept_reports(
     reports: Sequence[tuple[Path, str | None]], *, generation: int = 0
 ) -> None:
@@ -1139,21 +1173,27 @@ def submit_command(root: Path, command: dict[str, Any]) -> str:
         for source in (receipt, destination):
             if not source.exists():
                 continue
-            existing = (
-                read_immutable_json(source)[0]
-                if source == receipt
-                else read_json(source)
-            )
-            existing_command = existing.get("command") if source == receipt else existing
-            if existing_command != document:
+            if source == receipt:
+                existing = read_immutable_json(source, max_bytes=MAX_COMMAND_RECEIPT_BYTES)[0]
+                same = _receipt_matches(existing, document)
+            else:
+                same = read_json(source) == document
+            if not same:
                 raise StorageError(f"conflicting command request ID {request_id!r}")
             return request_id
         atomic_write_json(destination, document)
     return request_id
 
 
-def record_command_receipt(root: Path, command: dict[str, Any]) -> None:
-    """Retain one immutable command identity after it is handled or rejected."""
+def record_command_receipt(
+    root: Path, command: dict[str, Any], *, outcome: dict[str, Any] | None = None
+) -> None:
+    """Retain one immutable command identity after it is handled or rejected.
+
+    A command whose result is a summary (such as a bulk cancellation) also
+    retains that ``outcome``. The first durable receipt wins: a replay after a
+    crash only verifies the command identity.
+    """
 
     root = ensure_layout(root)
     request_id = command.get("request_id")
@@ -1161,16 +1201,63 @@ def record_command_receipt(root: Path, command: dict[str, Any]) -> None:
         raise StorageError("handled command has no request ID")
     command_root = root / "commands"
     receipt = _command_receipt(command_root, request_id)
-    document = {"v": 1, "request_id": request_id, "command": command}
+    document: dict[str, Any] = {"v": 1, "request_id": request_id, "command": command}
+    if outcome is not None:
+        document["outcome"] = outcome
+    if len(_canonical_bytes(document)) > MAX_COMMAND_RECEIPT_BYTES:
+        document = {
+            "v": 1,
+            "request_id": request_id,
+            "command_sha256": hashlib.sha256(_canonical_bytes(command)).hexdigest(),
+        }
+        if outcome is not None:
+            document["outcome"] = outcome
     with _key_lock(command_root, request_id) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if receipt.exists():
-            existing, _ = read_immutable_json(receipt)
-            if existing != document:
+            existing, _ = read_immutable_json(
+                receipt, max_bytes=MAX_COMMAND_RECEIPT_BYTES
+            )
+            if not _receipt_matches(existing, command):
                 raise StorageError(f"conflicting command receipt for {request_id!r}")
             return
         _mkdir(receipt.parent)
-        create_immutable_json(receipt, document)
+        create_immutable_json(receipt, document, max_bytes=MAX_COMMAND_RECEIPT_BYTES)
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        + "\n"
+    ).encode()
+
+
+def _receipt_matches(receipt: object, command: dict[str, Any]) -> bool:
+    """Compare a command with a receipt holding it in full or as a digest."""
+
+    if not isinstance(receipt, dict):
+        return False
+    if "command" in receipt:
+        return receipt["command"] == command
+    return (
+        receipt.get("command_sha256")
+        == hashlib.sha256(_canonical_bytes(command)).hexdigest()
+    )
+
+
+def command_receipt(root: Path, request_id: str) -> dict[str, Any] | None:
+    """Return a handled command's immutable receipt, or None while pending."""
+
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("request_id must be a non-empty string")
+    receipt = _command_receipt(ensure_layout(root) / "commands", request_id)
+    try:
+        document, _ = read_immutable_json(receipt, max_bytes=MAX_COMMAND_RECEIPT_BYTES)
+    except FileNotFoundError:
+        return None
+    if not isinstance(document, dict) or document.get("request_id") != request_id:
+        raise StorageError(f"invalid command receipt for {request_id!r}")
+    return document
 
 
 def _command_receipt(command_root: Path, request_id: str) -> Path:
@@ -1178,17 +1265,60 @@ def _command_receipt(command_root: Path, request_id: str) -> Path:
     return command_root / ".accepted" / f"{digest}.json"
 
 
+def command_sources(root: Path) -> list[Path]:
+    """List pending command files without reading them."""
+
+    return sorted((ensure_layout(root) / "commands").glob("*.json"))
+
+
 def list_commands(root: Path) -> list[tuple[Path, dict[str, Any]]]:
-    command_root = ensure_layout(root) / "commands"
-    result: list[tuple[Path, dict[str, Any]]] = []
-    for source in sorted(command_root.glob("*.json")):
-        result.append((source, read_json(source)))
-    return result
+    return [(source, read_json(source)) for source in command_sources(root)]
 
 
 def remove_command(source: Path) -> None:
     source.unlink(missing_ok=True)
     _fsync_directory(source.parent)
+
+
+def acknowledge_commands(
+    root: Path,
+    commands: Sequence[tuple[Path, dict[str, Any], dict[str, Any] | None]],
+) -> None:
+    """Retain immutable receipts for a handled batch, then remove its files.
+
+    Callers invoke this only after the effects of every command are durable.
+    One directory sync commits all removals; a removal lost in a crash leaves
+    a file whose journaled outcome is acknowledged again on restart.
+    """
+
+    for _, command, outcome in commands:
+        record_command_receipt(root, command, outcome=outcome)
+    for source, _, _ in commands:
+        source.unlink(missing_ok=True)
+    if commands:
+        _fsync_directory(ensure_layout(root) / "commands")
+
+
+def remove_stale_state_temporaries(root: Path) -> int:
+    """Delete snapshot replacements abandoned by an interrupted controller.
+
+    Only the controller holding the queue lock writes these files, so the
+    caller must hold that lock.
+    """
+
+    root = ensure_layout(root)
+    candidates = [
+        *root.glob(".state.json.*.tmp"),
+        *root.glob(f".{STATE_CURSOR_FILE}.*.tmp"),
+    ]
+    journal_root = root / "journal"
+    if journal_root.is_dir():
+        candidates.extend(journal_root.glob(".*.tmp"))
+    for source in candidates:
+        source.unlink(missing_ok=True)
+    for directory in {source.parent for source in candidates}:
+        _fsync_directory(directory)
+    return len(candidates)
 
 
 def load_state(root: Path) -> dict[str, Any] | None:
