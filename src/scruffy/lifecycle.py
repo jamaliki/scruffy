@@ -647,15 +647,21 @@ def request_cancellation(
     job: dict[str, Any],
     request_id: str | None = None,
     *,
+    bulk: bool = False,
     deferred_stops: list[RunningProcess] | None = None,
 ) -> bool:
     """Cancel one job, returning false when its state cannot be cancelled.
 
-    When ``deferred_stops`` is given, launchers are collected for the caller
-    to stop after one commit instead of being signalled one by one.
+    The job records ``cancel_request_id``. A bulk operation correlates its
+    per-job events by ``bulk_request_id`` because only the operation's final
+    summary is that command's outcome. When ``deferred_stops`` is given,
+    launchers are collected for the caller to stop after one commit instead of
+    being signalled one by one.
     """
 
-    data = {"request_id": request_id} if request_id else None
+    data = None
+    if request_id:
+        data = {"bulk_request_id" if bulk else "request_id": request_id}
     if job["state"] in {"queued", "blocked"}:
         prior = _replayable_result(controller, job)
         if prior is not None:
@@ -665,6 +671,8 @@ def request_cancellation(
         job["state"] = "cancelled"
         job["finished_at"] = utc_now()
         job["reason"] = "cancelled_before_start"
+        if request_id:
+            job["cancel_request_id"] = request_id
         write_result_record(controller.root, job)
         emit(controller, "job.cancelled", job=job, data=data)
         return True
@@ -672,6 +680,8 @@ def request_cancellation(
         return False
     job["state"] = "cancelling"
     job["reason"] = "cancel_requested"
+    if request_id:
+        job["cancel_request_id"] = request_id
     emit(controller, "job.cancelling", job=job, data=data)
     running = controller.running.get(job["id"])
     if running is not None:

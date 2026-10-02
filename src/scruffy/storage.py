@@ -31,6 +31,8 @@ MAX_TAIL_BYTES = 1024 * 1024
 INVALID_REQUEST_DIGEST = "-"
 STATE_CURSOR_FILE = "cursor.json"
 MAX_STATE_CURSOR_BYTES = 4096
+# A bulk command may name up to 10,000 job IDs; its receipt retains it.
+MAX_COMMAND_RECEIPT_BYTES = 1024 * 1024
 
 
 class StorageError(RuntimeError):
@@ -177,7 +179,9 @@ def read_immutable_json(
     return value, hashlib.sha256(payload).hexdigest()
 
 
-def create_immutable_json(target: Path, value: Any) -> str:
+def create_immutable_json(
+    target: Path, value: Any, *, max_bytes: int = 64 * 1024
+) -> str:
     """Create one durable, no-replace, mode-0444 JSON authority."""
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +203,7 @@ def create_immutable_json(target: Path, value: Any) -> str:
     finally:
         os.close(descriptor)
     _fsync_directory(target.parent)
-    stored, digest = read_immutable_json(target)
+    stored, digest = read_immutable_json(target, max_bytes=max_bytes)
     if stored != value:
         raise StorageError(f"immutable JSON authority changed while publishing {target}")
     return digest
@@ -656,6 +660,7 @@ _ARCHIVED_JOB_FIELDS = (
     "allocation_incarnation_sha256",
     "workflow_invalid",
     "project_id",
+    "cancel_request_id",
 )
 
 
@@ -1140,7 +1145,7 @@ def submit_command(root: Path, command: dict[str, Any]) -> str:
             if not source.exists():
                 continue
             existing = (
-                read_immutable_json(source)[0]
+                read_immutable_json(source, max_bytes=MAX_COMMAND_RECEIPT_BYTES)[0]
                 if source == receipt
                 else read_json(source)
             )
@@ -1152,8 +1157,15 @@ def submit_command(root: Path, command: dict[str, Any]) -> str:
     return request_id
 
 
-def record_command_receipt(root: Path, command: dict[str, Any]) -> None:
-    """Retain one immutable command identity after it is handled or rejected."""
+def record_command_receipt(
+    root: Path, command: dict[str, Any], *, outcome: dict[str, Any] | None = None
+) -> None:
+    """Retain one immutable command identity after it is handled or rejected.
+
+    A command whose result is a summary (such as a bulk cancellation) also
+    retains that ``outcome``. The first durable receipt wins: a replay after a
+    crash only verifies the command identity.
+    """
 
     root = ensure_layout(root)
     request_id = command.get("request_id")
@@ -1161,16 +1173,35 @@ def record_command_receipt(root: Path, command: dict[str, Any]) -> None:
         raise StorageError("handled command has no request ID")
     command_root = root / "commands"
     receipt = _command_receipt(command_root, request_id)
-    document = {"v": 1, "request_id": request_id, "command": command}
+    document: dict[str, Any] = {"v": 1, "request_id": request_id, "command": command}
+    if outcome is not None:
+        document["outcome"] = outcome
     with _key_lock(command_root, request_id) as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if receipt.exists():
-            existing, _ = read_immutable_json(receipt)
-            if existing != document:
+            existing, _ = read_immutable_json(
+                receipt, max_bytes=MAX_COMMAND_RECEIPT_BYTES
+            )
+            if not isinstance(existing, dict) or existing.get("command") != command:
                 raise StorageError(f"conflicting command receipt for {request_id!r}")
             return
         _mkdir(receipt.parent)
-        create_immutable_json(receipt, document)
+        create_immutable_json(receipt, document, max_bytes=MAX_COMMAND_RECEIPT_BYTES)
+
+
+def command_receipt(root: Path, request_id: str) -> dict[str, Any] | None:
+    """Return a handled command's immutable receipt, or None while pending."""
+
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("request_id must be a non-empty string")
+    receipt = _command_receipt(ensure_layout(root) / "commands", request_id)
+    try:
+        document, _ = read_immutable_json(receipt, max_bytes=MAX_COMMAND_RECEIPT_BYTES)
+    except FileNotFoundError:
+        return None
+    if not isinstance(document, dict) or document.get("request_id") != request_id:
+        raise StorageError(f"invalid command receipt for {request_id!r}")
+    return document
 
 
 def _command_receipt(command_root: Path, request_id: str) -> Path:
@@ -1194,7 +1225,8 @@ def remove_command(source: Path) -> None:
 
 
 def acknowledge_commands(
-    root: Path, commands: Sequence[tuple[Path, dict[str, Any]]]
+    root: Path,
+    commands: Sequence[tuple[Path, dict[str, Any], dict[str, Any] | None]],
 ) -> None:
     """Retain immutable receipts for a handled batch, then remove its files.
 
@@ -1203,9 +1235,9 @@ def acknowledge_commands(
     a file whose journaled outcome is acknowledged again on restart.
     """
 
-    for _, command in commands:
-        record_command_receipt(root, command)
-    for source, _ in commands:
+    for _, command, outcome in commands:
+        record_command_receipt(root, command, outcome=outcome)
+    for source, _, _ in commands:
         source.unlink(missing_ok=True)
     if commands:
         _fsync_directory(ensure_layout(root) / "commands")

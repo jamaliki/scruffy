@@ -601,6 +601,7 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "evacuation_requests": {},
                 "evacuation_history": {},
                 "evacuation_cancel_requests": {},
+                "bulk_operations": {},
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -797,4 +798,5 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     state.setdefault("evacuation_requests", {})
     state.setdefault("evacuation_history", {})
     state.setdefault("evacuation_cancel_requests", {})
+    state.setdefault("bulk_operations", {})
     return state

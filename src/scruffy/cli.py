@@ -13,13 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .bulk import CANCELLABLE_STATES
 from .client import (
     cancel_evacuation,
     cancel_job,
+    cancel_jobs,
     clear_gpu_quarantine,
     drain_queue,
     explain,
     observe,
+    preview_cancel_jobs,
     publish_event,
     quarantine_gpu,
     reprobe_gpu,
@@ -30,6 +33,7 @@ from .client import (
     submit_workflow,
     summary,
     validate_workflow,
+    wait_for_command,
     wait_for_evacuation,
     wait_for_job,
 )
@@ -505,6 +509,38 @@ def _cancel(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _cancel_jobs(arguments: argparse.Namespace) -> int:
+    if arguments.job_ids_file == "-":
+        lines = sys.stdin.read().splitlines()
+    elif arguments.job_ids_file:
+        lines = Path(arguments.job_ids_file).read_text(encoding="utf-8").splitlines()
+    else:
+        lines = []
+    job_ids = [*arguments.job_ids, *(line.strip() for line in lines if line.strip())]
+    selector = {
+        "job_ids": job_ids or None,
+        "states": arguments.states or None,
+        "project_id": _project(arguments),
+        "workflow_id": arguments.workflow_id,
+        "workflow_id_prefix": arguments.workflow_prefix,
+        "request_id_prefix": arguments.request_prefix,
+        "name_prefix": arguments.name_prefix,
+        "submitted_before": arguments.submitted_before,
+    }
+    root = _root(arguments)
+    if arguments.dry_run:
+        _json(preview_cancel_jobs(root, **selector))
+        return 0
+    request = cancel_jobs(root, request_id=arguments.request_id, **selector)
+    if not arguments.wait:
+        _json(request)
+        return 0
+    receipt = wait_for_command(root, request["request_id"], timeout=arguments.timeout)
+    outcome = receipt.get("outcome") or {}
+    _json({"request_id": request["request_id"], **outcome})
+    return 0 if outcome.get("state") == "completed" else 1
+
+
 def _drain(arguments: argparse.Namespace) -> int:
     _json(drain_queue(_root(arguments)))
     return 0
@@ -917,6 +953,47 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = commands.add_parser("cancel", help="asynchronously request cancellation")
     cancel.add_argument("job_id", help="job to cancel")
     cancel.set_defaults(handler=_cancel)
+
+    cancel_many = commands.add_parser(
+        "cancel-jobs",
+        help="cancel many jobs with one command, by ID list or filter",
+        description=(
+            "Cancel explicit JOB_IDs and/or every job matching all filters with "
+            "one idempotent command. Filters require at least one --state. "
+            "SCRUFFY_PROJECT scopes the selection like --project. The "
+            "controller applies it over as many ticks as needed and records "
+            "one summary outcome."
+        ),
+    )
+    cancel_many.add_argument("job_ids", nargs="*", metavar="JOB_ID", help="jobs to cancel")
+    cancel_many.add_argument(
+        "--job-ids-file", metavar="FILE", help="newline-separated job IDs ('-' for stdin)"
+    )
+    cancel_many.add_argument(
+        "--state",
+        dest="states",
+        action="append",
+        default=[],
+        choices=sorted(CANCELLABLE_STATES),
+        help="match this state (repeatable)",
+    )
+    cancel_many.add_argument("--project", help="match this project (or SCRUFFY_PROJECT)")
+    cancel_many.add_argument("--workflow-id", help="match this exact workflow ID")
+    cancel_many.add_argument("--workflow-prefix", help="match workflow IDs with this prefix")
+    cancel_many.add_argument("--request-prefix", help="match request IDs with this prefix")
+    cancel_many.add_argument("--name-prefix", help="match job names with this prefix")
+    cancel_many.add_argument(
+        "--submitted-before", metavar="ISO8601", help="match jobs submitted before this time"
+    )
+    cancel_many.add_argument("--request-id", help="stable idempotency key for retries")
+    cancel_many.add_argument(
+        "--dry-run", action="store_true", help="report matches without cancelling"
+    )
+    cancel_many.add_argument(
+        "--wait", action="store_true", help="wait for the summary outcome"
+    )
+    cancel_many.add_argument("--timeout", type=float, help="bound --wait in seconds")
+    cancel_many.set_defaults(handler=_cancel_jobs)
 
     drain = commands.add_parser(
         "drain",

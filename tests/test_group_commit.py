@@ -185,10 +185,10 @@ class GroupCommitTests(unittest.TestCase):
             original_write(root, state)
             order.append("snapshot")
 
-        def record_receipt(root: Path, command: dict[str, Any]) -> None:
+        def record_receipt(root: Path, command: dict[str, Any], **kwargs: Any) -> None:
             on_disk = load_state(self.root)["jobs"][command["job_id"]]["state"]
             order.append(f"receipt:{on_disk}")
-            original_receipt(root, command)
+            original_receipt(root, command, **kwargs)
 
         with (
             mock.patch("scruffy.state.write_state", side_effect=record_write),

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ._compat import UTC
+from .bulk import cancel_selector, selector_matches
 from .health import (
     GPU_ISOLATION_MODES,
     HEALTH_MODES,
@@ -135,8 +136,13 @@ MAX_REPORTS_PER_TICK = 128
 # Commands are applied in one group commit per tick. The bound keeps one tick
 # short when thousands of command files are pending on a shared filesystem.
 MAX_COMMANDS_PER_TICK = 512
+# Each cancelled job writes an immutable result record, so a bulk operation
+# over thousands of jobs advances over several ticks, one commit per tick.
+MAX_BULK_CANCELS_PER_TICK = 512
+MAX_REPORTED_UNKNOWN_JOB_IDS = 20
 STORAGE_RETRY_SECONDS = 5
 COMMAND_OUTCOME_KINDS = {
+    "jobs.cancel_completed",
     "job.cancelled",
     "job.cancelling",
     "job.cancel_ignored",
@@ -2515,7 +2521,9 @@ def _finish_missing_cancel(controller: Controller, command: dict[str, Any], job_
 
 
 def _ingest_commands(
-    controller: Controller, limit: int = MAX_COMMANDS_PER_TICK
+    controller: Controller,
+    limit: int = MAX_COMMANDS_PER_TICK,
+    bulk_limit: int = MAX_BULK_CANCELS_PER_TICK,
 ) -> None:
     """Apply a bounded batch of commands and persist their effects once.
 
@@ -2525,13 +2533,21 @@ def _ingest_commands(
     point either replays the outcome from the journal or retries the command.
     """
 
-    handled: list[tuple[Path, dict[str, Any]]] = []
+    handled: list[tuple[Path, dict[str, Any], dict[str, Any] | None]] = []
     stops: list[RunningProcess] = []
+    bulk_budget = bulk_limit
     with group_commit(controller):
         for source in command_sources(controller.root)[:limit]:
             command = read_json(source)
-            if _apply_command(controller, command, stops):
-                handled.append((source, command))
+            if command.get("kind") == "cancel_jobs":
+                finished, outcome, used = _apply_bulk_cancel(
+                    controller, command, stops, bulk_budget
+                )
+                bulk_budget -= used
+                if finished:
+                    handled.append((source, command, outcome))
+            elif _apply_command(controller, command, stops):
+                handled.append((source, command, None))
         if stops:
             # Cancelling transitions are durable before any launcher sees them.
             ensure_committed(controller)
@@ -2541,6 +2557,156 @@ def _ingest_commands(
             after_commit(
                 controller, lambda: acknowledge_commands(controller.root, handled)
             )
+
+
+def _bulk_project(selector: dict[str, Any]) -> dict[str, str]:
+    """Scope an operation's events to its project for filtered observers."""
+
+    project_id = selector.get("project_id")
+    return {"project_id": project_id} if isinstance(project_id, str) else {}
+
+
+def _start_bulk_cancel(
+    controller: Controller, command: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve a new bulk cancellation into a fixed, ordered target list.
+
+    Return None to retry next tick while a named job still awaits admission
+    or an archived lookup hits a transient storage error.
+    """
+
+    request_id = command.get("request_id")
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or "/" in request_id
+        or len(request_id) > 200
+    ):
+        raise ValueError("bulk cancellation request_id must be a path-safe string")
+    selector = cancel_selector(command.get("selector"))
+    jobs = controller.state["jobs"]
+    archived_terminal = 0
+    unknown: list[str] = []
+    missing = [job_id for job_id in selector.get("job_ids") or () if job_id not in jobs]
+    if missing:
+        pending = {job_id for job_id, _ in list_requests(controller.root)}
+        if pending.intersection(missing):
+            return None
+        unscoped = {key: value for key, value in selector.items() if key != "states"}
+        for job_id in missing:
+            try:
+                archived = find_archived_job(controller.root, job_id)
+            except TransientStorageError:
+                return None
+            except (OSError, StorageError) as exc:
+                _storage_notice(controller, "read_archived_job", job_id, exc)
+                archived = None
+            if archived is not None and selector_matches(archived, unscoped):
+                archived_terminal += 1
+            else:
+                unknown.append(job_id)
+    targets = sorted(
+        (job for job in jobs.values() if selector_matches(job, selector)),
+        key=lambda job: (int(job.get("queue_order", 0)), str(job["id"])),
+    )
+    operation = {
+        "v": 1,
+        "kind": "cancel_jobs",
+        "request_id": request_id,
+        "selector": selector,
+        "started_at": utc_now(),
+        "targets": [job["id"] for job in targets],
+        "position": 0,
+        "counts": {
+            "matched": len(targets) + archived_terminal,
+            "cancelled": 0,
+            "cancelling": 0,
+            "ignored": archived_terminal,
+            "unknown": len(unknown),
+        },
+        "unknown_job_ids": unknown[:MAX_REPORTED_UNKNOWN_JOB_IDS],
+    }
+    controller.state.setdefault("bulk_operations", {})[request_id] = operation
+    emit(
+        controller,
+        "jobs.cancel_started",
+        data={
+            "request_id": request_id,
+            "selector": selector,
+            "counts": copy.deepcopy(operation["counts"]),
+            **_bulk_project(selector),
+        },
+    )
+    return operation
+
+
+def _apply_bulk_cancel(
+    controller: Controller,
+    command: dict[str, Any],
+    stops: list[RunningProcess],
+    budget: int,
+) -> tuple[bool, dict[str, Any] | None, int]:
+    """Advance one bulk cancellation by at most ``budget`` jobs.
+
+    Return whether the operation finished, its outcome, and the jobs used.
+    The operation and its counts live in the snapshot between ticks. Each
+    cancelled job records the operation's request ID, so a crash between a
+    durable journal batch and its snapshot still counts that job once.
+    """
+
+    request_id = command.get("request_id")
+    operations = controller.state.setdefault("bulk_operations", {})
+    operation = operations.get(request_id) if isinstance(request_id, str) else None
+    if operation is None:
+        try:
+            operation = _start_bulk_cancel(controller, command)
+        except (TypeError, ValueError) as exc:
+            emit(
+                controller,
+                "command.rejected",
+                data={"request_id": request_id, "reason": str(exc)},
+            )
+            return True, {"state": "rejected", "reason": str(exc)}, 0
+        if operation is None:
+            return False, None, 0
+    jobs = controller.state["jobs"]
+    counts = operation["counts"]
+    targets = operation["targets"]
+    used = 0
+    while operation["position"] < len(targets) and used < budget:
+        job = jobs.get(targets[operation["position"]])
+        operation["position"] += 1
+        used += 1
+        if job is None:
+            # Archived since the operation started, therefore terminal.
+            counts["ignored"] += 1
+            continue
+        replayed = job.get("cancel_request_id") == request_id
+        if replayed or request_cancellation(
+            controller, job, request_id, bulk=True, deferred_stops=stops
+        ):
+            bucket = job.get("state")
+            counts[bucket if bucket in {"cancelled", "cancelling"} else "ignored"] += 1
+        else:
+            counts["ignored"] += 1
+    if operation["position"] < len(targets):
+        return False, None, used
+    del operations[request_id]
+    outcome = {
+        "state": "completed",
+        "request_id": request_id,
+        "selector": operation["selector"],
+        "started_at": operation["started_at"],
+        "completed_at": utc_now(),
+        "counts": dict(counts),
+        "unknown_job_ids": list(operation["unknown_job_ids"]),
+    }
+    emit(
+        controller,
+        "jobs.cancel_completed",
+        data={**copy.deepcopy(outcome), **_bulk_project(operation["selector"])},
+    )
+    return True, outcome, used
 
 
 def _apply_command(
@@ -2760,7 +2926,15 @@ def _discard_journaled_commands(controller: Controller) -> None:
         item = pending.pop(request_id, None)
         if item is not None:
             source, command = item
-            record_command_receipt(controller.root, command)
+            if event.get("kind") == "jobs.cancel_completed":
+                outcome = {
+                    key: value for key, value in data.items() if key != "project_id"
+                }
+            elif command.get("kind") == "cancel_jobs":
+                outcome = {"state": "rejected", "reason": data.get("reason")}
+            else:
+                outcome = None
+            record_command_receipt(controller.root, command, outcome=outcome)
             remove_command(source)
         if not pending:
             return

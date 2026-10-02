@@ -34,6 +34,9 @@ falls back to `state.json`, preserving compatibility with older queue roots.
 | Wait and inspect one job | - | MCP `wait_job(...)` |
 | Publish workload state | `scruffy report KIND` | `publish_event(...)` |
 | Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
+| Cancel many jobs | `scruffy cancel-jobs ...` | `cancel_jobs(root, ...)`, MCP `cancel_jobs` |
+| Preview a bulk cancel | `scruffy cancel-jobs ... --dry-run` | `preview_cancel_jobs(root, ...)` |
+| Wait for a command receipt | `scruffy cancel-jobs ... --wait` | `wait_for_command(root, request_id)` |
 | Disable new launches | `scruffy drain` | `drain_queue(root)` |
 | Resume after recovery | `scruffy resume` | `resume_queue(root)` |
 | Evacuate selected jobs | `scruffy evacuate ...` | `request_evacuation(root, ...)` |
@@ -399,6 +402,34 @@ command file is removed only after that commit. Cancellation retains its
 assignment until launcher exit, output closure, and Slurm reconciliation prove
 release safe. Cancelling any terminal job, including an archived one, produces
 `job.cancel_ignored` rather than `command.rejected`.
+
+`cancel_jobs` spools one bulk command for many jobs:
+
+```json
+{"request_id": "ops-cleanup-1", "state": "cancel_requested",
+ "selector": {"states": ["blocked"], "project_id": "koochak"}}
+```
+
+The selector names `job_ids` (at most 10,000), filters, or both (their
+intersection). Filters are `states` (a non-empty subset of `queued`,
+`blocked`, `starting`, `running`, and `finishing`; required unless `job_ids`
+is given), `project_id`, `workflow_id`, `workflow_id_prefix`,
+`request_id_prefix`, `name_prefix`, and `submitted_before` (ISO 8601 with a
+UTC offset). The controller resolves the selector once against its hot state.
+A named job still awaiting admission defers the whole command to a later
+tick. It then cancels at most 512 jobs per tick, each with its ordinary
+`job.cancelled` or `job.cancelling` event carrying `data.bulk_request_id`, and
+each job records `cancel_request_id`. `jobs.cancel_started` and the outcome
+`jobs.cancel_completed` repeat `request_id` and carry `counts`:
+`matched = cancelled + cancelling + ignored`, where `ignored` jobs were already
+terminal or cancelling, plus `unknown` named IDs. The same summary is kept as
+`outcome` in the command's immutable receipt, which `wait_for_command` returns.
+An invalid selector produces `command.rejected` and a rejected outcome.
+Progress of an unfinished operation appears in `summary.bulk_operations`.
+Reusing a `request_id` with the same selector is an idempotent retry. On MCP,
+`cancel_jobs` exists only on project-pinned servers and always adds that
+project to the selector; `dry_run=true` previews and `wait_seconds` waits up
+to 300 seconds for the outcome.
 
 `quarantine_gpu`, `clear_gpu_quarantine`, and `reprobe_gpu` use the same
 immutable command inbox. Their correlated outcome is

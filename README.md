@@ -438,7 +438,9 @@ Every server exposes focused monitoring tools:
 In stdio mode, start with `--project PROJECT` (or `SCRUFFY_PROJECT`) to pin the
 server to one project. In shared HTTP mode, Codex pins the project once through
 the `X-Scruffy-Project` connection header instead. A pinned server adds
-`submit_job`, `validate_workflow`, and `submit_workflow`. `submit_job` requires
+`submit_job`, `cancel_jobs`, `validate_workflow`, and `submit_workflow`.
+`cancel_jobs` is the project-scoped bulk cancellation described under
+[Lifecycle and operations](#lifecycle-and-operations). `submit_job` requires
 a stable `request_id`, name, argv array, absolute worker `cwd`, and explicit
 `gpus_per_node` (zero means CPU-only). It durably enqueues and returns without
 waiting for GPUs. Retry an uncertain call with identical arguments and the same
@@ -701,6 +703,7 @@ scruffy status [JOB_ID]
 scruffy explain JOB_ID
 scruffy wait JOB_ID
 scruffy cancel JOB_ID
+scruffy cancel-jobs [JOB_ID ...] [--state STATE ...] [filters] [--dry-run] [--wait]
 scruffy drain
 scruffy resume
 ```
@@ -713,6 +716,26 @@ replacement allocation starts. An explicit `resume` also reverses a drain or
 clears a recovery or `--start-paused` launch pause.
 Cancelling an archived terminal job produces `job.cancel_ignored`, just like
 cancelling a terminal job still in hot state.
+
+`cancel-jobs` cancels many jobs with one durable command instead of one command
+per job. It selects explicit job IDs (arguments or `--job-ids-file`), filters,
+or both: `--state` (required for filters), `--project` (or
+`SCRUFFY_PROJECT`), `--workflow-id`, `--workflow-prefix`, `--request-prefix`,
+`--name-prefix`, and `--submitted-before`. `--dry-run` reports what currently
+matches without writing anything.
+
+```bash
+scruffy cancel-jobs --state blocked --project koochak \
+  --workflow-prefix sweep-17/ --dry-run
+scruffy cancel-jobs --state blocked --project koochak \
+  --workflow-prefix sweep-17/ --request-id ops-cleanup-sweep-17 --wait
+```
+
+The controller resolves the selector once, cancels at most 512 jobs per tick
+with one snapshot commit per tick, and records one immutable summary
+(`matched`, `cancelled`, `cancelling`, `ignored`, `unknown`) in the command
+receipt and a `jobs.cancel_completed` event. Retrying with the same
+`--request-id` and selector is safe; a different selector conflicts.
 
 The hot snapshot keeps every nonterminal job and, after compaction, the newest
 1,000 terminal jobs. Older terminal jobs remain addressable by job ID with

@@ -530,6 +530,28 @@ def build_summary(
         if isinstance(release, str) and release.strip()
         else "unknown"
     )
+    raw_operations = state.get("bulk_operations")
+    bulk_operations = sorted(
+        (
+            {
+                "request_id": operation.get("request_id"),
+                "kind": operation.get("kind"),
+                "started_at": operation.get("started_at"),
+                "processed": operation.get("position"),
+                "total": len(operation.get("targets") or ()),
+                "counts": copy.deepcopy(operation.get("counts")),
+            }
+            for operation in (
+                raw_operations.values() if isinstance(raw_operations, dict) else ()
+            )
+            if isinstance(operation, dict)
+            and (
+                selected_project is None
+                or (operation.get("selector") or {}).get("project_id") == selected_project
+            )
+        ),
+        key=lambda item: str(item["started_at"] or ""),
+    )
     allocation_deadline = _parse_time(allocation.get("deadline_at"))
     if allocation_deadline is not None:
         allocation["remaining_seconds"] = max(
@@ -543,6 +565,7 @@ def build_summary(
         "allocation": allocation,
         "evacuation": copy.deepcopy(state.get("evacuation")),
         "evacuation_history": copy.deepcopy(state.get("evacuation_history", {})),
+        "bulk_operations": bulk_operations,
         "updated_at": state.get("updated_at"),
         "draining": bool(state.get("draining", False)),
         "launches_paused": bool(state.get("launches_paused", False)),

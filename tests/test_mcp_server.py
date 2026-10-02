@@ -886,6 +886,7 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                     "wait_for_updates",
                     "wait_job",
                     "submit_job",
+                    "cancel_jobs",
                     "validate_workflow",
                     "submit_workflow",
                 },
