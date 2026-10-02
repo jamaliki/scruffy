@@ -348,6 +348,35 @@ class BulkCancelControllerTests(unittest.TestCase):
         ]
         self.assertEqual(sorted(image["id"] for image in images), sorted(cancelled))
 
+    def test_restart_after_a_lost_first_snapshot_still_counts_every_job(self) -> None:
+        controller = self._controller()
+        images = [job(f"job-{index}", order=index) for index in range(5)]
+        self._seed(controller, *images)
+        cancel_jobs(self.root, states=["blocked"], request_id="first-tick")
+
+        # The journal batch is durable, but the snapshot holding the new
+        # operation record is not.
+        with (
+            mock.patch("scruffy.state.write_state", side_effect=OSError("EIO")),
+            self.assertRaises(OSError),
+        ):
+            _ingest_commands(controller)
+        controller.journal.close()
+
+        restarted = self._controller()
+        self.assertNotIn("first-tick", restarted.state["bulk_operations"])
+        self.assertEqual(
+            {"cancelled"},
+            {restarted.state["jobs"][image["id"]]["state"] for image in images},
+        )
+        _discard_journaled_commands(restarted)
+        _ingest_commands(restarted)
+
+        self.assertEqual(
+            {"matched": 5, "cancelled": 5, "cancelling": 0, "ignored": 0, "unknown": 0},
+            self._receipt_outcome("first-tick")["counts"],
+        )
+
     def test_named_job_awaiting_admission_defers_the_whole_command(self) -> None:
         controller = self._controller()
         self._seed(controller, job("known"))

@@ -2711,12 +2711,12 @@ def _start_bulk_cancel(
     jobs = controller.state["jobs"]
     archived_terminal = 0
     unknown: list[str] = []
+    unscoped = {key: value for key, value in selector.items() if key != "states"}
     missing = [job_id for job_id in selector.get("job_ids") or () if job_id not in jobs]
     if missing:
         pending = {job_id for job_id, _ in list_requests(controller.root)}
         if pending.intersection(missing):
             return None
-        unscoped = {key: value for key, value in selector.items() if key != "states"}
         for job_id in missing:
             try:
                 archived = find_archived_job(controller.root, job_id)
@@ -2729,8 +2729,18 @@ def _start_bulk_cancel(
                 archived_terminal += 1
             else:
                 unknown.append(job_id)
+    # Jobs this request already cancelled before a crash lost the operation
+    # record (but not its journaled cancellations) still count as cancelled.
     targets = sorted(
-        (job for job in jobs.values() if selector_matches(job, selector)),
+        (
+            job
+            for job in jobs.values()
+            if selector_matches(job, selector)
+            or (
+                job.get("cancel_request_id") == request_id
+                and selector_matches(job, unscoped)
+            )
+        ),
         key=lambda job: (int(job.get("queue_order", 0)), str(job["id"])),
     )
     operation = {
