@@ -293,7 +293,10 @@ The object has no extension fields. `signal` is currently restricted to
 automatically retried in this release. Wave 1 automatically creates one
 replay-safe successor only for `allocation_replaced` and
 `allocation_incarnation_changed`, preserving argv, cwd, environment, resource,
-dependency, artifact, and recovery declarations. Successors expose
+dependency, artifact, and recovery declarations. Only the attempt's own
+terminal reason counts and becomes the successor's `retry_reason`: an attempt
+that ended for any other reason, such as `application_exit`, is never retried
+automatically, including at a later allocation replacement. Successors expose
 `predecessor_job_id`, `successor_job_id`, `retry_reason`, and `retry_exhausted`
 in inspection, summaries, and archives. Non-restartable tasks and exhausted
 policies remain terminal `lost` jobs.
