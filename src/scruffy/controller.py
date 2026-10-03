@@ -379,7 +379,7 @@ def _initialize_controller(
             for job in recovered_terminal:
                 emit(controller, f"job.{job['state']}", job=job, snapshot=False)
             if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
-                _recover_lost_workflow_jobs(controller, active_lost_reason)
+                _recover_lost_workflow_jobs(controller)
 
         # Queued and later workflow jobs have already crossed their dependency
         # gate. Persist the marker for snapshots created before the field existed.
@@ -627,17 +627,24 @@ def _recovery_successor_spec(
     return spec
 
 
-def _recovery_candidate(
-    predecessor: dict[str, Any], reason: str
-) -> tuple[int, str, str] | None:
+def _recovery_candidate(predecessor: dict[str, Any]) -> tuple[int, str, str] | None:
+    """Return the deterministic successor due for the attempt's own terminal reason.
+
+    Only the reason the attempt itself ended with is retryable. A later,
+    unrelated event such as an allocation replacement never retries an attempt
+    that ended for another reason (for example ``application_exit``).
+    """
+
     workflow_id = predecessor.get("workflow_id")
     task_id = predecessor.get("task_id")
+    reason = predecessor.get("reason")
     policy = _recovery_policy(predecessor)
     if (
         predecessor.get("state") not in {"lost", "failed"}
         or not isinstance(workflow_id, str)
         or not isinstance(task_id, str)
         or policy is None
+        or not isinstance(reason, str)
         or reason not in policy.get("retry_on", [])
         or not all(key in predecessor for key in ("argv", "cwd", "request"))
     ):
@@ -716,8 +723,13 @@ def _admit_recovery_successor(
     record_request_receipt(controller.root, successor_id, job_identity_digest(spec))
 
 
-def _recover_lost_workflow_jobs(controller: Controller, reason: str) -> None:
-    """Admit at most one deterministic successor for each eligible lost task."""
+def _recover_lost_workflow_jobs(controller: Controller) -> None:
+    """Admit at most one deterministic successor for each eligible lost task.
+
+    A task is eligible only when it was itself lost to an allocation
+    replacement or incarnation change listed in its policy; evacuated attempts
+    are recovered by their evacuation operation instead.
+    """
 
     jobs = controller.state["jobs"]
     prospective = dict(jobs)
@@ -725,7 +737,10 @@ def _recover_lost_workflow_jobs(controller: Controller, reason: str) -> None:
     for predecessor in sorted(
         jobs.values(), key=lambda job: (int(job.get("queue_order", 0)), str(job["id"]))
     ):
-        candidate = _recovery_candidate(predecessor, reason)
+        reason = predecessor.get("reason")
+        if not isinstance(reason, str) or reason not in AUTO_RECOVERY_REASONS:
+            continue
+        candidate = _recovery_candidate(predecessor)
         if candidate is None:
             continue
         attempt, request_id, successor_id = candidate
@@ -1350,7 +1365,7 @@ def _evacuation_target_terminal(
         target["outcome"] = "completed"
         return
     if state == "failed" and job.get("reason") == "evacuated":
-        candidate = _recovery_candidate(job, "evacuated")
+        candidate = _recovery_candidate(job)
         if candidate is None:
             _mark_retry_exhaustion(job, "evacuated")
             target.update({"outcome": "lost", "reason": "not_restartable"})
@@ -2440,7 +2455,7 @@ def _retry_pending(controller: Controller, producer: dict[str, Any]) -> bool:
     if producer.get("successor_job_id") is not None:
         return False
     reason = producer.get("reason")
-    if not isinstance(reason, str) or _recovery_candidate(producer, reason) is None:
+    if not isinstance(reason, str) or _recovery_candidate(producer) is None:
         return False
     if reason in AUTO_RECOVERY_REASONS:
         # Admitted by the next controller start in this or a later allocation.
