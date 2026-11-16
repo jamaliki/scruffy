@@ -175,6 +175,8 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
             "handover",
         )
     }
+    if allocation.get("mode"):
+        allocation_view["mode"] = allocation["mode"]
     allocation_view["controller_release"] = allocation.get("controller_release", "unknown")
 
     return {
@@ -189,6 +191,7 @@ def minimal_overview(value: dict[str, Any]) -> dict[str, Any]:
         "counts": copy.deepcopy(value.get("counts", {})),
         "scheduler": copy.deepcopy(value.get("scheduler", {})),
         "resources": resource_totals(value.get("nodes")),
+        "leases": copy.deepcopy((value.get("leases") or {}).get("totals", {})),
         "gpu_health": copy.deepcopy(value.get("gpu_health")),
         "evacuation": copy.deepcopy(value.get("evacuation")),
         "evacuation_history": copy.deepcopy(value.get("evacuation_history", {})),

@@ -112,6 +112,14 @@ button.legend-item.selected { box-shadow:inset 0 -2px 0 var(--project-color); }
 .node-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--teal); opacity:.48; }
 .node-card:has(.gpu.occupied)::before { background:var(--accent); }
 .node-card:has(.gpu.stopped)::before { background:var(--danger); opacity:1; }
+.lease-card::before { background:var(--slate); }
+.lease-card.lease-running::before { background:var(--teal); opacity:.9; }
+.lease-card.lease-releasing::before { background:var(--warning); opacity:.9; }
+.lease-card:has(.lease-job)::before { background:var(--accent); }
+.lease-nodes { margin:10px 0 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+.lease-jobs { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; }
+.lease-job { padding:5px 9px; border:1px solid var(--project-color,var(--accent)); border-left-width:4px; background:rgba(3,16,18,.5); color:var(--ink); font-family:var(--mono); font-size:11px; cursor:pointer; }
+.lease-job:hover { background:var(--accent-light); }
 .node-header { display:flex; justify-content:space-between; align-items:baseline; gap:16px; margin-bottom:12px; }
 .node-name { margin:0; color:var(--heading); font-family:var(--serif); font-size:15px; font-style:italic; font-weight:700; letter-spacing:.03em; }
 .node-name::before { content:"// "; color:var(--accent); }

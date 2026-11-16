@@ -164,6 +164,30 @@ agents; reading does not consume events for anyone else. Use
   `scruffy resume`.
 - By default, `serve` automatically drains 900 seconds before Slurm's allocation
   deadline. Override with `--drain-before-end-seconds`; `0` disables it.
+- Leases add capacity beyond the primary allocation. Use
+  `scruffy lease attach SLURM_JOB_ID` for an allocation the user already holds
+  (Scruffy never cancels it), `serve --pools FILE` for elastic `sbatch` leases,
+  and `serve --hub` for a controller with no allocation of its own. Inspect
+  them with `scruffy leases` or the `leases` block of `summary` and
+  `resources`. Do not cancel elastic lease jobs (named `scruffy-lease-*`) by
+  hand; use `scruffy lease release`.
+- Set `--time-limit-seconds` on work that may run on a lease. A timed job runs
+  on a lease only if it can finish before the lease ends; an untimed job may
+  use only the primary or an attached lease. A job whose lease ended becomes
+  `lost` with reason `lease_ended`; opt into retries with
+  `recovery.retry_on: ["lease_ended"]`.
+- Leases add capacity beyond the primary allocation. Use
+  `scruffy lease attach SLURM_JOB_ID` for an allocation the user already holds
+  (Scruffy never cancels it), `serve --pools FILE` for elastic `sbatch` leases,
+  and `serve --hub` for a controller with no allocation of its own. Inspect
+  them with `scruffy leases` or the `leases` block of `summary` and
+  `resources`. Do not cancel elastic lease jobs (named `scruffy-lease-*`) by
+  hand; use `scruffy lease release`.
+- Set `--time-limit-seconds` on work that may run on a lease. A timed job runs
+  on a lease only if it can finish before the lease ends; an untimed job may
+  use only the primary or an attached lease. A job whose lease ended becomes
+  `lost` with reason `lease_ended`; opt into retries with
+  `recovery.retry_on: ["lease_ended"]`.
 - Run the controller as the outer batch foreground process when possible. A
   nested controller `srun` must use `--overlap --gres=none` with a small CPU and
   memory request so its management footprint does not block worker steps.

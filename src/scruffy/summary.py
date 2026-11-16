@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from ._compat import UTC
+from .leases import is_live, lease_view
 from .models import (
     ACTIVE_JOB_STATES,
     DEFAULT_PROJECT,
@@ -87,6 +88,7 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "assignment": job.get("assignment"),
         "placement": job.get("assignment") or job.get("last_assignment"),
         "provenance": job.get("provenance"),
+        "lease_id": job.get("lease_id"),
         "resolved_dependencies": list(job.get("resolved_dependencies") or []),
         "resolved_conditions": list(job.get("resolved_conditions") or []),
         "allocation_incarnation_sha256": job.get(
@@ -278,6 +280,72 @@ def scheduler_explanation(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_LEASE_STATE_ORDER = {"running": 0, "releasing": 1, "pending": 2, "requested": 3, "ended": 4}
+RECENT_ENDED_LEASES = 5
+
+
+def _lease_used_gpus(state: dict[str, Any]) -> Counter[str]:
+    used: Counter[str] = Counter()
+    for job in state.get("jobs", {}).values():
+        if not isinstance(job, dict) or job.get("state") not in ACTIVE_JOB_STATES:
+            continue
+        assignment = job.get("assignment")
+        if not isinstance(assignment, dict) or not assignment.get("lease_id"):
+            continue
+        for reservation in assignment.get("reservations") or ():
+            if isinstance(reservation, dict):
+                used[str(assignment["lease_id"])] += len(reservation.get("gpu_ids") or ())
+    return used
+
+
+def lease_summary(state: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Return live leases, recent endings, pool backoff, and lease capacity.
+
+    Leases are allocation-wide capacity; project scoping never hides them.
+    """
+
+    current = (now or datetime.now(UTC)).timestamp()
+    raw = state.get("leases")
+    leases = [
+        lease
+        for lease in (raw.values() if isinstance(raw, dict) else ())
+        if isinstance(lease, dict)
+    ]
+    used = _lease_used_gpus(state)
+    live = sorted(
+        (lease for lease in leases if is_live(lease)),
+        key=lambda lease: (
+            _LEASE_STATE_ORDER.get(str(lease.get("state")), 9),
+            str(lease.get("lease_id")),
+        ),
+    )
+    ended = sorted(
+        (lease for lease in leases if not is_live(lease)),
+        key=lambda lease: str(lease.get("ended_at") or ""),
+        reverse=True,
+    )
+    live_views = [
+        lease_view(lease, current, used.get(str(lease.get("lease_id")), 0)) for lease in live
+    ]
+    running = [view for view in live_views if view["state"] == "running"]
+    pools = state.get("lease_pools")
+    return {
+        "totals": {
+            "live": len(live_views),
+            "running": len(running),
+            "pending": sum(view["state"] in {"requested", "pending"} for view in live_views),
+            "releasing": sum(view["state"] == "releasing" for view in live_views),
+            "gpus_total": sum(view["gpus"] for view in running),
+            "gpus_used": sum(view["used_gpus"] for view in live_views),
+        },
+        "live": live_views,
+        "recent_ended": [
+            lease_view(lease, current) for lease in ended[:RECENT_ENDED_LEASES]
+        ],
+        "pools": copy.deepcopy(pools) if isinstance(pools, dict) else {},
+    }
+
+
 def _node_sort_key(name: str) -> tuple[str, int, str]:
     prefix, separator, suffix = name.rpartition("-")
     if separator and suffix.isascii() and suffix.isdecimal():
@@ -314,6 +382,7 @@ def resource_view(state: dict[str, Any]) -> dict[str, Any]:
             )
     allocation = state.get("allocation")
     allocation = allocation if isinstance(allocation, dict) else {}
+    leases = lease_summary(state)
     return {
         "v": 1,
         "queue_id": state.get("queue_id"),
@@ -322,12 +391,16 @@ def resource_view(state: dict[str, Any]) -> dict[str, Any]:
         "allocation": {
             "id": allocation.get("id"),
             "state": allocation.get("state"),
+            "mode": allocation.get("mode", "allocation"),
             "controller_release": allocation.get("controller_release", "unknown"),
         },
         "totals": resource_totals(nodes),
         "scheduler": scheduler_explanation(state),
         "gpu_health": state.get("gpu_health"),
         "nodes": rows,
+        "lease_totals": leases["totals"],
+        "leases": leases["live"],
+        "lease_pools": leases["pools"],
     }
 
 
@@ -582,6 +655,7 @@ def build_summary(
         "scheduler": scheduler_explanation({**state, "jobs": {job["id"]: job for job in jobs}}),
         "archived_jobs": sum(int(count) for count in archived_counts.values()),
         "nodes": state.get("nodes", {}),
+        "leases": lease_summary(state, current),
         "submitted": submitted[:limit],
         "active": active[:limit],
         "queued": queued[:limit],

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .health import unavailable_gpu_ids
+from .leases import prune_ended_leases
 from .models import (
     ACTIVE_JOB_STATES,
     DEFAULT_PROJECT,
@@ -224,13 +225,44 @@ def apply_workload_event(
     workload["last_recorded_at"] = recorded_at
 
 
-def active_assignments(state: dict[str, Any]) -> tuple[Assignment, ...]:
-    """Decode every assignment which must still hold resources."""
+def job_lease_id(job: dict[str, Any]) -> str | None:
+    """Return the lease a job's current or last assignment is on.
+
+    ``None`` is the controller's own (primary) allocation.
+    """
+
+    for key in ("assignment", "last_assignment"):
+        assignment = job.get(key)
+        if isinstance(assignment, dict):
+            lease_id = assignment.get("lease_id")
+            return lease_id if isinstance(lease_id, str) else None
+    lease_id = job.get("lease_id")
+    return lease_id if isinstance(lease_id, str) else None
+
+
+def all_active_assignments(state: dict[str, Any]) -> tuple[Assignment, ...]:
+    """Decode every assignment on any allocation that still holds resources."""
 
     return tuple(
         Assignment.from_dict(job["assignment"])
         for job in state["jobs"].values()
         if job["state"] in ACTIVE_JOB_STATES and job.get("assignment") is not None
+    )
+
+
+def active_assignments(
+    state: dict[str, Any], lease_id: str | None = None
+) -> tuple[Assignment, ...]:
+    """Decode the assignments still holding resources on one allocation.
+
+    The default is the controller's primary allocation; pass a lease ID for a
+    satellite allocation. Node names are only unique within one allocation.
+    """
+
+    return tuple(
+        assignment
+        for assignment in all_active_assignments(state)
+        if assignment.lease_id == lease_id
     )
 
 
@@ -717,6 +749,8 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
                 "evacuation_cancel_requests": {},
                 "bulk_operations": {},
                 "retained_log_jobs": [],
+                "leases": {},
+                "lease_pools": {},
                 "updated_at": utc_now(),
             }
     generation = int(state.get("journal_generation", 0))
@@ -799,6 +833,8 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
             "jobs.cancel_completed",
         } and isinstance(event.get("data"), dict):
             apply_bulk_event(state, event["kind"], event["data"])
+        if event.get("kind", "").startswith("lease."):
+            apply_lease_event(state, event)
         if event.get("kind") == "resource.gpu_health_changed":
             data = event.get("data")
             recovered_health = data.get("gpu_health") if isinstance(data, dict) else None
@@ -923,4 +959,24 @@ def load_recovered_state(root: Path) -> dict[str, Any]:
     state.setdefault("evacuation_cancel_requests", {})
     state.setdefault("bulk_operations", {})
     state.setdefault("retained_log_jobs", [])
+    state.setdefault("leases", {})
+    state.setdefault("lease_pools", {})
     return state
+
+
+def apply_lease_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    """Replay one lease transition from its complete lease or pool image."""
+
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return
+    lease = data.get("lease")
+    if isinstance(lease, dict) and isinstance(lease.get("lease_id"), str):
+        leases = state.setdefault("leases", {})
+        leases[lease["lease_id"]] = copy.deepcopy(lease)
+        if lease.get("state") == "ended":
+            prune_ended_leases(leases)
+    pool = data.get("pool_status")
+    name = data.get("pool")
+    if isinstance(pool, dict) and isinstance(name, str):
+        state.setdefault("lease_pools", {})[name] = copy.deepcopy(pool)

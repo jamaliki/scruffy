@@ -298,9 +298,17 @@ class Assignment:
     job_id: str
     request: ResourceRequest
     reservations: tuple[NodeReservation, ...]
+    # ``None`` is the controller's own (primary) allocation. A lease ID names
+    # another Slurm allocation the controller launches into. Primary
+    # assignments serialize without the key so their digests are unchanged.
+    lease_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "job_id", _nonempty_string(self.job_id, "job_id"))
+        if self.lease_id is not None:
+            object.__setattr__(
+                self, "lease_id", _nonempty_string(self.lease_id, "lease_id")
+            )
         if not isinstance(self.request, ResourceRequest):
             raise ModelError("request must be a ResourceRequest")
         reservations = tuple(self.reservations)
@@ -313,27 +321,39 @@ class Assignment:
         object.__setattr__(self, "reservations", reservations)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "job_id": self.job_id,
             "request": self.request.to_dict(),
             "reservations": [item.to_dict() for item in self.reservations],
         }
+        if self.lease_id is not None:
+            result["lease_id"] = self.lease_id
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> Assignment:
         data = _mapping(value, "assignment")
-        _exact_keys(data, {"job_id", "request", "reservations"}, "assignment")
+        required = {"job_id", "request", "reservations"}
+        _exact_keys(
+            data,
+            required | ({"lease_id"} if "lease_id" in data else set()),
+            "assignment",
+        )
         raw_reservations = data["reservations"]
         if isinstance(raw_reservations, (str, bytes)) or not isinstance(
             raw_reservations, Sequence
         ):
             raise ModelError("reservations must be a JSON array")
+        lease_id = data.get("lease_id")
+        if "lease_id" in data and lease_id is None:
+            raise ModelError("assignment lease_id must be a non-empty string")
         return cls(
             job_id=data["job_id"],  # type: ignore[arg-type]
             request=ResourceRequest.from_dict(data["request"]),
             reservations=tuple(
                 NodeReservation.from_dict(item) for item in raw_reservations
             ),
+            lease_id=lease_id,  # type: ignore[arg-type]
         )
 
 

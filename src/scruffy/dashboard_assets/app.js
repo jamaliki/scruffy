@@ -57,6 +57,14 @@ function renderMetrics(snapshot, stale) {
     metric("Memory allocation", `${stale ? "?" : formatNumber(usedMemory)} / ${formatNumber(totals.memory)}`, stale ? "availability unknown" : `${formatNumber(totals.freeMemory)} GB available`),
     metric("Waiting", String(Number(counts.submitted || 0) + Number(counts.queued || 0)), `${counts.blocked || 0} dependency-blocked`),
   ]);
+  const leaseTotals = snapshot.leases?.totals;
+  if (leaseTotals && (leaseTotals.live || snapshot.allocation?.mode === "hub")) {
+    byId("metrics").append(metric(
+      "Lease GPUs",
+      `${stale ? "?" : leaseTotals.gpus_used} / ${leaseTotals.gpus_total}`,
+      `${leaseTotals.running} running · ${leaseTotals.pending} pending · ${leaseTotals.releasing} releasing`,
+    ));
+  }
 }
 
 function progressBar(label, used, total) {
@@ -120,14 +128,51 @@ function renderNode(name, nodeState, jobs, stale) {
   return card;
 }
 
+function leaseTitle(lease) {
+  const origin = lease.kind === "elastic" ? `pool ${lease.pool || "?"}` : "attached";
+  return `Lease ${lease.slurm_job_id || lease.lease_id} · ${origin}`;
+}
+
+function renderLease(lease, jobs, stale) {
+  const card = element("article", `node-card lease-card lease-${lease.state}`);
+  const header = element("header", "node-header");
+  header.append(element("h3", "node-name", leaseTitle(lease)));
+  let detail = lease.state.toUpperCase();
+  if (lease.state === "running" && lease.end_at) detail += ` · ${formatDuration(new Date().toISOString(), lease.end_at)} left`;
+  if (lease.pending_reason) detail += ` · ${lease.pending_reason}`;
+  if (lease.draining) detail += " · draining";
+  header.append(element("span", "node-free", detail));
+  card.append(header);
+  if (lease.nodes?.length) card.append(element("p", "lease-nodes mono", lease.nodes.join(", ")));
+  if (lease.gpus) card.append(progressBar("GPUs in use", stale ? 0 : lease.used_gpus, lease.gpus));
+  const chips = element("div", "lease-jobs");
+  for (const job of jobs.values()) {
+    if (job.lease_id !== lease.lease_id || !LIVE_JOB_STATES.has(job.state)) continue;
+    const chip = element("button", "lease-job", job.name || job.id);
+    chip.type = "button";
+    chip.dataset.jobId = job.id;
+    chip.style.setProperty("--project-color", projectColor(job.project_id || "default"));
+    chip.title = `${job.id} · ${job.project_id || "default"}`;
+    chips.append(chip);
+  }
+  if (chips.childElementCount) card.append(chips);
+  return card;
+}
+
 function renderNodes(snapshot) {
   const jobs = uniqueJobs(snapshot);
   const entries = Object.entries(snapshot.nodes || {}).sort(([left], [right]) => left.localeCompare(right, undefined, {numeric: true}));
   const stale = telemetryIsStale(snapshot);
-  replace(byId("nodes"), entries.length ? entries.map(([name, state]) => renderNode(name, state, jobs, stale)) : [empty("No managed nodes are visible.")]);
+  const leases = snapshot.leases?.live || [];
+  const cards = [
+    ...entries.map(([name, state]) => renderNode(name, state, jobs, stale)),
+    ...leases.map((lease) => renderLease(lease, jobs, stale)),
+  ];
+  replace(byId("nodes"), cards.length ? cards : [empty(snapshot.allocation?.mode === "hub" ? "No leases yet: attach an allocation or configure pools." : "No managed nodes are visible.")]);
   const totals = resourceTotals(snapshot.nodes);
   const withheld = entries.reduce((total, [, node]) => total + (node.unavailable_gpu_ids || []).length, 0);
-  byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available / ${withheld} health-withheld`;
+  const leaseNote = leases.length ? ` / ${leases.length} leases` : "";
+  byId("resource-note").textContent = stale ? `${entries.length} nodes / ${totals.gpus} GPUs${leaseNote} / availability unknown` : `${entries.length} nodes / ${totals.gpus} GPUs / ${totals.freeGpus} available / ${withheld} health-withheld${leaseNote}`;
 }
 
 function legendItem(label, color = null, project = null) {

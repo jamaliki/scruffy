@@ -488,6 +488,32 @@ def reprobe_quarantine(
     }
 
 
+def quarantined_nodes(health: Mapping[str, object]) -> frozenset[str]:
+    """Return nodes with any quarantined GPU that the policy enforces.
+
+    Satellite leases have no health monitor, but they may share hosts with the
+    primary allocation. A node with a quarantined device is withheld whole
+    from new GPU work on a lease, because count-based Slurm binding there
+    cannot avoid one specific device.
+    """
+
+    enforce_automatic = health.get("mode") == "enforce"
+    health_nodes = health.get("nodes")
+    known_nodes = health_nodes if isinstance(health_nodes, Mapping) else {}
+    result = set()
+    for name, node_state in known_nodes.items():
+        raw_devices = node_state.get("devices") if isinstance(node_state, Mapping) else None
+        devices = raw_devices.values() if isinstance(raw_devices, Mapping) else ()
+        if any(
+            isinstance(device, Mapping)
+            and device.get("status") == "quarantined"
+            and (enforce_automatic or device.get("quarantine_source") == "operator")
+            for device in devices
+        ):
+            result.add(str(name))
+    return frozenset(result)
+
+
 def unavailable_gpu_ids(
     health: Mapping[str, object],
     inventory: Sequence[NodeInventory],

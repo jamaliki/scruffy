@@ -44,6 +44,9 @@ falls back to `state.json`, preserving compatibility with older queue roots.
 | Quarantine a GPU | `scruffy gpu-quarantine NODE UUID` | `quarantine_gpu(...)` |
 | Clear GPU quarantine | `scruffy gpu-clear NODE UUID` | `clear_gpu_quarantine(...)` |
 | Re-probe automatic GPU quarantine | `scruffy gpu-reprobe NODE UUID` | `reprobe_gpu(...)` |
+| Leases, pools, and lease capacity | `scruffy leases` | `leases(root)`; MCP `resources()` |
+| Attach another allocation | `scruffy lease attach SLURM_JOB_ID` | `attach_lease(root, ...)` |
+| Release a lease | `scruffy lease release LEASE_ID` | `release_lease(root, ...)` |
 
 All operations use `--root ROOT` or `SCRUFFY_ROOT`. Every participant must see
 that directory at the same absolute path. CLI commands emit JSON except `logs`
@@ -71,7 +74,7 @@ allocation-wide when no project is selected.
 | `succeeded` | Process exited successfully | no | yes |
 | `failed` | Process or launch failed | no | yes |
 | `cancelled` | Cancellation completed | no | yes |
-| `lost` | Allocation or controller ended with unresolved work | no | yes |
+| `lost` | Allocation, lease, or controller ended with unresolved work | no | yes |
 | `rejected` | Request or workflow could not be admitted | no | yes |
 | `skipped` | A `succeeded` dependency ended unsuccessfully, or an awaited artifact can no longer be published | no | yes |
 
@@ -93,6 +96,8 @@ Important hot-job fields are:
 - `id`, `name`, `state`, and `submitted_at`.
 - `project_id`, with legacy records normalized to `default`.
 - `request`; live `assignment`; and historical `last_assignment` after release.
+- Optional `lease_id` when the job runs on a lease rather than the primary
+  allocation; the assignment carries the same `lease_id`.
 - `started_at`, `finished_at`, `exit_code`, `signal`, `reason`, and `error`.
 - Optional `workflow_id`, `task_id`, `attempt`, `needs`, `blockers`, and concrete
   `resolved_dependencies`.
@@ -283,7 +288,7 @@ Workflow tasks may opt into the strict recovery object below; its
 ```json
 {
   "max_attempts": 4,
-  "retry_on": ["allocation_replaced", "allocation_incarnation_changed", "evacuated"],
+  "retry_on": ["allocation_replaced", "allocation_incarnation_changed", "lease_ended", "evacuated"],
   "evacuation": {"signal": "USR1", "grace_seconds": 600}
 }
 ```
@@ -291,8 +296,9 @@ Workflow tasks may opt into the strict recovery object below; its
 The object has no extension fields. `signal` is currently restricted to
 `USR1`; `evacuated` is persisted for the next evacuation phase but is not
 automatically retried in this release. Wave 1 automatically creates one
-replay-safe successor only for `allocation_replaced` and
-`allocation_incarnation_changed`, preserving argv, cwd, environment, resource,
+replay-safe successor only for `allocation_replaced`,
+`allocation_incarnation_changed`, and `lease_ended` (the attempt's lease
+allocation ended under it), preserving argv, cwd, environment, resource,
 dependency, artifact, and recovery declarations. Only the attempt's own
 terminal reason counts and becomes the successor's `retry_reason`: an attempt
 that ended for any other reason, such as `application_exit`, is never retried
@@ -373,6 +379,14 @@ must ignore unknown fields and event kinds so compatible additions do not break
 v1 readers. A contained per-item storage failure is published as a `notice`
 whose `data.kind` is `storage.item_skipped`; the controller continues serving
 unrelated work.
+
+`lease.*` events (`requested`, `submitted`, `pending`, `running`, `updated`,
+`attached`, `releasing`, `ended`) carry the complete lease image in
+`data.lease`; `lease.pool_backoff` carries `data.pool` and `data.pool_status`.
+Lease commands report through `lease.attached`, `lease.attach_ignored`,
+`lease.releasing`, `lease.release_ignored`, or `command.rejected`, matched by
+`data.request_id`; their receipts carry an `outcome` with `state` and
+`lease_id`.
 
 `resource.gpu_health_changed` contains `data.transitions` plus the complete
 bounded `data.gpu_health` projection needed for replay. Scruffy journals health

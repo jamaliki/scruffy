@@ -3,7 +3,9 @@
 Scruffy is a small, cooperative GPU queue that runs inside one multi-node Slurm
 allocation. One controller divides the allocation while any number of humans or
 agents submit work asynchronously and observe the same non-consuming event
-journal.
+journal. The same controller can also place work on other allocations you hold
+and on elastic leases from the main cluster (see
+[Leases](#leases-more-than-one-allocation)), or run as an allocation-less hub.
 
 It is named after the quiet caretaker from *Futurama*. This project is not
 affiliated with the show or its owners.
@@ -815,6 +817,60 @@ keep artifact bytes in their normal storage.
 The shared queue stores argv, working directories, environment overrides, state,
 events, and logs in plaintext. Protect its permissions and pass paths to secret
 files rather than secret values.
+
+## Leases: more than one allocation
+
+One controller can place work on more capacity than its own allocation. Every
+other Slurm allocation it uses is a *lease*, and the CLI, MCP tools, summaries,
+and dashboard show leases alongside the primary allocation.
+
+- **Attach** an allocation you already hold (for example an idle interactive
+  job). Scruffy places queued work on it with `srun --jobid`, never cancels it,
+  and `lease release` only stops placement:
+
+  ```bash
+  scruffy lease attach 4242 --wait            # optional --gpus-per-node, --project
+  scruffy leases
+  scruffy lease release 4242 --wait           # lease ID or Slurm job ID
+  ```
+
+- **Elastic leases** come from the main cluster when it has room. Describe the
+  shapes Scruffy may request in a pools file (see
+  [`examples/pools.json`](examples/pools.json)) and start the controller with
+  `--pools`. Queued work that fits nowhere is packed into `sbatch` lease
+  requests, within each pool's `max_leases`, `max_pending_leases`, and
+  `max_gpus` and the file's `max_total_gpus`. That last limit counts every GPU
+  you hold or have pending in Slurm. A pending lease blocked by your own QOS or
+  association limit (`QOSMax…`, `AssocGrp…`) is withdrawn, and its pool backs
+  off for `backoff_seconds`. With `start_within_seconds`, Scruffy also asks
+  `sbatch --test-only` for an estimated start and skips requests that would
+  wait too long. Leases idle for `idle_release_seconds` are cancelled.
+- **Hub mode** runs a controller that owns no allocation at all, for example on
+  a login or service node, and uses only leases:
+
+  ```bash
+  scruffy --root "$SCRUFFY_ROOT" serve --hub --pools pools.json
+  ```
+
+Time limits decide where work may run. A job with `--time-limit-seconds` fits
+a lease only if it can finish, plus the pool's `time_margin_seconds`, before
+the lease ends. An untimed job may run on the primary allocation or on an
+attached lease with more than `--drain-before-end-seconds` left, but never on
+an elastic lease. Give burstable work a time limit. A multi-node job must fit
+within one allocation.
+
+When a lease ends under running work, a step that Slurm accounting reports
+`COMPLETED` keeps its exit code, and every other job becomes `lost` with reason
+`lease_ended`. Add `lease_ended` to a task's `recovery.retry_on` to get an
+automatic successor. Elastic leases are `--no-requeue` and run
+`python -m scruffy.lease_agent` as their placeholder batch step. The agent ends
+the allocation only once the controller's heartbeat has been stale for
+`heartbeat_timeout_seconds` and no worker step is live, so a crashed hub does
+not strand GPUs.
+
+Current limits: leases have no GPU health monitor of their own. A primary
+deadline drain also pauses lease placement. Like any restart, a hub restart
+pauses launches until `scruffy resume`.
 
 ## Development
 

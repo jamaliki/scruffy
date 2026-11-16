@@ -41,7 +41,7 @@ from .storage import (
     utc_now,
 )
 from .submissions import submission_summary, workflow_submission
-from .summary import build_summary, explain_job, state_cursor
+from .summary import build_summary, explain_job, lease_summary, state_cursor
 from .workflows import (
     select_task_attempts,
     validate_recovery_policy,
@@ -409,6 +409,100 @@ def resume_queue(root: Path) -> dict[str, Any]:
 
     request_id = submit_command(root, {"kind": "resume", "submitted_at": utc_now()})
     return {"request_id": request_id, "state": "resume_requested"}
+
+
+def _lease_request_id(request_id: str | None) -> str | None:
+    if request_id is None:
+        return None
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or "/" in request_id
+        or len(request_id) > 200
+    ):
+        raise ValueError("request_id must be a non-empty path-safe string")
+    return request_id
+
+
+def attach_lease(
+    root: Path,
+    slurm_job_id: str,
+    *,
+    gpus_per_node: int | None = None,
+    cpus_per_node: int | None = None,
+    memory_gb_per_node: int | None = None,
+    projects: Sequence[str] | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    """Ask the controller to place work on another allocation the user holds.
+
+    Scruffy never cancels an attached allocation; releasing it only stops
+    placement. Optional caps limit what Scruffy manages on each node, and
+    ``projects`` restricts which projects may use it.
+    """
+
+    slurm_job_id = str(slurm_job_id).strip()
+    if not slurm_job_id.isascii() or not slurm_job_id.isdecimal():
+        raise ValueError("slurm_job_id must be a numeric Slurm job ID")
+    command: dict[str, Any] = {"kind": "lease.attach", "slurm_job_id": slurm_job_id}
+    for key, value in (
+        ("gpus_per_node", gpus_per_node),
+        ("cpus_per_node", cpus_per_node),
+        ("memory_gb_per_node", memory_gb_per_node),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+        command[key] = value
+    if projects:
+        command["projects"] = sorted({normalize_project_id(item) for item in projects})
+    stable = _lease_request_id(request_id)
+    if stable is None:
+        command["submitted_at"] = utc_now()
+    else:
+        # Identical retries with one request ID must produce identical commands.
+        command["request_id"] = stable
+    request_id = submit_command(root, command)
+    return {
+        "request_id": request_id,
+        "state": "lease_attach_requested",
+        "slurm_job_id": slurm_job_id,
+    }
+
+
+def release_lease(
+    root: Path, lease_id: str, *, request_id: str | None = None
+) -> dict[str, Any]:
+    """Stop placing work on a lease and give it back once its jobs finish.
+
+    ``lease_id`` may also be the lease's Slurm job ID.
+    """
+
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        raise ValueError("lease_id must be a non-empty string")
+    command: dict[str, Any] = {"kind": "lease.release", "lease_id": lease_id.strip()}
+    stable = _lease_request_id(request_id)
+    if stable is None:
+        command["submitted_at"] = utc_now()
+    else:
+        command["request_id"] = stable
+    request_id = submit_command(root, command)
+    return {"request_id": request_id, "state": "lease_release_requested", "lease_id": lease_id}
+
+
+def leases(root: Path) -> dict[str, Any]:
+    """Return live leases, recent endings, pool backoff, and lease capacity."""
+
+    state = status(root)
+    allocation = state.get("allocation") if isinstance(state.get("allocation"), dict) else {}
+    return {
+        "v": 1,
+        "queue_id": state.get("queue_id"),
+        "as_of_cursor": state_cursor(state),
+        "mode": (allocation or {}).get("mode", "allocation"),
+        **lease_summary(state),
+    }
 
 
 def request_evacuation(
