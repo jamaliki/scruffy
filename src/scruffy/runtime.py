@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
+from .leases import LeaseSettings
 from .models import NodeInventory
 from .slurm import AllocationIncarnation, SlurmStep
 
@@ -87,6 +88,22 @@ class RunningProcess:
 
 
 @dataclass(slots=True)
+class LeaseSteps:
+    """Fail-closed live-step snapshot for one lease allocation.
+
+    ``ended`` is set only after the lease itself is confirmed gone. Its steps
+    are then provably absent, so each refresh is a fresh empty snapshot.
+    """
+
+    slurm_job_id: str
+    steps: tuple[SlurmStep, ...] = ()
+    snapshot_at: float = 0.0
+    last_query: float = 0.0
+    query_error: str | None = None
+    ended: bool = False
+
+
+@dataclass(slots=True)
 class Controller:
     root: Path
     inventory: tuple[NodeInventory, ...]
@@ -135,6 +152,27 @@ class Controller:
     commit_depth: int = 0
     commit_pending: bool = False
     after_commit: list[Callable[[], None]] = field(default_factory=list)
+    # Satellite allocations. ``lease_settings`` is None without a pools file;
+    # attached leases still work then.
+    lease_settings: LeaseSettings | None = None
+    lease_steps: dict[str, LeaseSteps] = field(default_factory=dict)
+    last_lease_observation: float = 0.0
+    lease_observation_error: str | None = None
+    lease_absences: dict[str, int] = field(default_factory=dict)
+    lease_idle_since: dict[str, float] = field(default_factory=dict)
+    # Set when a job ends for a reason that admits an automatic retry, so the
+    # controller admits the successor in the same tick.
+    auto_recovery_pending: bool = False
+    last_lease_heartbeat: float = 0.0
+    last_lease_plan: float = 0.0
+    user_gpus_in_use: int | None = None
+    lease_observed_at: float = 0.0
+
+    @property
+    def hub(self) -> bool:
+        """A Slurm controller with no primary allocation of its own."""
+
+        return self.launcher == "slurm" and not self.slurm_job_id
 
 
 def copy_stream(

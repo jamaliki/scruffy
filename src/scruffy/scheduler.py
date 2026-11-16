@@ -75,6 +75,9 @@ def queue_priority_key(
 def _inventory_by_name(
     inventory: Sequence[NodeInventory],
 ) -> dict[str, NodeInventory]:
+    if not inventory:
+        # A hub has no primary allocation; any assignment on it is unknown.
+        return {}
     try:
         validated = validate_inventory(inventory)
     except ValueError as exc:

@@ -53,7 +53,7 @@ job-log directory and therefore survives hot-state and log compaction.
 
 ### Resource ownership
 
-`assignment` means one thing only: a live lease that still consumes resources.
+`assignment` means one thing only: a live reservation that still consumes resources.
 It is cleared only after process and launcher reconciliation prove release safe.
 `last_assignment` is historical placement and never participates in scheduling.
 
@@ -109,8 +109,8 @@ GPU use an explicit GRES mask and verify the physical mapping before exec, so a
 Slurm substitution cannot silently use the stopped GPU. A multi-node exact step
 uses one common slot set on every node; when that contract cannot be
 represented, Scruffy does not construct the unsafe placement. `node` isolation
-remains available as an explicit conservative fallback. Existing leases remain
-owned and are not terminated implicitly.
+remains available as an explicit conservative fallback. Existing reservations
+remain owned and are not terminated implicitly.
 
 ### Workflow attempts
 
@@ -185,6 +185,69 @@ Cursors remain bounded recovery cursors rather than an infinite event database.
 A reset includes a reason and an authoritative overview. Agents rebuild their
 view instead of asking the controller to retain unbounded history.
 
+### Leases: capacity beyond one allocation
+
+A controller may place work on more than its own (primary) allocation. Every
+other Slurm allocation it uses is a *lease*, and each worker step runs inside
+exactly one allocation, with `srun --jobid` naming the primary or a lease.
+
+- An **attached** lease is an allocation the user already holds. Scruffy
+  discovers its inventory and incarnation exactly as it does for the primary,
+  never cancels it, and releasing it only stops placement.
+- An **elastic** lease is requested from a configured pool with `sbatch`. Its
+  batch payload is `scruffy.lease_agent`, a placeholder that keeps the
+  allocation while workers run as steps. The Slurm job name is the lease ID.
+  Elastic leases never requeue, because a requeued allocation loses its steps.
+- A **hub** is a controller with no primary allocation (`serve --hub`). It owns
+  no inventory, runs no health monitor, and places all work on leases.
+
+Lease records are hot state (`state.leases`). Every transition is journaled
+with the complete lease image before the controller acts on Slurm, so replay
+needs no Slurm query. That includes a `requested` image before `sbatch` and a
+`releasing` image before `scancel`. A crash after `sbatch` is resolved by
+finding the job by its name; a crash before `scancel` repeats the cancel.
+States run `requested → pending → running → releasing → ended`. Only `running`
+leases accept placements, and only after two consecutive `squeue` absences (or
+a terminal Slurm state) does a lease end.
+
+Ending a lease resolves the jobs still bound to it. A step that Slurm
+accounting reports `COMPLETED` keeps its exit code. Anything else becomes
+`lost` with reason `lease_ended`, which workflow recovery policies may retry.
+A requeue or restart-count change of a running lease also ends it. Lease jobs
+are unaffected by a change of the primary allocation and are recovered against
+their own lease incarnation at controller restart.
+
+Placement keeps the single-writer scheduler: it tries the primary first and
+then running leases, soonest-ending first, choosing the highest-priority job
+that fits each. A timed job fits a lease only if its time limit plus the
+pool's margin (120 seconds for attached leases) ends before the lease does. An
+untimed job may use an attached lease with no known end, or with more than
+`--drain-before-end-seconds` left, but never an elastic lease. A multi-node job
+must fit within one allocation. A node with an enforced GPU quarantine from
+the primary's health state is withheld from GPU work on leases as well.
+
+The elastic autoscaler is a pure function of queued demand, lease records,
+pool backoff, and the user's Slurm GPU footprint. Each pass it:
+
+1. withdraws pending leases blocked by the user's own QOS or association
+   limits, or whose estimated start exceeds the pool's `start_within_seconds`,
+   and backs that pool off;
+2. releases running elastic leases that have been idle for
+   `idle_release_seconds` or are about to expire;
+3. packs queued work, in priority order, into pending leases first and then
+   into new ones, within `max_leases`, `max_pending_leases`, `max_gpus`, and
+   `max_total_gpus`;
+4. withdraws settled pending leases that no queued job needs any more.
+
+Idle timing is kept in controller memory, so a restarted controller never
+releases a lease immediately. Growth stops while launches are paused or
+draining, and while `squeue` observation is failing.
+
+The lease agent is a dead-man's switch. It exits, ending the allocation, only
+when the controller's lease heartbeat (`leases/heartbeat.json`) has been stale
+for longer than `heartbeat_timeout_seconds` *and* no numbered worker step is
+live. Any uncertainty keeps the allocation.
+
 ## Deliberate non-goals
 
 - Artifact bytes remain in normal project storage. Scruffy may later retain a
@@ -197,6 +260,6 @@ view instead of asking the controller to retain unbounded history.
   blockers and resource eligibility instead of an unreliable ETA.
 
 These boundaries keep the single-writer loop boring: validate and commit a
-submission, own live leases, record execution transitions, and publish bounded
+submission, own live reservations, record execution transitions, and publish bounded
 views. Rich experiment behavior can be built above those facts without making
 resource recovery depend on a workflow framework.

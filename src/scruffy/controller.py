@@ -29,6 +29,21 @@ from .health import (
     set_quarantine,
 )
 from .health_worker import health_worker_release_sha256 as _health_worker_release_sha256
+from .lease_runtime import (
+    advance_releases,
+    attach_lease,
+    lease_command_outcome,
+    observe_leases,
+    plan_and_apply_leases,
+    release_lease,
+    write_lease_heartbeat,
+)
+from .leases import (
+    LeaseSettings,
+    is_live,
+    lease_inventory,
+    pool_accepts,
+)
 from .lifecycle import (
     begin_shutdown,
     drain_messages,
@@ -78,6 +93,7 @@ from .state import (
     emit_submission,
     ensure_committed,
     group_commit,
+    job_lease_id,
     load_recovered_state,
     log_directories_to_keep,
 )
@@ -129,6 +145,7 @@ from .workflows import (
     AUTO_RECOVERY_REASONS,
     WorkflowError,
     artifact_conditions,
+    mark_retry_exhaustion,
     resolve_blocked_jobs,
     resolve_dependencies,
     select_task_attempts,
@@ -168,6 +185,10 @@ COMMAND_OUTCOME_KINDS = {
     "evacuation.partial",
     "evacuation.cancelled",
     "evacuation.cancel_replayed",
+    "lease.attached",
+    "lease.attach_ignored",
+    "lease.releasing",
+    "lease.release_ignored",
 }
 
 EVACUATION_TERMINAL_OUTCOMES = frozenset(
@@ -193,6 +214,7 @@ def _initialize_controller(
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
     legacy_report_projects: tuple[str, ...] = (),
+    lease_settings: LeaseSettings | None = None,
 ) -> Controller:
     controller_release = _normalize_controller_release(controller_release)
     legacy_report_projects = tuple(normalize_project_id(p) for p in legacy_report_projects)
@@ -206,12 +228,24 @@ def _initialize_controller(
         health,
         (allocation_incarnation.fingerprint_sha256 if allocation_incarnation is not None else None),
     )
-    active = [job for job in state.get("jobs", {}).values() if job["state"] in ACTIVE_JOB_STATES]
+    all_active = [
+        job for job in state.get("jobs", {}).values() if job["state"] in ACTIVE_JOB_STATES
+    ]
+    # Satellite (lease) jobs survive any change of the primary allocation;
+    # they are recovered against their own lease below.
+    active = [job for job in all_active if job_lease_id(job) is None]
+    lease_active = [job for job in all_active if job_lease_id(job) is not None]
     previous = state.get("allocation") or {}
-    if launcher == "slurm" and (
+    hub = launcher == "slurm" and not slurm_job_id
+    if hub:
+        if inventory or allocation_incarnation is not None:
+            raise ValueError("a hub controller has no primary allocation inventory")
+    elif launcher == "slurm" and (
         allocation_incarnation is None or allocation_incarnation.slurm_job_id != slurm_job_id
     ):
         raise ValueError("Slurm allocation incarnation is missing or differs")
+    if lease_active and launcher != "slurm":
+        raise UnsafeRecovery("lease jobs require the Slurm launcher; refusing unsafe recovery")
     previous_incarnation = None
     raw_previous_incarnation = previous.get("incarnation")
     if raw_previous_incarnation is not None:
@@ -228,6 +262,7 @@ def _initialize_controller(
     )
     legacy_slurm_allocation = (
         launcher == "slurm"
+        and not hub
         and raw_previous_incarnation is None
         and (
             previous.get("id") == allocation_id
@@ -254,13 +289,18 @@ def _initialize_controller(
             ) from exc
         if active and any(not job.get("launch_token") for job in active):
             raise UnsafeRecovery("active Slurm job has no launch token; refusing unsafe recovery")
-        incarnation_sha256 = allocation_incarnation.fingerprint_sha256
+        incarnation_sha256 = (
+            allocation_incarnation.fingerprint_sha256
+            if allocation_incarnation is not None
+            else None
+        )
         if active and any(
             job.get("allocation_incarnation_sha256") != incarnation_sha256 for job in active
         ):
             raise UnsafeRecovery(
                 "active Slurm job allocation incarnation differs; refusing unsafe recovery"
             )
+    live_lease_jobs, ended_lease_jobs = _partition_lease_jobs(state, lease_active)
 
     journal = open_journal(root, int(state.get("journal_generation", 0)))
     messages: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
@@ -283,6 +323,7 @@ def _initialize_controller(
         gpu_isolation=gpu_isolation,
         legacy_report_projects=legacy_report_projects,
         gpu_health_interval=gpu_health_interval,
+        lease_settings=lease_settings,
         health_worker_release_sha256=worker_release,
         health_step_name=(
             f"scruffy-health-{allocation_incarnation.fingerprint_sha256[:12]}-{worker_release[:12]}"
@@ -315,6 +356,10 @@ def _initialize_controller(
                 evacuation["state"] = "partial"
                 _evacuation_emit(controller, evacuation, request, "evacuation.partial")
 
+        _reattach_slurm_jobs(controller, live_lease_jobs)
+        if ended_lease_jobs:
+            _lose_jobs(controller, ended_lease_jobs, "lease_ended")
+            _recover_lost_workflow_jobs(controller)
         lost_reason = None
         if same_slurm_allocation:
             _reattach_slurm_jobs(controller, active)
@@ -325,59 +370,11 @@ def _initialize_controller(
                 active_lost_reason = "allocation_incarnation_changed"
             else:
                 active_lost_reason = "allocation_replaced"
-            lost_active: list[dict[str, Any]] = []
-            recovered_terminal: list[dict[str, Any]] = []
             # A replaced or restarted Slurm incarnation cannot retain its old
             # steps. Legacy active records are not upgraded to a new incarnation;
             # launches remain paused below until an operator audits the old work.
-            for job in active:
-                prior = read_result_record(root, str(job["id"]))
-                # A persisted loss result is the first half of the loss
-                # transaction, not a completed workflow outcome.  Replay must
-                # retain its immutable timestamp/assignment while still emitting
-                # job.lost and admitting the deterministic successor.
-                if (
-                    prior is not None
-                    and prior.get("state") in TERMINAL_JOB_STATES
-                    and prior.get("state") != "lost"
-                    and type(job.get("attempt")) is int
-                ):
-                    job.update(
-                        {
-                            "state": prior["state"],
-                            "finished_at": prior.get("finished_at"),
-                            "exit_code": prior.get("exit_code"),
-                            "signal": prior.get("signal"),
-                            "reason": prior.get("reason"),
-                            "error": prior.get("error"),
-                            "last_assignment": prior.get("assignment"),
-                            "assignment": None,
-                        }
-                    )
-                    recovered_terminal.append(job)
-                    continue
-                lost_active.append(job)
-                job["state"] = "lost"
-                job["finished_at"] = (
-                    (prior.get("finished_at") if prior is not None else None)
-                    or job.get("finished_at")
-                    or job.get("started_at")
-                    or job.get("submitted_at")
-                    or utc_now()
-                )
-                job["reason"] = active_lost_reason
-                _mark_retry_exhaustion(job, active_lost_reason)
-                job["last_assignment"] = (
-                    prior.get("assignment") if prior is not None else job.get("assignment")
-                )
-                job["assignment"] = None
-                write_result_record(root, job)
-            if lost_active:
+            if _lose_jobs(controller, active, active_lost_reason):
                 lost_reason = active_lost_reason
-            for job in lost_active:
-                emit(controller, "job.lost", job=job, snapshot=False)
-            for job in recovered_terminal:
-                emit(controller, f"job.{job['state']}", job=job, snapshot=False)
             if launcher == "slurm" and active_lost_reason in AUTO_RECOVERY_REASONS:
                 _recover_lost_workflow_jobs(controller)
 
@@ -403,6 +400,14 @@ def _initialize_controller(
         )
         if slurm_job_id:
             metadata["slurm_job_id"] = slurm_job_id
+        if hub:
+            # The hub's own job deadline (if any) is not a capacity deadline.
+            for key in ("deadline", "deadline_at"):
+                metadata.pop(key, None)
+            # A hub may run inside a small Slurm job of its own; that job is
+            # not capacity, only the controller's lifetime.
+            metadata["mode"] = "hub"
+            metadata["controller_slurm_job_id"] = metadata.pop("slurm_job_id", None)
         if same_slurm_allocation and isinstance(previous.get("handover"), dict):
             metadata["handover"] = previous["handover"]
         deadline_at = metadata.get("deadline_at")
@@ -443,7 +448,9 @@ def _initialize_controller(
             job["id"]
             for job in state["jobs"].values()
             if job["state"] in {"queued", "blocked"}
-            and not request_can_ever_fit(inventory, ResourceRequest.from_dict(job["request"]))
+            and not _capacity_can_ever_fit(
+                controller, ResourceRequest.from_dict(job["request"]), job_project(job)
+            )
         ]
         if replacement:
             metadata["handover"] = {
@@ -466,7 +473,10 @@ def _initialize_controller(
                     allocation_incarnation.to_dict() if allocation_incarnation is not None else None
                 ),
                 "controller_release": controller_release,
-                "reattached_jobs": ([job["id"] for job in active] if same_slurm_allocation else []),
+                "reattached_jobs": (
+                    [job["id"] for job in active] if same_slurm_allocation else []
+                )
+                + [job["id"] for job in live_lease_jobs],
                 "lost_jobs": ([job["id"] for job in active] if lost_reason is not None else []),
                 "lost_reason": lost_reason,
                 "removed_stale_temporaries": removed_temporaries,
@@ -502,6 +512,134 @@ def _normalize_controller_release(value: str | None) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("controller release must be a non-empty string")
     return value.strip()
+
+
+def _lose_jobs(
+    controller: Controller, jobs: list[dict[str, Any]], reason: str
+) -> list[dict[str, Any]]:
+    """Resolve active jobs whose allocation is gone; return the lost ones.
+
+    A persisted loss result is the first half of the loss transaction, not a
+    completed workflow outcome. Replay must retain its immutable
+    timestamp/assignment while still emitting job.lost and admitting the
+    deterministic successor. Any other persisted terminal result wins.
+    """
+
+    lost: list[dict[str, Any]] = []
+    recovered_terminal: list[dict[str, Any]] = []
+    for job in jobs:
+        prior = read_result_record(controller.root, str(job["id"]))
+        if (
+            prior is not None
+            and prior.get("state") in TERMINAL_JOB_STATES
+            and prior.get("state") != "lost"
+            and type(job.get("attempt")) is int
+        ):
+            job.update(
+                {
+                    "state": prior["state"],
+                    "finished_at": prior.get("finished_at"),
+                    "exit_code": prior.get("exit_code"),
+                    "signal": prior.get("signal"),
+                    "reason": prior.get("reason"),
+                    "error": prior.get("error"),
+                    "last_assignment": prior.get("assignment"),
+                    "assignment": None,
+                }
+            )
+            recovered_terminal.append(job)
+            continue
+        lost.append(job)
+        job["state"] = "lost"
+        job["finished_at"] = (
+            (prior.get("finished_at") if prior is not None else None)
+            or job.get("finished_at")
+            or job.get("started_at")
+            or job.get("submitted_at")
+            or utc_now()
+        )
+        job["reason"] = reason
+        _mark_retry_exhaustion(job, reason)
+        job["last_assignment"] = (
+            prior.get("assignment") if prior is not None else job.get("assignment")
+        )
+        job["assignment"] = None
+        write_result_record(controller.root, job)
+    for job in lost:
+        emit(controller, "job.lost", job=job, snapshot=False)
+    for job in recovered_terminal:
+        emit(controller, f"job.{job['state']}", job=job, snapshot=False)
+    return lost
+
+
+def _partition_lease_jobs(
+    state: dict[str, Any], jobs: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split active lease jobs into reattachable and provably ended ones.
+
+    A lease record reaches ``ended`` only after Slurm confirmed its allocation
+    gone, so none of its steps can still run. Jobs on a live lease are
+    reattached exactly like primary jobs; inconsistent records refuse recovery.
+    """
+
+    leases = state.get("leases", {})
+    live: list[dict[str, Any]] = []
+    ended: list[dict[str, Any]] = []
+    by_lease: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        lease_id = job_lease_id(job)
+        lease = leases.get(lease_id) if lease_id is not None else None
+        if not isinstance(lease, dict) or lease.get("state") not in {"running", "releasing"}:
+            ended.append(job)
+            continue
+        if not job.get("launch_token"):
+            raise UnsafeRecovery("active lease job has no launch token; refusing unsafe recovery")
+        try:
+            incarnation = AllocationIncarnation.from_dict(lease.get("incarnation"))
+        except (TypeError, ValueError) as exc:
+            raise UnsafeRecovery(f"lease {lease_id} has an invalid incarnation: {exc}") from exc
+        if job.get("allocation_incarnation_sha256") != incarnation.fingerprint_sha256:
+            raise UnsafeRecovery(
+                "active lease job allocation incarnation differs; refusing unsafe recovery"
+            )
+        by_lease.setdefault(str(lease_id), []).append(job)
+        live.append(job)
+    for lease_id, lease_jobs in by_lease.items():
+        try:
+            assert_invariants(
+                lease_inventory(leases[lease_id]),
+                tuple(Assignment.from_dict(job["assignment"]) for job in lease_jobs),
+            )
+        except (KeyError, ValueError, InvariantError) as exc:
+            raise UnsafeRecovery(
+                f"invalid active assignments on lease {lease_id}; refusing recovery: {exc}"
+            ) from exc
+    return live, ended
+
+
+def _capacity_can_ever_fit(
+    controller: Controller, request: ResourceRequest, project_id: str
+) -> bool:
+    """Return whether any capacity this controller can use could run a job.
+
+    That is the primary allocation, a configured lease pool, or a live lease.
+    A hub accepts everything: its capacity is open-ended because allocations
+    can be attached later, so work waits rather than being rejected.
+    """
+
+    if controller.inventory and request_can_ever_fit(controller.inventory, request):
+        return True
+    settings = controller.lease_settings
+    if settings is not None and any(
+        pool_accepts(pool, request, project_id) for pool in settings.pools
+    ):
+        return True
+    for lease in controller.state.get("leases", {}).values():
+        if is_live(lease):
+            inventory = lease_inventory(lease)
+            if inventory and request_can_ever_fit(inventory, request):
+                return True
+    return controller.hub
 
 
 def _reattach_slurm_jobs(controller: Controller, jobs: list[dict[str, Any]]) -> None:
@@ -581,19 +719,7 @@ def _recovery_policy(job: dict[str, Any]) -> dict[str, Any] | None:
 def _mark_retry_exhaustion(job: dict[str, Any], reason: str) -> None:
     """Persist bounded retry exhaustion on the terminal predecessor."""
 
-    policy = _recovery_policy(job)
-    attempt = job.get("attempt") if type(job.get("attempt")) is int else 1
-    max_attempts = policy.get("max_attempts") if policy else None
-    retry_on = policy.get("retry_on") if policy else ()
-    if (
-        isinstance(max_attempts, int)
-        and attempt >= max_attempts
-        and isinstance(retry_on, list)
-        and reason in retry_on
-    ):
-        job["retry_exhausted"] = True
-        job["retry_exhausted_reason"] = reason
-        job["retry_exhausted_at"] = job.get("finished_at")
+    mark_retry_exhaustion(job, reason)
 
 
 def _recovery_successor_spec(
@@ -1011,7 +1137,13 @@ def _evacuation_targets(
         controller.state["jobs"].values(),
         key=lambda candidate: (int(candidate.get("queue_order", 0)), str(candidate["id"])),
     ):
-        if job.get("state") != "running" or not _evacuation_matches_scope(job, scope):
+        if (
+            job.get("state") != "running"
+            or job_lease_id(job) is not None
+            or not _evacuation_matches_scope(job, scope)
+        ):
+            # Evacuation belongs to the primary allocation's lifetime; a lease
+            # job's allocation is unaffected by it.
             continue
         policy = job.get("recovery") if isinstance(job.get("recovery"), dict) else None
         evacuation_policy = policy.get("evacuation") if policy else None
@@ -2018,11 +2150,11 @@ def _initial_job_event(
     if job.get("state") == "rejected":
         return "job.rejected"
     request = ResourceRequest.from_dict(job["request"])
-    if not request_can_ever_fit(controller.inventory, request):
+    if not _capacity_can_ever_fit(controller, request, job_project(job)):
         job["state"] = "rejected"
         job["finished_at"] = utc_now()
         job["reason"] = "request_cannot_fit"
-        job["error"] = "request cannot fit this allocation inventory"
+        job["error"] = "request cannot fit this allocation inventory or any lease pool"
         return "job.rejected"
     if job.get("workflow_id") is None:
         return "job.queued"
@@ -2200,7 +2332,9 @@ def _stage_atomic_submission(
     impossible = [
         str(job["task_id"])
         for job in staged
-        if not request_can_ever_fit(controller.inventory, ResourceRequest.from_dict(job["request"]))
+        if not _capacity_can_ever_fit(
+            controller, ResourceRequest.from_dict(job["request"]), project_id
+        )
     ]
     if impossible:
         raise ValueError(f"tasks cannot fit this allocation: {impossible!r}")
@@ -2707,6 +2841,10 @@ def _ingest_commands(
                 bulk_budget -= used
                 if finished:
                     handled.append((source, command, outcome))
+            elif command.get("kind") == "lease.attach":
+                handled.append((source, command, attach_lease(controller, command)))
+            elif command.get("kind") == "lease.release":
+                handled.append((source, command, release_lease(controller, command)))
             elif _apply_command(controller, command, stops):
                 handled.append((source, command, None))
         if stops:
@@ -3127,6 +3265,8 @@ def _discard_journaled_commands(controller: Controller) -> None:
                 }
             elif command.get("kind") == "cancel_jobs":
                 outcome = {"state": "rejected", "reason": data.get("reason")}
+            elif command.get("kind") in {"lease.attach", "lease.release"}:
+                outcome = lease_command_outcome(event.get("kind"), data)
             else:
                 outcome = None
             record_command_receipt(controller.root, command, outcome=outcome)
@@ -3738,6 +3878,11 @@ def _apply_tick(controller: Controller) -> None:
         _advance_evacuation(controller)
         drain_messages(controller)
         poll_processes(controller)
+        observe_leases(controller)
+        advance_releases(controller)
+        if controller.auto_recovery_pending:
+            controller.auto_recovery_pending = False
+            _recover_lost_workflow_jobs(controller)
         _maintain_health_monitor(controller)
         _ingest_gpu_health(controller)
         _ingest_reports(controller)
@@ -3776,7 +3921,12 @@ def _serve(controller: Controller) -> None:
                     break
             else:
                 schedule(controller)
+                # Lease decisions follow placement, so queued work that
+                # still fits nowhere is what drives new lease requests.
+                with group_commit(controller):
+                    plan_and_apply_leases(controller)
             _heartbeat(controller)
+            write_lease_heartbeat(controller)
             time.sleep(controller.poll_interval)
         drain_messages(controller)
         poll_processes(controller)
@@ -3846,13 +3996,28 @@ def run_controller(
     gpu_isolation: str = "gpu",
     gpu_health_interval: float = 10,
     legacy_report_projects: tuple[str, ...] = (),
+    lease_settings: LeaseSettings | None = None,
 ) -> None:
-    """Own a queue until interrupted, retrying transient storage failures."""
+    """Own a queue until interrupted, retrying transient storage failures.
+
+    A Slurm controller without ``slurm_job_id`` is a *hub*: it has no primary
+    allocation and places work only on leases.
+    """
 
     if launcher not in {"local", "slurm"}:
         raise ValueError(f"unknown launcher {launcher!r}")
     controller_release = _normalize_controller_release(controller_release)
-    inventory = validate_inventory(inventory)
+    hub = launcher == "slurm" and not slurm_job_id
+    if hub:
+        if inventory or allocation_incarnation is not None:
+            raise ValueError("a hub controller has no primary allocation inventory")
+        if not allocation_id:
+            raise ValueError("a hub controller needs a stable allocation ID")
+        gpu_health_mode = "off"
+    else:
+        inventory = validate_inventory(inventory)
+    if lease_settings is not None and launcher != "slurm":
+        raise ValueError("lease pools require the Slurm launcher")
     if gpu_health_mode not in HEALTH_MODES:
         raise ValueError(f"unknown GPU health mode {gpu_health_mode!r}")
     if gpu_isolation not in GPU_ISOLATION_MODES:
@@ -3867,9 +4032,9 @@ def run_controller(
         raise ValueError("GPU health interval must be positive")
     if launcher == "local" and len(inventory) != 1:
         raise ValueError("the local launcher requires a one-node inventory")
-    if launcher == "slurm" and (not slurm_job_id or allocation_id != slurm_job_id):
+    if launcher == "slurm" and not hub and allocation_id != slurm_job_id:
         raise ValueError("the Slurm allocation ID must equal its Slurm job ID")
-    if launcher == "slurm" and (
+    if launcher == "slurm" and not hub and (
         allocation_incarnation is None or allocation_incarnation.slurm_job_id != slurm_job_id
     ):
         raise ValueError("a matching Slurm allocation incarnation is required")
@@ -3904,6 +4069,7 @@ def run_controller(
                     gpu_isolation=gpu_isolation,
                     legacy_report_projects=legacy_report_projects,
                     gpu_health_interval=gpu_health_interval,
+                    lease_settings=lease_settings,
                 )
                 _serve(controller)
                 return

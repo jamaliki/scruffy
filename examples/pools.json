@@ -1,0 +1,24 @@
+{
+  "v": 1,
+  "max_total_gpus": 32,
+  "heartbeat_timeout_seconds": 600,
+  "observe_interval_seconds": 15,
+  "pools": [
+    {
+      "name": "gpu-4h",
+      "partition": "gpu",
+      "qos": "normal",
+      "nodes": 1,
+      "gpus_per_node": 8,
+      "cpus_per_node": 112,
+      "memory_gb_per_node": 900,
+      "time_limit_seconds": 14400,
+      "max_leases": 2,
+      "max_pending_leases": 1,
+      "idle_release_seconds": 300,
+      "start_within_seconds": 1800,
+      "time_margin_seconds": 120,
+      "backoff_seconds": 300
+    }
+  ]
+}

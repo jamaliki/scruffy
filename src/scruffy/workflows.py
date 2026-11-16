@@ -20,12 +20,33 @@ ArtifactCondition = tuple[str, str]
 
 DEPENDENCY_CONDITIONS = frozenset({"succeeded", "terminal"})
 RECOVERY_REASONS = frozenset(
-    {"allocation_replaced", "allocation_incarnation_changed", "evacuated"}
+    {"allocation_replaced", "allocation_incarnation_changed", "evacuated", "lease_ended"}
 )
+# ``lease_ended``: a satellite allocation ended under a running task.
 AUTO_RECOVERY_REASONS = frozenset(
-    {"allocation_replaced", "allocation_incarnation_changed"}
+    {"allocation_replaced", "allocation_incarnation_changed", "lease_ended"}
 )
 MAX_RECOVERY_ATTEMPTS = 10
+
+
+def mark_retry_exhaustion(job: dict[str, object], reason: str) -> None:
+    """Persist bounded retry exhaustion on the terminal predecessor."""
+
+    policy = job.get("recovery")
+    policy = policy if isinstance(policy, dict) else None
+    attempt = job.get("attempt") if type(job.get("attempt")) is int else 1
+    max_attempts = policy.get("max_attempts") if policy else None
+    retry_on = policy.get("retry_on") if policy else ()
+    if (
+        isinstance(max_attempts, int)
+        and isinstance(attempt, int)
+        and attempt >= max_attempts
+        and isinstance(retry_on, list)
+        and reason in retry_on
+    ):
+        job["retry_exhausted"] = True
+        job["retry_exhausted_reason"] = reason
+        job["retry_exhausted_at"] = job.get("finished_at")
 
 
 class WorkflowError(ValueError):

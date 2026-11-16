@@ -6,15 +6,22 @@ import queue
 import signal
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from ._compat import UTC
-from .health import nodes_requiring_exact_gpu_binding, unavailable_gpu_ids
+from .health import (
+    nodes_requiring_exact_gpu_binding,
+    quarantined_nodes,
+    unavailable_gpu_ids,
+)
+from .leases import lease_accepts, lease_inventory, lease_remaining_seconds
 from .models import (
     Assignment,
+    NodeInventory,
     NodeReservation,
     QueuedJob,
     ResourceRequest,
@@ -29,6 +36,8 @@ from .provenance import (
 from .runtime import Controller, RunningProcess, signal_process, start_readers, stop_launcher
 from .scheduler import choose_first_fitting_job, project_gpu_usage, queue_priority_key
 from .slurm import (
+    AllocationIncarnation,
+    build_lease_environment,
     build_local_argv,
     build_srun_argv,
     build_srun_environment,
@@ -36,7 +45,12 @@ from .slurm import (
     expand_slurm_hostnames,
     new_step_name,
 )
-from .slurm_runtime import reconcile_slurm, refresh_slurm_snapshot
+from .slurm_runtime import (
+    job_slurm_job_id,
+    reconcile_slurm,
+    refresh_slurm_snapshot,
+    step_snapshot,
+)
 from .state import active_assignments, emit, ensure_committed
 from .storage import (
     StorageError,
@@ -45,6 +59,7 @@ from .storage import (
     read_immutable_json,
     utc_now,
 )
+from .workflows import AUTO_RECOVERY_REASONS, mark_retry_exhaustion
 
 MAX_MESSAGES_PER_TICK = 256
 RUNTIME_PLACEMENT_CONTRACT = 1
@@ -138,6 +153,46 @@ def _placement_entry(
     }
 
 
+def _job_allocation(controller: Controller, job: dict[str, Any]) -> str:
+    try:
+        return job_slurm_job_id(controller, job)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _lease_record(controller: Controller, lease_id: str) -> dict[str, Any]:
+    lease = controller.state.get("leases", {}).get(lease_id)
+    if not isinstance(lease, dict):
+        raise StorageError(f"unknown lease {lease_id!r}")
+    return lease
+
+
+def _launch_target(
+    controller: Controller, assignment: Assignment
+) -> tuple[str, str | None, str | None]:
+    """Return the allocation ID, Slurm job ID, and incarnation for a launch."""
+
+    if assignment.lease_id is None:
+        incarnation = controller.allocation_incarnation
+        return (
+            controller.allocation_id,
+            controller.slurm_job_id,
+            incarnation.fingerprint_sha256 if incarnation is not None else None,
+        )
+    lease = _lease_record(controller, assignment.lease_id)
+    slurm_job_id = lease.get("slurm_job_id")
+    raw_incarnation = lease.get("incarnation")
+    if not isinstance(slurm_job_id, str) or not slurm_job_id:
+        raise StorageError(f"lease {assignment.lease_id!r} has no Slurm job")
+    try:
+        incarnation = AllocationIncarnation.from_dict(raw_incarnation)
+    except (TypeError, ValueError) as exc:
+        raise StorageError(f"lease {assignment.lease_id!r} has no incarnation") from exc
+    if incarnation.slurm_job_id != slurm_job_id:
+        raise StorageError(f"lease {assignment.lease_id!r} incarnation differs")
+    return slurm_job_id, slurm_job_id, incarnation.fingerprint_sha256
+
+
 def _runtime_placement_authority(
     controller: Controller, job: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -149,7 +204,7 @@ def _runtime_placement_authority(
         raise ValueError("runtime placement file registry is missing")
     if len(relative_files) != len(assignment.reservations):
         raise ValueError("runtime placement file registry has the wrong size")
-    outer_job_id = controller.slurm_job_id or ""
+    outer_job_id = _job_allocation(controller, job)
     live_step_id = job.get("slurm_step_id")
     if not outer_job_id or not isinstance(live_step_id, str):
         raise ValueError("runtime placement has no reconciled Slurm step")
@@ -190,7 +245,7 @@ def _runtime_placement_candidate_step(
         raise TypeError("runtime placement file registry is missing")
     if len(relative_files) != len(assignment.reservations):
         raise ValueError("runtime placement file registry has the wrong size")
-    outer_job_id = controller.slurm_job_id or ""
+    outer_job_id = _job_allocation(controller, job)
     if not outer_job_id:
         raise ValueError("runtime placement has no outer Slurm job")
     candidate = None
@@ -369,8 +424,11 @@ def _requires_exact_gpu_binding(
 ) -> bool:
     if (
         assignment.request.gpus_per_node == 0
+        or assignment.lease_id is not None
         or getattr(controller, "gpu_isolation", "node") != "gpu"
     ):
+        # Leases have no health monitor, so nothing requires exact binding;
+        # a quarantined lease node is withheld whole instead.
         return False
     state = getattr(controller, "state", {})
     health = state.get("gpu_health", {}) if isinstance(state, Mapping) else {}
@@ -396,7 +454,7 @@ def _launch_arguments(
         )
         return (
             build_srun_argv(
-                slurm_job_id=controller.slurm_job_id or "",
+                slurm_job_id=_launch_target(controller, assignment)[1] or "",
                 name=job["launch_token"],
                 assignment_file=assignment_file,
                 stdout_file=stdout_file,
@@ -411,7 +469,11 @@ def _launch_arguments(
                     else None
                 ),
             ),
-            build_srun_environment(),
+            (
+                build_srun_environment()
+                if assignment.lease_id is None
+                else build_lease_environment()
+            ),
         )
     return build_local_argv(assignment_file, assignment.reservations[0].node)
 
@@ -429,6 +491,9 @@ def start_job(
     launch_file, _ = provenance_files(controller.root, str(job["id"]))
     prior_launch: dict[str, Any] | None = None
     try:
+        allocation_id, slurm_job_id, incarnation_sha256 = _launch_target(
+            controller, assignment
+        )
         if launch_file.exists():
             prior_launch, _ = read_immutable_json(launch_file)
             if not isinstance(prior_launch, dict):
@@ -456,15 +521,10 @@ def start_job(
                 and prior_job.get("launch_token") != job.get("launch_token")
             ):
                 raise StorageError(f"launch token changed before admission {job['id']}")
-            if prior_launch.get("allocation_id") != controller.allocation_id:
+            if prior_launch.get("allocation_id") != allocation_id:
                 raise StorageError(f"launch allocation changed before admission {job['id']}")
             if controller.launcher == "slurm":
-                current_fingerprint = (
-                    controller.allocation_incarnation.fingerprint_sha256
-                    if controller.allocation_incarnation is not None
-                    else None
-                )
-                if prior_launch.get("allocation_incarnation_sha256") != current_fingerprint:
+                if prior_launch.get("allocation_incarnation_sha256") != incarnation_sha256:
                     raise StorageError(
                         f"launch record belongs to a different allocation incarnation {job['id']}"
                     )
@@ -472,6 +532,10 @@ def start_job(
         _fail_unlaunched(controller, job, assignment, exc)
         return
     job["assignment"] = assignment.to_dict()
+    if assignment.lease_id is None:
+        job.pop("lease_id", None)
+    else:
+        job["lease_id"] = assignment.lease_id
     job["state"] = "starting"
     prior_job = prior_launch.get("job") if prior_launch else None
     prior_started_at = prior_launch.get("started_at") if prior_launch else None
@@ -485,12 +549,10 @@ def start_job(
         job["started_at"], assignment.request.time_limit_seconds
     )
     if controller.launcher == "slurm":
-        if controller.allocation_incarnation is None:
+        if incarnation_sha256 is None:
             raise RuntimeError("Slurm controller has no allocation incarnation")
         job["launch_token"] = job.get("launch_token") or prior_token or new_step_name()
-        job["allocation_incarnation_sha256"] = (
-            controller.allocation_incarnation.fingerprint_sha256
-        )
+        job["allocation_incarnation_sha256"] = incarnation_sha256
         job["runtime_placement_contract"] = RUNTIME_PLACEMENT_CONTRACT
         job["runtime_placement_files"] = [
             f"jobs/{job['id']}/runtime-placement-{index}.json"
@@ -505,9 +567,7 @@ def start_job(
     stdout_file = directory / "stdout.log"
     stderr_file = directory / "stderr.log"
     try:
-        launch_file = write_launch_record(
-            controller.root, controller.allocation_id, job, assignment
-        )
+        launch_file = write_launch_record(controller.root, allocation_id, job, assignment)
         worker_document = {
             "root": str(controller.root),
             "job_id": job["id"],
@@ -516,7 +576,7 @@ def start_job(
             "task_id": job.get("task_id"),
             "attempt": job.get("attempt"),
             "launcher": controller.launcher,
-            "slurm_job_id": controller.slurm_job_id,
+            "slurm_job_id": slurm_job_id,
             "launch_token": job.get("launch_token"),
             "allocation_incarnation_sha256": job.get(
                 "allocation_incarnation_sha256"
@@ -621,6 +681,74 @@ def start_job(
         emit(controller, "job.running", job=job)
 
 
+@dataclass(frozen=True, slots=True)
+class PlacementTarget:
+    """One allocation the scheduler may place work on in this pass."""
+
+    lease_id: str | None
+    inventory: tuple[NodeInventory, ...]
+    assignments: tuple[Assignment, ...]
+    unavailable: Mapping[str, Collection[int]]
+    exact_gpu_nodes: frozenset[str] = frozenset()
+    lease: Mapping[str, Any] | None = None
+
+
+def placement_targets(controller: Controller) -> list[PlacementTarget]:
+    """Return the primary allocation, then running leases, in preference order.
+
+    Leases with the least remaining time come first so that long leases stay
+    free for long jobs; an untimed attached lease comes last.
+    """
+
+    health = controller.state.get("gpu_health") or {}
+    targets = []
+    if controller.inventory:
+        targets.append(
+            PlacementTarget(
+                None,
+                controller.inventory,
+                active_assignments(controller.state),
+                unavailable_gpu_ids(health, controller.inventory),
+                (
+                    nodes_requiring_exact_gpu_binding(health, controller.inventory)
+                    if controller.launcher == "slurm"
+                    else frozenset()
+                ),
+            )
+        )
+    if controller.launcher != "slurm":
+        return targets
+    now = time.time()
+    quarantined = quarantined_nodes(health)
+    leases = []
+    for lease_id, lease in controller.state.get("leases", {}).items():
+        if lease.get("state") != "running" or lease.get("draining"):
+            continue
+        view = controller.lease_steps.get(lease_id)
+        if view is not None and view.ended:
+            continue
+        inventory = lease_inventory(lease)
+        if not inventory:
+            continue
+        remaining = lease_remaining_seconds(lease, now)
+        leases.append(
+            (
+                remaining is None,
+                remaining or 0.0,
+                lease_id,
+                PlacementTarget(
+                    lease_id,
+                    inventory,
+                    active_assignments(controller.state, lease_id),
+                    {node.name: node.gpu_ids for node in inventory if node.name in quarantined},
+                    lease=lease,
+                ),
+            )
+        )
+    targets.extend(item[3] for item in sorted(leases, key=lambda item: item[:3]))
+    return targets
+
+
 def schedule(controller: Controller) -> None:
     while (
         not controller.stopping
@@ -633,28 +761,57 @@ def schedule(controller: Controller) -> None:
             (job for job in jobs.values() if job["state"] == "queued"),
             key=lambda job: queue_priority_key(job, usage),
         )
+        if not queued_images:
+            return
         queued = [
             QueuedJob(job["id"], ResourceRequest.from_dict(job["request"]))
             for job in queued_images
         ]
-        exact_gpu_nodes = (
-            nodes_requiring_exact_gpu_binding(
-                controller.state.get("gpu_health", {}), controller.inventory
+        priority = {job.job_id: index for index, job in enumerate(queued)}
+        now = time.time()
+        best: tuple[int, QueuedJob, Assignment] | None = None
+        for target in placement_targets(controller):
+            limit = len(queued) if best is None else best[0]
+            if target.lease is None:
+                candidates = queued[:limit]
+            else:
+                candidates = [
+                    queued_job
+                    for queued_job, image in zip(queued[:limit], queued_images[:limit])
+                    if lease_accepts(
+                        target.lease,
+                        queued_job.request,
+                        job_project(image),
+                        now,
+                        settings=controller.lease_settings,
+                        untimed_margin_seconds=controller.drain_before_end_seconds,
+                    )
+                ]
+            if not candidates:
+                continue
+            choice = choose_first_fitting_job(
+                target.inventory,
+                target.assignments,
+                candidates,
+                target.unavailable,
+                exact_gpu_nodes=target.exact_gpu_nodes,
+                slurm_count_binding=controller.launcher == "slurm",
             )
-            if controller.launcher == "slurm"
-            else frozenset()
-        )
-        choice = choose_first_fitting_job(
-            controller.inventory,
-            active_assignments(controller.state),
-            queued,
-            unavailable_gpu_ids(controller.state.get("gpu_health", {}), controller.inventory),
-            exact_gpu_nodes=exact_gpu_nodes,
-            slurm_count_binding=controller.launcher == "slurm",
-        )
-        if choice is None:
+            if choice is None:
+                continue
+            queued_job, assignment = choice
+            if target.lease_id is not None:
+                assignment = replace(assignment, lease_id=target.lease_id)
+            index = priority[queued_job.job_id]
+            if best is None or index < best[0]:
+                best = (index, queued_job, assignment)
+            if index == 0:
+                break
+        if best is None:
             return
-        queued_job, assignment = choice
+        _, queued_job, assignment = best
+        if assignment.lease_id is not None:
+            controller.lease_idle_since.pop(assignment.lease_id, None)
         start_job(controller, controller.state["jobs"][queued_job.job_id], assignment)
 
 
@@ -843,6 +1000,9 @@ def _finish_job(
             except FileNotFoundError:
                 size = 0
             job[f"{stream_name}_bytes"] = size
+    if state == "lost" and isinstance(reason, str) and reason in AUTO_RECOVERY_REASONS:
+        mark_retry_exhaustion(job, reason)
+        controller.auto_recovery_pending = True
     write_result_record(controller.root, job)
     emit(controller, f"job.{state}", job=job)
 
@@ -935,7 +1095,7 @@ def _recovered_returncode(
 ) -> int | None:
     """Resolve an attached step through accounting after it leaves live state."""
 
-    snapshot_at = controller.slurm_snapshot_at
+    snapshot_at = step_snapshot(controller, job).snapshot_at
     if running.last_accounting_snapshot_at == snapshot_at:
         return None
     running.last_accounting_snapshot_at = snapshot_at

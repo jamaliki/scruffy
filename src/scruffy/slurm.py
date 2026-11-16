@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import uuid
@@ -722,3 +724,293 @@ def allocation_metadata(allocation_id: str, launcher: str) -> dict[str, Any]:
             int(deadline), UTC
         ).isoformat(timespec="seconds")
     return metadata
+
+
+# ---------------------------------------------------------------------------
+# Leases: other allocations of the same user.
+
+_TERMINAL_SLURM_JOB_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "SPECIAL_EXIT",
+        "TIMEOUT",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SlurmJobObservation:
+    """One of the user's Slurm jobs as reported by ``squeue``."""
+
+    job_id: str
+    name: str
+    state: str
+    reason: str | None = None
+    nodes: str | None = None
+    start_at: float | None = None
+    end_at: float | None = None
+    gpus: int = 0
+    restart_count: int | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in _TERMINAL_SLURM_JOB_STATES
+
+
+def _slurm_number(value: object) -> int | None:
+    """Decode a Slurm JSON number, including ``{set, infinite, number}``."""
+
+    if isinstance(value, Mapping):
+        if value.get("set") is False or value.get("infinite") is True:
+            return None
+        value = value.get("number")
+    if type(value) is int:
+        return value
+    return None
+
+
+def _slurm_state(value: object) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").split(maxsplit=1)[0].upper()
+
+
+def tres_gpu_count(encoded: object) -> int:
+    """Count GPUs in a TRES string such as ``cpu=8,gres/gpu:h100=4``."""
+
+    if not isinstance(encoded, str) or not encoded:
+        return 0
+    generic = None
+    typed = 0
+    for item in encoded.split(","):
+        key, _, value = item.partition("=")
+        if not value.isascii() or not value.isdecimal():
+            continue
+        if key == "gres/gpu":
+            generic = int(value)
+        elif key.startswith("gres/gpu:"):
+            typed += int(value)
+    return generic if generic is not None else typed
+
+
+def parse_squeue_jobs(document: object) -> tuple[SlurmJobObservation, ...]:
+    """Parse ``squeue --json`` across the Slurm releases that emit it."""
+
+    if not isinstance(document, Mapping) or not isinstance(document.get("jobs"), list):
+        raise RuntimeError("squeue returned an invalid job document")
+    if document.get("errors"):
+        raise RuntimeError(f"squeue reported errors: {document['errors']!r}")
+    result = []
+    for item in document["jobs"]:
+        if not isinstance(item, Mapping):
+            raise RuntimeError("squeue returned an invalid job record")
+        job_id = _slurm_number(item.get("job_id"))
+        if job_id is None:
+            raise RuntimeError("squeue returned a job without an ID")
+        state = _slurm_state(item.get("job_state"))
+        tres = item.get("tres_alloc_str") if state == "RUNNING" else None
+        gpus = tres_gpu_count(tres or item.get("tres_req_str"))
+        start = _slurm_number(item.get("start_time"))
+        end = _slurm_number(item.get("end_time"))
+        reason = item.get("state_reason")
+        nodes = item.get("nodes")
+        result.append(
+            SlurmJobObservation(
+                job_id=str(job_id),
+                name=str(item.get("name") or ""),
+                state=state,
+                reason=reason if isinstance(reason, str) and reason != "None" else None,
+                nodes=nodes if isinstance(nodes, str) and nodes else None,
+                start_at=float(start) if start else None,
+                end_at=float(end) if end else None,
+                gpus=gpus,
+                restart_count=_slurm_number(item.get("restart_cnt")),
+            )
+        )
+    return tuple(result)
+
+
+def user_jobs(user: str | None = None) -> tuple[SlurmJobObservation, ...]:
+    """Return every queued or running job of one user, error-checked."""
+
+    result = subprocess.run(
+        ["squeue", "--json", f"--user={user or getpass.getuser()}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return parse_squeue_jobs(json.loads(result.stdout))
+
+
+def lease_job(slurm_job_id: str) -> SlurmJobObservation:
+    """Return one lease allocation's state from ``scontrol``."""
+
+    job = _allocation_job(slurm_job_id)
+    observed = parse_squeue_jobs({"jobs": [job]})[0]
+    if observed.job_id != slurm_job_id:
+        raise ValueError("Slurm returned a different allocation job")
+    return observed
+
+
+def _numeric_job_id(slurm_job_id: str) -> str:
+    if not slurm_job_id.isascii() or not slurm_job_id.isdecimal():
+        raise ValueError(f"refusing unsafe Slurm job ID {slurm_job_id!r}")
+    return slurm_job_id
+
+
+def _slurm_duration(seconds: int) -> str:
+    # Slurm limits have minute granularity; rounding down never exceeds a
+    # QOS maximum the pool was sized to.
+    minutes = max(1, seconds // 60)
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{days}-{hours:02d}:{minutes:02d}:00"
+
+
+def build_lease_sbatch_argv(
+    *,
+    lease_id: str,
+    root: Path,
+    nodes: int,
+    gpus_per_node: int,
+    cpus_per_node: int,
+    memory_gb_per_node: int,
+    time_limit_seconds: int,
+    heartbeat_timeout_seconds: int,
+    partition: str | None = None,
+    qos: str | None = None,
+    account: str | None = None,
+    constraint: str | None = None,
+    gpu_type: str | None = None,
+    extra_args: Sequence[str] = (),
+) -> list[str]:
+    """Build an argv-only ``sbatch`` for one placeholder lease.
+
+    The batch payload is only the lease agent, which keeps the allocation
+    while the controller launches worker steps into it with ``srun --jobid``.
+    The job name is the lease ID, so an uncertain submission can be found
+    again. Leases never requeue: a requeued allocation would lose its steps.
+    """
+
+    if not lease_id.startswith("scruffy-lease-") or not lease_id.replace("-", "").isalnum():
+        raise ValueError(f"invalid lease ID {lease_id!r}")
+    gpus = f"{gpu_type}:{gpus_per_node}" if gpu_type else str(gpus_per_node)
+    argv = [
+        "sbatch",
+        "--parsable",
+        f"--job-name={lease_id}",
+        "--no-requeue",
+        f"--nodes={nodes}",
+        "--ntasks-per-node=1",
+        f"--cpus-per-task={cpus_per_node}",
+        f"--mem={memory_gb_per_node}G",
+        f"--gpus-per-node={gpus}",
+        f"--time={_slurm_duration(time_limit_seconds)}",
+        f"--output={root / 'leases' / 'logs' / f'{lease_id}.out'}",
+        "--export=ALL",
+    ]
+    for option, value in (
+        ("--partition", partition),
+        ("--qos", qos),
+        ("--account", account),
+        ("--constraint", constraint),
+    ):
+        if value is not None:
+            argv.append(f"{option}={value}")
+    argv.extend(extra_args)
+    agent = [
+        sys.executable,
+        "-m",
+        "scruffy.lease_agent",
+        "--root",
+        str(root),
+        "--lease-id",
+        lease_id,
+        "--heartbeat-timeout",
+        str(heartbeat_timeout_seconds),
+    ]
+    argv.append(f"--wrap=exec {shlex.join(agent)}")
+    return argv
+
+
+def build_lease_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return an environment for ``sbatch``/``srun`` into another allocation.
+
+    Nothing of the controller's own allocation may leak into another one, so
+    every Slurm input or output variable is dropped except the site config.
+    """
+
+    environment = dict(os.environ if source is None else source)
+    environment.pop("SCRUFFY_NODE", None)
+    environment.pop("CUDA_VISIBLE_DEVICES", None)
+    for name in tuple(environment):
+        if name == "SLURM_CONF":
+            continue
+        if name.startswith((*_SLURM_ENVIRONMENT_PREFIXES, "SBATCH_", "SALLOC_")):
+            del environment[name]
+    return environment
+
+
+def submit_lease(argv: Sequence[str]) -> str:
+    """Submit one lease and return its numeric Slurm job ID."""
+
+    if not argv or argv[0] != "sbatch" or "--parsable" not in argv:
+        raise ValueError("lease submission must be a parsable sbatch command")
+    result = subprocess.run(
+        list(argv),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=build_lease_environment(),
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("sbatch returned no job ID")
+    job_id = lines[-1].split(";", 1)[0]
+    return _numeric_job_id(job_id)
+
+
+_TEST_ONLY_START = re.compile(r"to start at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def probe_lease_start(argv: Sequence[str]) -> float | None:
+    """Ask Slurm when a lease would start, without submitting it."""
+
+    if not argv or argv[0] != "sbatch":
+        raise ValueError("lease probe must be an sbatch command")
+    probe = [argv[0], "--test-only", *[item for item in argv[1:] if item != "--parsable"]]
+    result = subprocess.run(
+        probe,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=build_lease_environment(),
+    )
+    match = _TEST_ONLY_START.search(result.stderr + result.stdout)
+    if match is None:
+        return None
+    # Slurm prints the controller's local time without an offset.
+    return datetime.fromisoformat(match.group(1)).timestamp()
+
+
+def cancel_lease(slurm_job_id: str) -> None:
+    """Cancel one elastic lease allocation Scruffy itself submitted."""
+
+    subprocess.run(
+        ["scancel", "--quiet", _numeric_job_id(slurm_job_id)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )

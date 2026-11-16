@@ -15,16 +15,19 @@ from typing import Any
 from . import __version__
 from .bulk import CANCELLABLE_STATES
 from .client import (
+    attach_lease,
     cancel_evacuation,
     cancel_job,
     cancel_jobs,
     clear_gpu_quarantine,
     drain_queue,
     explain,
+    leases,
     observe,
     preview_cancel_jobs,
     publish_event,
     quarantine_gpu,
+    release_lease,
     reprobe_gpu,
     request_evacuation,
     resume_queue,
@@ -39,6 +42,7 @@ from .client import (
 )
 from .controller import run_controller
 from .dashboard import run_dashboard
+from .leases import load_lease_settings
 from .models import (
     DEFAULT_PROJECT,
     TERMINAL_JOB_STATES,
@@ -157,6 +161,11 @@ def _serve(arguments: argparse.Namespace) -> int:
         raise ValueError("--drain-before-end-seconds must be non-negative")
     if arguments.evacuate_before_end_seconds < 0:
         raise ValueError("--evacuate-before-end-seconds must be non-negative")
+    lease_settings = (
+        load_lease_settings(Path(arguments.pools)) if arguments.pools else None
+    )
+    if arguments.hub:
+        return _serve_hub(arguments, root, controller_release, lease_settings)
     slurm_job_id = arguments.slurm_job_id or os.environ.get("SLURM_JOB_ID")
     launcher = arguments.launcher
     if launcher == "auto":
@@ -196,6 +205,8 @@ def _serve(arguments: argparse.Namespace) -> int:
         controller_options["evacuate_before_end_seconds"] = (
             arguments.evacuate_before_end_seconds
         )
+    if lease_settings is not None:
+        controller_options["lease_settings"] = lease_settings
     run_controller(
         root=root,
         inventory=inventory,
@@ -213,6 +224,80 @@ def _serve(arguments: argparse.Namespace) -> int:
         **controller_options,
     )
     return 0
+
+
+def _serve_hub(
+    arguments: argparse.Namespace,
+    root: Path,
+    controller_release: str | None,
+    lease_settings: Any,
+) -> int:
+    """Run a controller that owns no allocation and places work on leases."""
+
+    if arguments.launcher == "local":
+        raise ValueError("--hub requires the Slurm launcher")
+    if arguments.inventory or arguments.slurm_job_id:
+        raise ValueError("--hub has no primary allocation; omit --inventory and --slurm-job-id")
+    if arguments.evacuate_before_end_seconds:
+        raise ValueError("--evacuate-before-end-seconds needs a primary allocation")
+    controller_options: dict[str, Any] = {}
+    if controller_release is not None:
+        controller_options["controller_release"] = controller_release
+    if getattr(arguments, "legacy_report_project", None):
+        controller_options["legacy_report_projects"] = tuple(arguments.legacy_report_project)
+    run_controller(
+        root=root,
+        inventory=(),
+        launcher="slurm",
+        allocation_id=arguments.allocation_id or "hub",
+        slurm_job_id=None,
+        allocation_incarnation=None,
+        poll_interval=arguments.poll_interval,
+        cancel_grace=arguments.cancel_grace,
+        start_paused=arguments.start_paused,
+        drain_before_end_seconds=arguments.drain_before_end_seconds,
+        gpu_health_mode="off",
+        gpu_isolation=arguments.gpu_isolation,
+        gpu_health_interval=arguments.gpu_health_interval,
+        lease_settings=lease_settings,
+        **controller_options,
+    )
+    return 0
+
+
+def _leases(arguments: argparse.Namespace) -> int:
+    _json(leases(_root(arguments)))
+    return 0
+
+
+def _lease_outcome(arguments: argparse.Namespace, request: dict[str, Any], success: str) -> int:
+    if not arguments.wait:
+        _json(request)
+        return 0
+    receipt = wait_for_command(_root(arguments), request["request_id"], timeout=arguments.timeout)
+    outcome = receipt.get("outcome") or {}
+    _json({"request_id": request["request_id"], **outcome})
+    return 0 if outcome.get("state") in {success, "already_attached", "ignored"} else 1
+
+
+def _lease_attach(arguments: argparse.Namespace) -> int:
+    request = attach_lease(
+        _root(arguments),
+        arguments.slurm_job_id,
+        gpus_per_node=arguments.gpus_per_node,
+        cpus_per_node=arguments.cpus_per_node,
+        memory_gb_per_node=arguments.memory_gb_per_node,
+        projects=arguments.project or None,
+        request_id=arguments.request_id,
+    )
+    return _lease_outcome(arguments, request, "attached")
+
+
+def _lease_release(arguments: argparse.Namespace) -> int:
+    request = release_lease(
+        _root(arguments), arguments.lease_id, request_id=arguments.request_id
+    )
+    return _lease_outcome(arguments, request, "releasing")
 
 
 def _submit(arguments: argparse.Namespace) -> int:
@@ -632,6 +717,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--slurm-job-id", help="outer Slurm allocation job ID")
     serve.add_argument(
+        "--hub",
+        action="store_true",
+        help=(
+            "own no allocation: place work only on attached allocations and "
+            "elastic leases (allocation ID defaults to 'hub')"
+        ),
+    )
+    serve.add_argument(
+        "--pools",
+        metavar="FILE",
+        help="JSON lease-pool file enabling elastic leases submitted with sbatch",
+    )
+    serve.add_argument(
         "--gpus-per-node",
         type=int,
         help="optional managed GPU cap per node (default: allocation)",
@@ -840,6 +938,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="label the project scope; availability remains allocation-wide",
     )
     resources.set_defaults(handler=_resources)
+
+    leases_parser = commands.add_parser(
+        "leases", help="show attached and elastic leases, pool backoff, and lease capacity"
+    )
+    leases_parser.set_defaults(handler=_leases)
+
+    lease = commands.add_parser("lease", help="attach or release other allocations")
+    lease_commands = lease.add_subparsers(dest="lease_command", required=True)
+    lease_attach = lease_commands.add_parser(
+        "attach",
+        help="place queued work on another allocation you already hold",
+        description=(
+            "Attach a running Slurm allocation as extra capacity. Scruffy never "
+            "cancels it; 'lease release' only stops placement."
+        ),
+    )
+    lease_attach.add_argument("slurm_job_id", help="running Slurm job ID")
+    lease_attach.add_argument("--gpus-per-node", type=int, help="managed GPU cap per node")
+    lease_attach.add_argument("--cpus-per-node", type=int, help="managed CPU cap per node")
+    lease_attach.add_argument(
+        "--memory-gb-per-node", type=int, help="managed memory cap per node"
+    )
+    lease_attach.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        help="allow only this project on the lease (repeatable; default: all)",
+    )
+    lease_attach.add_argument("--request-id", help="stable retry identity")
+    lease_attach.add_argument("--wait", action="store_true", help="wait for the outcome")
+    lease_attach.add_argument("--timeout", type=float, help="bound --wait in seconds")
+    lease_attach.set_defaults(handler=_lease_attach)
+    lease_release = lease_commands.add_parser(
+        "release",
+        help="stop placing work on a lease and give it back when idle",
+        description=(
+            "Running jobs finish first. An elastic lease is then cancelled in "
+            "Slurm; an attached allocation is only detached."
+        ),
+    )
+    lease_release.add_argument("lease_id", help="lease ID or its Slurm job ID")
+    lease_release.add_argument("--request-id", help="stable retry identity")
+    lease_release.add_argument("--wait", action="store_true", help="wait for the outcome")
+    lease_release.add_argument("--timeout", type=float, help="bound --wait in seconds")
+    lease_release.set_defaults(handler=_lease_release)
 
     gpus = commands.add_parser(
         "gpus", help="list GPU health, identity, and scheduler state"
