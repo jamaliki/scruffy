@@ -19,7 +19,8 @@ falls back to `state.json`, preserving compatibility with older queue roots.
 | Submit | `scruffy submit -- ...` | `submit_job(...)` |
 | Validate complete DAG | `scruffy validate-workflow FILE` | `validate_workflow(...)` |
 | Submit complete DAG | `scruffy submit-workflow FILE` | `submit_workflow(...)` |
-| Full state or one job | `scruffy status [JOB_ID]` | `status(root, job_id=None)` |
+| Full state or one job | `scruffy status [JOB]` | `status(root, job_id=None)` |
+| Job ID for a reference | `status`, `logs`, `wait`, `cancel` | `resolve_job_reference(root, reference, project_id=None)` |
 | Bounded orientation | `scruffy summary` | `summary(root)` |
 | Resource availability | `scruffy resources` | MCP `resources()` |
 | GPU identity and health | `scruffy gpus` | MCP `gpus()` |
@@ -29,11 +30,11 @@ falls back to `state.json`, preserving compatibility with older queue roots.
 | Dependency-blocked jobs | `scruffy blocked` | MCP `blocked_jobs()` |
 | Dependency explanation | `scruffy explain JOB_ID` | `explain(root, job_id)` |
 | Snapshot and events | `scruffy observe` | `observe(root, ...)` |
-| Wait for one terminal job | `scruffy wait JOB_ID` | `wait_for_job(root, job_id)` |
-| Bounded output tail | `scruffy logs JOB_ID --tail N` | MCP `tail_job_output(...)` |
+| Wait for one terminal job | `scruffy wait JOB` | `wait_for_job(root, job_id)` |
+| Bounded output tail | `scruffy logs JOB --tail N` | MCP `tail_job_output(...)` |
 | Wait and inspect one job | - | MCP `wait_job(...)` |
 | Publish workload state | `scruffy report KIND` | `publish_event(...)` |
-| Request cancellation | `scruffy cancel JOB_ID` | `cancel_job(root, job_id)` |
+| Request cancellation | `scruffy cancel JOB` | `cancel_job(root, job_id)` |
 | Cancel many jobs | `scruffy cancel-jobs ...` | `cancel_jobs(root, ...)`, MCP `cancel_jobs` |
 | Preview a bulk cancel | `scruffy cancel-jobs ... --dry-run` | `preview_cancel_jobs(root, ...)` |
 | Wait for a command receipt | `scruffy cancel-jobs ... --wait` | `wait_for_command(root, request_id)` |
@@ -59,6 +60,17 @@ Submission, full-state views, summaries, explanations, and observations accept
 a project selector through `--project`, `SCRUFFY_PROJECT`, or the Python
 `project_id` argument. Submission defaults to `default`; read operations remain
 allocation-wide when no project is selected.
+
+`JOB` in `status`, `logs`, `wait` and `cancel` is a job reference, resolved
+client-side by `resolve_job_reference` before the operation runs: a job ID
+(hot, pending or archived); then a request ID or a workflow task
+`WORKFLOW_ID/TASK_ID` (a workflow ID may itself contain `/`), either of which
+names the task's newest attempt; then a job name unique among hot and pending
+jobs. The project selector scopes the last two steps; without one every
+project with hot jobs is searched. Two different matches at one step raise an
+error naming their job IDs. A reference that matches nothing is passed on
+unchanged, so an unknown or just-submitted job ID behaves as before. The
+controller, the request format and the MCP tools still take job IDs only.
 
 ## Job states
 

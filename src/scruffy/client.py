@@ -937,6 +937,104 @@ def status(
     raise KeyError(f"unknown job {job_id}")
 
 
+def _newest_task_attempt(
+    root: Path,
+    jobs: dict[str, dict[str, Any]],
+    next_order: int,
+    project_id: str,
+    workflow_id: str,
+    task_id: str,
+) -> dict[str, Any] | None:
+    """Return one workflow task's newest attempt, hot, pending or archived."""
+
+    attempts = {
+        job["id"]: job
+        for job in jobs.values()
+        if job_project(job) == project_id
+        and job.get("workflow_id") == workflow_id
+        and job.get("task_id") == task_id
+    }
+    for archived in list_archived_workflow(root, workflow_id, project_id=project_id):
+        if archived.get("task_id") == task_id:
+            attempts.setdefault(archived["id"], archived)
+    # Pending attempts have no queue order yet; they are the newest.
+    ordered = [
+        job if type(job.get("queue_order")) is int else {**job, "queue_order": next_order + index}
+        for index, job in enumerate(attempts.values())
+    ]
+    selected = select_task_attempts(ordered).get((project_id, workflow_id, task_id))
+    return None if selected is None else attempts[selected["id"]]
+
+
+def resolve_job_reference(
+    root: Path, reference: str, *, project_id: str | None = None
+) -> str:
+    """Return the job ID that a job ID, task, request ID or job name names.
+
+    ``reference`` is tried in order as a job ID; then as a workflow task
+    ``WORKFLOW_ID/TASK_ID`` or a request ID, either of which names the task's
+    newest attempt; then as a job name, unique among hot and pending jobs.
+    ``project_id`` scopes the last two; without it every project with hot jobs
+    is searched. Two different matches at one step raise ``ValueError`` naming
+    them. A reference that matches nothing is returned unchanged, so callers
+    report or await it exactly as an unknown job ID.
+    """
+
+    if not isinstance(reference, str) or not reference or reference.strip() != reference:
+        raise ValueError("job reference must be a non-empty trimmed string")
+    selected = normalize_project_id(project_id) if project_id is not None else None
+    state = status(root)
+    jobs: dict[str, dict[str, Any]] = state.get("jobs", {})
+    if reference in jobs or find_archived_job(root, reference) is not None:
+        return reference
+    projects = (
+        [selected]
+        if selected is not None
+        else sorted({DEFAULT_PROJECT, *(job_project(job) for job in jobs.values())})
+    )
+    next_order = int(state.get("next_queue_order", 0))
+    matches: dict[str, dict[str, Any]] = {}
+
+    for project in projects:
+        for index, character in enumerate(reference):
+            if character == "/" and 0 < index < len(reference) - 1:
+                newest = _newest_task_attempt(
+                    root, jobs, next_order, project, reference[:index], reference[index + 1 :]
+                )
+                if newest is not None:
+                    matches[newest["id"]] = newest
+        # A request ID names one attempt; a workflow task's resolves to the
+        # task's newest attempt, so a retry is followed.
+        job_id = create_job_id(reference, project_id=project)
+        job = jobs.get(job_id) or find_archived_job(root, job_id)
+        if job is None or job_project(job) != project:
+            continue
+        workflow_id, task_id = job.get("workflow_id"), job.get("task_id")
+        if isinstance(workflow_id, str) and isinstance(task_id, str):
+            job = (
+                _newest_task_attempt(root, jobs, next_order, project, workflow_id, task_id)
+                or job
+            )
+        matches[job["id"]] = job
+    if not matches:
+        matches = {
+            job["id"]: job
+            for job in jobs.values()
+            if job.get("name") == reference
+            and (selected is None or job_project(job) == selected)
+        }
+    if len(matches) > 1:
+        named = ", ".join(
+            f"{job['id']} ({job_project(job)}, {job.get('state')})"
+            for job in sorted(matches.values(), key=lambda item: str(item["id"]))[:10]
+        )
+        raise ValueError(
+            f"job reference {reference!r} matches {len(matches)} jobs: {named}; "
+            "use a job ID"
+        )
+    return next(iter(matches), reference)
+
+
 def _snapshot_cursor(root: Path) -> tuple[str, int, int, int]:
     compact = read_state_cursor(root)
     if compact is not None:

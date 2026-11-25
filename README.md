@@ -785,14 +785,24 @@ scruffy resources
 scruffy running
 scruffy queue
 scruffy blocked
-scruffy status [JOB_ID]
+scruffy status [JOB]
 scruffy explain JOB_ID
-scruffy wait JOB_ID
-scruffy cancel JOB_ID
+scruffy wait JOB
+scruffy cancel JOB
 scruffy cancel-jobs [JOB_ID ...] [--state STATE ...] [filters] [--dry-run] [--wait]
 scruffy drain
 scruffy resume
 ```
+
+`status`, `logs`, `wait` and `cancel` take a job reference `JOB`: a job ID; a
+request ID or a workflow task `WORKFLOW_ID/TASK_ID`, either of which names the
+task's newest attempt, so a retried task is followed; or a job name that is
+unique among hot and pending jobs. Request IDs, tasks and names are looked up
+in `--project` (or `SCRUFFY_PROJECT`) when given, and otherwise in every
+project with hot jobs. A reference that matches two different jobs is refused
+with their IDs; one that matches nothing is treated as a job ID. Archived jobs
+are found by job ID, request ID or task, not by name. Scripts should keep the
+job ID that `submit` returns.
 
 Cancellation, drain, and resume requests are asynchronous and return a
 `request_id` that appears on their journal outcome. `drain` disables new

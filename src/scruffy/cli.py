@@ -30,6 +30,7 @@ from .client import (
     release_lease,
     reprobe_gpu,
     request_evacuation,
+    resolve_job_reference,
     resume_queue,
     status,
     submit_job,
@@ -399,12 +400,21 @@ def _submit_workflow(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _job_reference(arguments: argparse.Namespace) -> str:
+    """Resolve the command's job ID, task, request ID or job name."""
+
+    return resolve_job_reference(
+        _root(arguments), arguments.job_id, project_id=_project(arguments)
+    )
+
+
 def _status(arguments: argparse.Namespace) -> int:
+    project_id = _project(arguments)
     _json(
         status(
             _root(arguments),
-            arguments.job_id,
-            project_id=_project(arguments),
+            None if arguments.job_id is None else _job_reference(arguments),
+            project_id=project_id,
         )
     )
     return 0
@@ -555,12 +565,13 @@ def _observe(arguments: argparse.Namespace) -> int:
 
 def _logs(arguments: argparse.Namespace) -> int:
     root = _root(arguments)
-    job = status(root, arguments.job_id)
+    job_id = _job_reference(arguments)
+    job = status(root, job_id)
     streams = [arguments.stream] if arguments.stream else ["stdout", "stderr"]
     positions: dict[str, int] = {}
     sources: dict[str, Path] = {}
     for stream_name in streams:
-        relative_name = job.get(stream_name, f"jobs/{arguments.job_id}/{stream_name}.log")
+        relative_name = job.get(stream_name, f"jobs/{job_id}/{stream_name}.log")
         source = root.expanduser().resolve() / relative_name
         sources[stream_name] = source
         data, positions[stream_name] = tail_window(source, arguments.tail)
@@ -585,7 +596,7 @@ def _logs(arguments: argparse.Namespace) -> int:
 
     while True:
         flush_new_output()
-        job = status(root, arguments.job_id)
+        job = status(root, job_id)
         if job["state"] in TERMINAL_JOB_STATES:
             flush_new_output()
             return 0
@@ -593,7 +604,7 @@ def _logs(arguments: argparse.Namespace) -> int:
 
 
 def _wait(arguments: argparse.Namespace) -> int:
-    job = wait_for_job(_root(arguments), arguments.job_id, timeout=arguments.timeout)
+    job = wait_for_job(_root(arguments), _job_reference(arguments), timeout=arguments.timeout)
     _json(job)
     if job["state"] == "succeeded":
         return 0
@@ -603,7 +614,7 @@ def _wait(arguments: argparse.Namespace) -> int:
 
 
 def _cancel(arguments: argparse.Namespace) -> int:
-    _json(cancel_job(_root(arguments), arguments.job_id))
+    _json(cancel_job(_root(arguments), _job_reference(arguments)))
     return 0
 
 
@@ -929,7 +940,11 @@ def build_parser() -> argparse.ArgumentParser:
         workflow_command.set_defaults(handler=handler)
 
     show = commands.add_parser("status", help="show the queue or one job")
-    show.add_argument("job_id", nargs="?", help="omit for the complete queue")
+    show.add_argument(
+        "job_id",
+        nargs="?",
+        help="job ID, request ID, WORKFLOW_ID/TASK_ID (newest attempt) or unique job name; omit for the complete queue",
+    )
     show.add_argument("--project", help="show only this project")
     show.set_defaults(handler=_status)
 
@@ -1120,7 +1135,8 @@ def build_parser() -> argparse.ArgumentParser:
     observe_parser.set_defaults(handler=_observe)
 
     logs = commands.add_parser("logs", help="read a job's raw output")
-    logs.add_argument("job_id", help="job whose logs to read")
+    logs.add_argument("job_id", help="job ID, request ID, WORKFLOW_ID/TASK_ID (newest attempt) or unique job name")
+    logs.add_argument("--project", help="resolve references in this project (or SCRUFFY_PROJECT)")
     logs.add_argument(
         "--stream", choices=("stdout", "stderr"), help="select one stream"
     )
@@ -1133,12 +1149,16 @@ def build_parser() -> argparse.ArgumentParser:
     logs.set_defaults(handler=_logs)
 
     wait = commands.add_parser("wait", help="wait for one terminal job state")
-    wait.add_argument("job_id", help="job to wait for")
+    wait.add_argument("job_id", help="job ID, request ID, WORKFLOW_ID/TASK_ID (newest attempt) or unique job name")
+    wait.add_argument("--project", help="resolve references in this project (or SCRUFFY_PROJECT)")
     wait.add_argument("--timeout", type=float, help="maximum seconds to wait")
     wait.set_defaults(handler=_wait)
 
     cancel = commands.add_parser("cancel", help="asynchronously request cancellation")
-    cancel.add_argument("job_id", help="job to cancel")
+    cancel.add_argument("job_id", help="job ID, request ID, WORKFLOW_ID/TASK_ID (newest attempt) or unique job name")
+    cancel.add_argument(
+        "--project", help="resolve references in this project (or SCRUFFY_PROJECT)"
+    )
     cancel.set_defaults(handler=_cancel)
 
     cancel_many = commands.add_parser(
