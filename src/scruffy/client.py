@@ -41,7 +41,7 @@ from .storage import (
     submit_submission,
     utc_now,
 )
-from .submissions import submission_summary, workflow_submission
+from .submissions import normalize_inherit_slot, submission_summary, workflow_submission
 from .summary import build_summary, explain_job, lease_summary, state_cursor
 from .workflows import (
     select_task_attempts,
@@ -99,11 +99,14 @@ def submit_job(
     wait_for: Sequence[Mapping[str, str]] | None = None,
     recovery: Mapping[str, Any] | None = None,
     priority: int = 0,
+    inherit_slot: bool = False,
 ) -> dict[str, Any]:
     """Durably enqueue a job and return immediately with its stable job ID.
 
     ``priority`` (default 0, from -1000 to 1000) places higher values first,
-    ahead of project fair share and FIFO order.
+    ahead of project fair share and FIFO order. ``inherit_slot`` (workflow
+    tasks with ``needs`` only) places the task first on the nodes its last
+    upstream task just freed, if it fits there.
     """
 
     if not argv or not all(isinstance(item, str) and item for item in argv):
@@ -112,6 +115,9 @@ def submit_job(
         raise ValueError("name must not be empty")
     project_id = normalize_project_id(project_id)
     priority = normalize_priority(priority)
+    inherit_slot = normalize_inherit_slot(
+        inherit_slot, needs if workflow_id is not None else None
+    )
     job_id = create_job_id(request_id, project_id=project_id)
     spec = {
         "v": 1,
@@ -126,6 +132,7 @@ def submit_job(
         **({"project_id": project_id} if project_id != DEFAULT_PROJECT else {}),
         **_workflow_fields(workflow_id, task_id, needs, wait_for, recovery),
         **({"priority": priority} if priority else {}),
+        **({"inherit_slot": True} if inherit_slot else {}),
     }
     job_id, deduplicated = submit_request(root, spec)
     return {

@@ -38,8 +38,21 @@ TASK_KEYS = frozenset(
         "wait_for",
         "recovery",
         "priority",
+        "inherit_slot",
     }
 )
+
+
+def normalize_inherit_slot(value: object, needs: object, label: str = "") -> bool:
+    """Validate the opt-in slot hand-off flag; it needs upstream tasks."""
+
+    if value is None or value is False:
+        return False
+    if value is not True:
+        raise ValueError(f"{label}inherit_slot must be a boolean")
+    if not needs:
+        raise ValueError(f"{label}inherit_slot requires needs")
+    return True
 
 
 def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
@@ -93,6 +106,8 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
     }
     if priority:
         job["priority"] = priority
+    if normalize_inherit_slot(spec.get("inherit_slot"), spec.get("needs")):
+        job["inherit_slot"] = True
     workflow_id = spec.get("workflow_id")
     task_id = spec.get("task_id")
     needs = spec.get("needs", [])
@@ -174,6 +189,9 @@ def _task_spec(
         priority = normalize_priority(task.get("priority", 0))
     except ValueError as exc:
         raise ValueError(f"tasks[{index}].{exc}") from exc
+    inherit_slot = normalize_inherit_slot(
+        task.get("inherit_slot"), needs, f"tasks[{index}]."
+    )
     return {
         "v": 1,
         "job_id": create_job_id(request_id, project_id=project_id),
@@ -191,6 +209,7 @@ def _task_spec(
         "wait_for": [dict(item) for item in wait_for],
         **({"recovery": recovery} if recovery is not None else {}),
         **({"priority": priority} if priority else {}),
+        **({"inherit_slot": True} if inherit_slot else {}),
     }
 
 

@@ -170,6 +170,9 @@ MAX_DEPENDENCY_SKIPS_PER_TICK = 512
 # visible to the controller later on a shared filesystem. Its artifact
 # waiters are skipped only after this settling time and an empty inbox.
 ARTIFACT_SKIP_GRACE_SECONDS = 600
+# How long after an upstream task finishes an inherit_slot dependent may claim
+# the nodes it freed ahead of other queued work.
+SLOT_HANDOFF_SECONDS = 60
 REPORT_INBOX_RECHECK_SECONDS = 5
 STORAGE_RETRY_SECONDS = 5
 COMMAND_OUTCOME_KINDS = {
@@ -794,6 +797,8 @@ def _recovery_successor_spec(
         spec["project_id"] = project_id
     if job_priority(predecessor):
         spec["priority"] = job_priority(predecessor)
+    if predecessor.get("inherit_slot") is True:
+        spec["inherit_slot"] = True
     return spec
 
 
@@ -1755,6 +1760,47 @@ def _stage_job(
             # Reject the request which closes a cycle, not the whole workflow.
             _mark_workflow_rejected(job, exc)
     return job
+
+
+def _slot_handoff(
+    job: dict[str, Any], jobs: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Return the slot an ``inherit_slot`` task inherits from its last upstream.
+
+    The upstream task that finished last is the one this task was waiting on
+    alone; its nodes are the freed resources. The hand-off lapses
+    ``SLOT_HANDOFF_SECONDS`` after that task finished.
+    """
+
+    if job.get("inherit_slot") is not True:
+        return None
+    finished = [
+        upstream
+        for upstream in (
+            jobs.get(str(item.get("job_id")))
+            for item in job.get("resolved_dependencies") or []
+        )
+        if isinstance(upstream, dict)
+        and isinstance(upstream.get("finished_at"), str)
+        and isinstance(upstream.get("last_assignment"), dict)
+    ]
+    if not finished:
+        return None
+    source = max(finished, key=lambda upstream: str(upstream["finished_at"]))
+    try:
+        finished_at = datetime.fromisoformat(source["finished_at"])
+        assignment = Assignment.from_dict(source["last_assignment"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    until = finished_at + timedelta(seconds=SLOT_HANDOFF_SECONDS)
+    if until <= datetime.now(UTC):
+        return None
+    return {
+        "job_id": source["id"],
+        "lease_id": assignment.lease_id,
+        "nodes": sorted({item.node for item in assignment.reservations}),
+        "until": until.astimezone(UTC).isoformat(timespec="milliseconds"),
+    }
 
 
 def _resolved_dependency_ids(
@@ -2818,6 +2864,9 @@ def _refresh_dirty_workflows(controller: Controller) -> None:
                 job["blockers"] = []
                 job["resolved_dependencies"] = _resolved_dependency_ids(job, resolution_jobs)
                 job["resolved_conditions"] = _resolved_condition_evidence(job)
+                handoff = _slot_handoff(job, jobs)
+                if handoff is not None:
+                    job["handoff"] = handoff
                 emit(controller, "job.queued", job=job)
             elif decision == "skipped":
                 budget -= 1

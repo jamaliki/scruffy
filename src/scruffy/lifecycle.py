@@ -761,6 +761,79 @@ def placement_targets(controller: Controller) -> list[PlacementTarget]:
     return targets
 
 
+def _user_unavailable(
+    target: PlacementTarget, searching: Collection[str]
+) -> Mapping[str, Collection[int]]:
+    """Return slots closed to user work: health plus nodes a hold is searching."""
+
+    if target.lease is not None or not searching:
+        return target.unavailable
+    return {
+        **target.unavailable,
+        **{node.name: node.gpu_ids for node in target.inventory if node.name in searching},
+    }
+
+
+def _slot_handoff_choice(
+    controller: Controller,
+    queued_images: Sequence[dict[str, Any]],
+    targets: Sequence[PlacementTarget],
+    searching: Collection[str],
+    now: float,
+) -> tuple[str, Assignment] | None:
+    """Place an ``inherit_slot`` task on the nodes its upstream just freed.
+
+    The hand-off precedes priority and fair share, but only on those nodes,
+    only while it is live, and only when the task fits there now.
+    """
+
+    current = datetime.now(UTC)
+    for image in queued_images:
+        handoff = image.get("handoff")
+        if not isinstance(handoff, dict) or is_system_job(image):
+            continue
+        try:
+            if datetime.fromisoformat(str(handoff.get("until"))) <= current:
+                continue
+        except ValueError:
+            continue
+        target = next(
+            (item for item in targets if item.lease_id == handoff.get("lease_id")), None
+        )
+        if target is None:
+            continue
+        request = ResourceRequest.from_dict(image["request"])
+        if target.lease is not None and not lease_accepts(
+            target.lease,
+            request,
+            job_project(image),
+            now,
+            settings=controller.lease_settings,
+            untimed_margin_seconds=controller.drain_before_end_seconds,
+        ):
+            continue
+        nodes = tuple(
+            node
+            for node in handoff.get("nodes") or ()
+            if isinstance(node, str) and request.allows_node(node)
+        )
+        try:
+            restricted = replace(request, allowed_nodes=nodes)
+        except ValueError:
+            continue
+        choice = choose_first_fitting_job(
+            target.inventory,
+            target.assignments,
+            [QueuedJob(image["id"], restricted)],
+            _user_unavailable(target, searching),
+            exact_gpu_nodes=target.exact_gpu_nodes,
+            slurm_count_binding=controller.launcher == "slurm",
+        )
+        if choice is not None:
+            return image["id"], replace(choice[1], request=request, lease_id=target.lease_id)
+    return None
+
+
 def schedule(controller: Controller) -> None:
     while (
         not controller.stopping
@@ -785,8 +858,16 @@ def schedule(controller: Controller) -> None:
         # kept for the hold's sentinels (see gpu_holds).
         searching = searching_hold_nodes(controller.state.get("gpu_health") or {})
         now = time.time()
+        targets = placement_targets(controller)
+        handoff = _slot_handoff_choice(controller, queued_images, targets, searching, now)
+        if handoff is not None:
+            job_id, assignment = handoff
+            if assignment.lease_id is not None:
+                controller.lease_idle_since.pop(assignment.lease_id, None)
+            start_job(controller, jobs[job_id], assignment)
+            continue
         best: tuple[int, QueuedJob, Assignment] | None = None
-        for target in placement_targets(controller):
+        for target in targets:
             limit = len(queued) if best is None else best[0]
             if target.lease is None:
                 candidates = queued[:limit]
@@ -811,17 +892,12 @@ def schedule(controller: Controller) -> None:
                 (candidates, target.unavailable)
             ]
             if target.lease is None and searching:
-                withheld = {
-                    **target.unavailable,
-                    **{
-                        node.name: node.gpu_ids
-                        for node in target.inventory
-                        if node.name in searching
-                    },
-                }
                 passes = [
                     ([job for job in candidates if job.job_id in system], target.unavailable),
-                    ([job for job in candidates if job.job_id not in system], withheld),
+                    (
+                        [job for job in candidates if job.job_id not in system],
+                        _user_unavailable(target, searching),
+                    ),
                 ]
             choice = None
             for group, unavailable in passes:

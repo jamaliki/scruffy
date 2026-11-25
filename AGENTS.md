@@ -115,7 +115,9 @@ agents; reading does not consume events for anyone else. Use
   jobs first. Queue order is a request's explicit `priority` (default 0,
   higher first), then projects currently holding fewer GPUs, then
   controller-owned FIFO order. Set `--priority` only when the work must jump
-  the fair-share queue; it is cooperative, not access control.
+  the fair-share queue; it is cooperative, not access control. Placement goes
+  system jobs (GPU-hold sentinels) first, then a live `inherit_slot` hand-off
+  on the nodes its upstream just freed, then that order.
 - Use `scruffy dashboard` for human allocation orientation. It is read-only,
   loopback-only, and uses the same compact views; do not infer queue state by
   scraping its HTML.

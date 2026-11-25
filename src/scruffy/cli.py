@@ -345,6 +345,7 @@ def _submit(arguments: argparse.Namespace) -> int:
         needs=_needs(arguments.needs),
         wait_for=_artifact_conditions(arguments.wait_for_artifact),
         priority=arguments.priority,
+        inherit_slot=arguments.inherit_slot,
     )
     _json(result)
     return 0
@@ -895,6 +896,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="TASK:ARTIFACT_ID",
         help="block until a workflow task publishes an immutable artifact",
+    )
+    submit.add_argument(
+        "--inherit-slot",
+        action="store_true",
+        help=(
+            "with --needs: when the last needed task finishes, place this task "
+            "first on the nodes it freed, if it fits there"
+        ),
     )
     submit.add_argument("command", nargs=argparse.REMAINDER, help="argv to execute")
     submit.set_defaults(handler=_submit)

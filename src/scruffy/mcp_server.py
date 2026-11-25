@@ -589,6 +589,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
             "allowed_nodes",
             "exclude_nodes",
             "priority",
+            "inherit_slot",
             "workflow_id",
             "task_id",
             "needs",
@@ -659,6 +660,9 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
         wait_for=wait_for,
         recovery=params.get("recovery"),
         priority=0 if params.get("priority") is None else params["priority"],
+        inherit_slot=(
+            False if params.get("inherit_slot") is None else params["inherit_slot"]
+        ),
     )
 
 
@@ -1166,6 +1170,7 @@ def create_server(
             allowed_nodes: list[str] | None = None,
             exclude_nodes: list[str] | None = None,
             priority: int = 0,
+            inherit_slot: bool = False,
             workflow_id: str | None = None,
             task_id: str | None = None,
             needs: list[dict[str, str]] | None = None,
@@ -1181,6 +1186,8 @@ def create_server(
             restricts placement to those nodes; exclude_nodes forbids them.
             priority (-1000..1000, default 0) places higher values first,
             ahead of project fair share and FIFO order; use it sparingly.
+            inherit_slot (with needs) places the task first on the nodes its
+            last needed task just freed, if it fits there.
             """
 
             return await call(
@@ -1198,6 +1205,7 @@ def create_server(
                     "allowed_nodes": allowed_nodes,
                     "exclude_nodes": exclude_nodes,
                     "priority": priority,
+                    "inherit_slot": inherit_slot,
                     "workflow_id": workflow_id,
                     "task_id": task_id,
                     "needs": needs,

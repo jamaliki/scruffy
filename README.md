@@ -698,6 +698,17 @@ by a new job with a new `request_id`; retry skipped dependants the same way.
 Active duplicate task IDs, self-dependencies, and cycles are rejected. Use
 `scruffy explain JOB_ID` for the resolved dependency state.
 
+A dependent normally queues behind fair share like any other job, so a chain
+can lose the GPU its last step just freed to another project. A task with
+`needs` may opt into a slot hand-off with `"inherit_slot": true` (CLI
+`submit --inherit-slot`, MCP `submit_job` `inherit_slot`). When its last
+needed task finishes and it becomes ready, it records `handoff` (that task,
+its allocation, and its nodes) and, for the next 60 seconds, is placed first
+on those nodes if it fits there, ahead of priority and fair share; a
+quarantine search on the node still comes first. If it does not fit there it
+waits in the ordinary order. It is opt-in because a default hand-off would
+let a long chain keep a node indefinitely against the documented fair share.
+
 Artifact conditions are independent of lifecycle dependencies. A task may wait
 for an intermediate artifact while its producer continues running, or declare
 both `wait_for` and `needs` when it also requires successful producer exit. Only

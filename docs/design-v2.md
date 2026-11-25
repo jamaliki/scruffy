@@ -254,7 +254,9 @@ A requeue or restart-count change of a running lease also ends it. Lease jobs
 are unaffected by a change of the primary allocation and are recovered against
 their own lease incarnation at controller restart.
 
-Placement keeps the single-writer scheduler: it tries the primary first and
+Placement keeps the single-writer scheduler: it first gives an opted-in
+`inherit_slot` task the nodes its last upstream just freed (a 60-second
+hand-off recorded when the task becomes ready), then tries the primary and
 then running leases, soonest-ending first, choosing the highest-priority job
 that fits each. A timed job fits a lease only if its time limit plus the
 pool's margin (120 seconds for attached leases) ends before the lease does. An

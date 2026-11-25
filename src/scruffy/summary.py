@@ -75,6 +75,8 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "request_id": job.get("request_id"),
         "request": job.get("request"),
         "priority": job_priority(job),
+        "inherit_slot": job.get("inherit_slot") is True,
+        "handoff": copy.deepcopy(job.get("handoff")),
         "workflow_id": job.get("workflow_id"),
         "task_id": job.get("task_id"),
         "attempt": job.get("attempt"),

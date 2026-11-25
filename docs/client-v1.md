@@ -162,6 +162,20 @@ still places a lower-priority job that fits when a higher one does not. An
 automatic retry inherits its predecessor's priority. Job views report
 `priority`. A controller older than this field ignores it.
 
+`inherit_slot` is an optional top-level boolean of a job spec or workflow task
+with non-empty `needs` (CLI `submit --inherit-slot`, Python
+`submit_job(inherit_slot=True)`, MCP `submit_job` `inherit_slot`). It is
+omitted when false, so it is part of request identity only when set, and it
+is rejected without `needs`. When the task becomes ready because its last
+needed task finished, its job records `handoff`:
+`{job_id, lease_id, nodes, until}` naming that task, the allocation, the nodes
+it freed, and a deadline 60 seconds after it finished. Until then the
+scheduler first tries to place the task on exactly those nodes, before
+priority and fair share; if it does not fit, ordinary order applies. Job views
+report `inherit_slot` and `handoff`; an automatic retry keeps the flag. A
+controller older than this field ignores it on single submissions and rejects
+it in workflow tasks.
+
 `explain(root, job_id)` returns the job, its resolved upstream job IDs and
 states, current blockers, and a short explanation. MCP `inspect_job` is the
 bounded projection of this view. `tail_job_output` reads only stdout or stderr
