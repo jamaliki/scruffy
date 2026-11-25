@@ -60,6 +60,7 @@ from .models import (
     Assignment,
     NodeInventory,
     ResourceRequest,
+    job_priority,
     job_project,
     node_name_key,
     normalize_project_id,
@@ -789,6 +790,8 @@ def _recovery_successor_spec(
     project_id = job_project(predecessor)
     if project_id != DEFAULT_PROJECT:
         spec["project_id"] = project_id
+    if job_priority(predecessor):
+        spec["priority"] = job_priority(predecessor)
     return spec
 
 

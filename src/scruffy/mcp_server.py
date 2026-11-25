@@ -582,6 +582,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
             "time_limit_seconds",
             "allowed_nodes",
             "exclude_nodes",
+            "priority",
             "workflow_id",
             "task_id",
             "needs",
@@ -651,6 +652,7 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
         needs=needs,
         wait_for=wait_for,
         recovery=params.get("recovery"),
+        priority=0 if params.get("priority") is None else params["priority"],
     )
 
 
@@ -1157,6 +1159,7 @@ def create_server(
             time_limit_seconds: int | None = None,
             allowed_nodes: list[str] | None = None,
             exclude_nodes: list[str] | None = None,
+            priority: int = 0,
             workflow_id: str | None = None,
             task_id: str | None = None,
             needs: list[dict[str, str]] | None = None,
@@ -1170,6 +1173,8 @@ def create_server(
             reuse the same request_id and identical arguments when retrying an
             uncertain call; Scruffy will deduplicate it safely. allowed_nodes
             restricts placement to those nodes; exclude_nodes forbids them.
+            priority (-1000..1000, default 0) places higher values first,
+            ahead of project fair share and FIFO order; use it sparingly.
             """
 
             return await call(
@@ -1186,6 +1191,7 @@ def create_server(
                     "time_limit_seconds": time_limit_seconds,
                     "allowed_nodes": allowed_nodes,
                     "exclude_nodes": exclude_nodes,
+                    "priority": priority,
                     "workflow_id": workflow_id,
                     "task_id": task_id,
                     "needs": needs,

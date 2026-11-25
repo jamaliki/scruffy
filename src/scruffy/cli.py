@@ -344,6 +344,7 @@ def _submit(arguments: argparse.Namespace) -> int:
         task_id=arguments.task_id,
         needs=_needs(arguments.needs),
         wait_for=_artifact_conditions(arguments.wait_for_artifact),
+        priority=arguments.priority,
     )
     _json(result)
     return 0
@@ -859,6 +860,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="NODE[,NODE...]",
         help="never place on these nodes (repeatable or comma-separated)",
+    )
+    submit.add_argument(
+        "--priority",
+        type=int,
+        default=0,
+        help=(
+            "-1000..1000; higher is placed first, before project fair share "
+            "and FIFO order (default: 0)"
+        ),
     )
     submit.add_argument("--cwd", help="worker directory; defaults to current directory")
     submit.add_argument(

@@ -332,6 +332,13 @@ GPU exclusivity holds across every project. Projects provide a small dynamic
 fair-share signal, not a quota or access-control boundary: the scheduler prefers
 the project currently holding fewer GPUs, then preserves FIFO order.
 
+A request may set an explicit integer `priority` from -1000 to 1000 (default
+0; `submit --priority`, workflow task `priority`, MCP `submit_job`). Higher
+priority is placed first, before project usage and FIFO order, and negative
+values defer work. Like projects it is cooperative rather than access control,
+so reserve it for work that must jump the fair-share queue. Backfill still
+starts a lower-priority job that fits when a higher one does not.
+
 Set `--project` on submission and observation, or export `SCRUFFY_PROJECT` for
 an agent session:
 

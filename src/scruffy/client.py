@@ -18,6 +18,7 @@ from .models import (
     NodeInventory,
     ResourceRequest,
     job_project,
+    normalize_priority,
     normalize_project_id,
 )
 from .protocol import validate_event
@@ -97,14 +98,20 @@ def submit_job(
     needs: Sequence[Mapping[str, str]] | None = None,
     wait_for: Sequence[Mapping[str, str]] | None = None,
     recovery: Mapping[str, Any] | None = None,
+    priority: int = 0,
 ) -> dict[str, Any]:
-    """Durably enqueue a job and return immediately with its stable job ID."""
+    """Durably enqueue a job and return immediately with its stable job ID.
+
+    ``priority`` (default 0, from -1000 to 1000) places higher values first,
+    ahead of project fair share and FIFO order.
+    """
 
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise ValueError("command must contain at least one non-empty argument")
     if not name.strip():
         raise ValueError("name must not be empty")
     project_id = normalize_project_id(project_id)
+    priority = normalize_priority(priority)
     job_id = create_job_id(request_id, project_id=project_id)
     spec = {
         "v": 1,
@@ -118,6 +125,7 @@ def submit_job(
         "resources": request.to_dict(),
         **({"project_id": project_id} if project_id != DEFAULT_PROJECT else {}),
         **_workflow_fields(workflow_id, task_id, needs, wait_for, recovery),
+        **({"priority": priority} if priority else {}),
     }
     job_id, deduplicated = submit_request(root, spec)
     return {

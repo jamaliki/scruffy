@@ -7,7 +7,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .models import DEFAULT_PROJECT, NodeInventory, ResourceRequest, normalize_project_id
+from .models import (
+    DEFAULT_PROJECT,
+    NodeInventory,
+    ResourceRequest,
+    normalize_priority,
+    normalize_project_id,
+)
 from .scheduler import request_can_ever_fit
 from .storage import (
     create_job_id,
@@ -31,6 +37,7 @@ TASK_KEYS = frozenset(
         "needs",
         "wait_for",
         "recovery",
+        "priority",
     }
 )
 
@@ -54,6 +61,7 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
     if not cwd.is_absolute():
         raise ValueError("cwd must be absolute")
     project_id = normalize_project_id(spec.get("project_id"))
+    priority = normalize_priority(spec.get("priority", 0))
     recovery = None
     if "recovery" in spec:
         if spec["recovery"] is None:
@@ -83,6 +91,8 @@ def job_from_spec(spec: dict[str, Any], queue_order: int) -> dict[str, Any]:
         "reason": None,
         "error": None,
     }
+    if priority:
+        job["priority"] = priority
     workflow_id = spec.get("workflow_id")
     task_id = spec.get("task_id")
     needs = spec.get("needs", [])
@@ -160,6 +170,10 @@ def _task_spec(
         raise ValueError(f"tasks[{index}].recovery must be an object")
     if recovery is not None:
         recovery = validate_recovery_policy(recovery, f"tasks[{index}].recovery")
+    try:
+        priority = normalize_priority(task.get("priority", 0))
+    except ValueError as exc:
+        raise ValueError(f"tasks[{index}].{exc}") from exc
     return {
         "v": 1,
         "job_id": create_job_id(request_id, project_id=project_id),
@@ -176,6 +190,7 @@ def _task_spec(
         "needs": [dict(item) for item in needs],
         "wait_for": [dict(item) for item in wait_for],
         **({"recovery": recovery} if recovery is not None else {}),
+        **({"priority": priority} if priority else {}),
     }
 
 

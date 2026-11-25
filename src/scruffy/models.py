@@ -21,6 +21,8 @@ DEFAULT_PROJECT = "default"
 _PROJECT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _NODE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}\Z")
 MAX_NODE_CONSTRAINT_NAMES = 256
+MIN_PRIORITY = -1000
+MAX_PRIORITY = 1000
 
 
 class ModelError(ValueError):
@@ -44,6 +46,23 @@ def job_project(job: Mapping[str, object]) -> str:
     """Read a job's project while treating legacy records as ``default``."""
 
     return normalize_project_id(job.get("project_id"))
+
+
+def normalize_priority(value: object = 0) -> int:
+    """Validate a request priority; higher values are placed first."""
+
+    if type(value) is not int or not MIN_PRIORITY <= value <= MAX_PRIORITY:
+        raise ModelError(
+            f"priority must be an integer from {MIN_PRIORITY} to {MAX_PRIORITY}"
+        )
+    return value
+
+
+def job_priority(job: Mapping[str, object]) -> int:
+    """Read a job's priority while treating legacy and malformed records as 0."""
+
+    value = job.get("priority", 0)
+    return value if type(value) is int else 0
 
 
 def node_name_key(name: str) -> str:

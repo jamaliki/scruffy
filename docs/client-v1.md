@@ -139,10 +139,21 @@ mapping before exec; `node` isolation is the conservative fallback.
 
 Operational job views use scheduler-relevant order: running jobs are newest
 started first, blocked jobs are newest admitted first, and queued jobs are
-highest priority first. Queue priority is dynamic: projects holding fewer GPUs
-come first, with controller-owned FIFO order breaking ties. The scheduler
+highest priority first. Queue order is the request's explicit `priority`
+(higher first), then the dynamic fair share: projects holding fewer GPUs come
+first, with controller-owned FIFO order breaking ties. The scheduler
 recomputes that order after every placement and backfills past requests that do
 not currently fit.
+
+`priority` is an optional top-level integer of a job spec or workflow task, from
+-1000 to 1000 (CLI `submit --priority`, Python `submit_job(priority=...)`, MCP
+`submit_job` `priority`). It defaults to 0 and is omitted from the spec when 0,
+so existing request identities are unchanged; a non-zero value is part of the
+request identity. Higher values are placed first, before project usage and
+FIFO order; negative values defer work behind default-priority jobs. Backfill
+still places a lower-priority job that fits when a higher one does not. An
+automatic retry inherits its predecessor's priority. Job views report
+`priority`. A controller older than this field ignores it.
 
 `explain(root, job_id)` returns the job, its resolved upstream job IDs and
 states, current blockers, and a short explanation. MCP `inspect_job` is the

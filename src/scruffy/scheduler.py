@@ -23,6 +23,7 @@ from .models import (
     NodeReservation,
     QueuedJob,
     ResourceRequest,
+    job_priority,
     job_project,
     validate_inventory,
 )
@@ -61,11 +62,16 @@ def project_gpu_usage(jobs: Iterable[dict[str, Any]]) -> dict[str, int]:
 
 def queue_priority_key(
     job: dict[str, Any], usage: dict[str, int]
-) -> tuple[int, int, str]:
-    """Order lower-usage projects first, then preserve FIFO within a tie."""
+) -> tuple[int, int, int, str]:
+    """Order higher request priority first, then lower-usage projects, then FIFO.
+
+    ``priority`` defaults to 0, so jobs that never set it keep the dynamic
+    project fair-share order among themselves.
+    """
 
     queue_order = job.get("queue_order")
     return (
+        -job_priority(job),
         usage.get(job_project(job), 0),
         queue_order if type(queue_order) is int else 2**63 - 1,
         str(job.get("id") or ""),

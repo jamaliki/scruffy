@@ -70,6 +70,7 @@ class SubmitCliTests(unittest.TestCase):
             task_id=None,
             needs=[],
             wait_for=[],
+            priority=0,
         )
 
     def test_cpu_only_submit_keeps_positive_cpu_and_memory_defaults(self) -> None:
