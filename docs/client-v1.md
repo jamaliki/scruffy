@@ -128,9 +128,16 @@ Scruffy's current admission ID and can be remapped after hardware maintenance.
 Paginate job views while `more` is true, then inspect only the selected item
 that needs detail.
 
-GPU scheduler states are `free`, `assigned`, `stopped`, `node_held`,
+GPU scheduler states are `free`, `assigned`, `stopped`, `parked`, `node_held`,
 `health_unknown`, and `quarantined_observed`. `stopped` identifies the
-quarantined UUID. `node_held` means the node is withheld because health evidence
+quarantined UUID; for a sentinel-held quarantine it is the slot the hold's
+sentinel occupies, and `parked` is a sentinel still searching. `gpus` also
+returns `holds`, and `overview`/`summary` return `gpu_holds`: per held
+quarantine its `node`, `uuid`, `state` (`searching`, `holding`, `waiting`, or
+`failed`), holding sentinel `job_id`, `blocked_by` job IDs, tracked
+`sentinels`, and `detail`. Job views carry `system` (`"gpu_hold"` for a
+sentinel, otherwise null); cancelling a system job returns `job.cancel_ignored`
+with reason `system_job`. `node_held` means the node is withheld because health evidence
 or the configured placement contract cannot safely isolate one physical GPU.
 With the default `gpu` isolation, healthy peers remain `free` and their Slurm
 workers use count-based allocation. A job placed on a node with a mappable
@@ -516,9 +523,12 @@ clears itself after later good samples. A failed NVIDIA query produces no valid
 sample; in `serve --gpu-health enforce`, missing or stale telemetry withholds
 the node from new GPU work.
 The default `observe` mode records and displays automatic health state without
-withholding capacity. An explicit operator quarantine withholds only that GPU
+withholding capacity. An explicit operator quarantine stops only that GPU
 when `--gpu-isolation=gpu` (the default), or the whole node with
-`--gpu-isolation=node`, until `gpu-clear`, regardless of monitor mode. Exact
+`--gpu-isolation=node`, until `gpu-clear`, regardless of monitor mode. In
+Slurm mode with `gpu` isolation it is enforced by a sentinel job holding the
+device (see the README), so the GPU need not be known to a health monitor;
+its UUID must have the `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form. Exact
 multi-node GPU binding uses one common slot set on every node; if that cannot
 be represented, Scruffy does not guess. Start with `--gpu-isolation=node` when
 whole-node withholding is the required fallback.

@@ -23,6 +23,7 @@ from .models import (
     NodeReservation,
     QueuedJob,
     ResourceRequest,
+    is_system_job,
     job_priority,
     job_project,
     validate_inventory,
@@ -45,6 +46,7 @@ def project_gpu_usage(jobs: Iterable[dict[str, Any]]) -> dict[str, int]:
         if (
             job.get("state") not in ACTIVE_JOB_STATES
             or job.get("assignment") is None
+            or is_system_job(job)
         ):
             continue
         try:
@@ -62,15 +64,17 @@ def project_gpu_usage(jobs: Iterable[dict[str, Any]]) -> dict[str, int]:
 
 def queue_priority_key(
     job: dict[str, Any], usage: dict[str, int]
-) -> tuple[int, int, int, str]:
+) -> tuple[int, int, int, int, str]:
     """Order higher request priority first, then lower-usage projects, then FIFO.
 
     ``priority`` defaults to 0, so jobs that never set it keep the dynamic
-    project fair-share order among themselves.
+    project fair-share order among themselves. Controller-owned system jobs
+    (GPU-hold sentinels) precede all user work.
     """
 
     queue_order = job.get("queue_order")
     return (
+        0 if is_system_job(job) else 1,
         -job_priority(job),
         usage.get(job_project(job), 0),
         queue_order if type(queue_order) is int else 2**63 - 1,

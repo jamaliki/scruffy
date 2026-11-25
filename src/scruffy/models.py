@@ -65,6 +65,16 @@ def job_priority(job: Mapping[str, object]) -> int:
     return value if type(value) is int else 0
 
 
+def is_system_job(job: Mapping[str, object]) -> bool:
+    """Return whether the controller itself owns a job (a GPU-hold sentinel).
+
+    System jobs are placed before user work, count against no project, and
+    can be cancelled only by the controller.
+    """
+
+    return isinstance(job.get("system"), str)
+
+
 def node_name_key(name: str) -> str:
     """Return the case-insensitive short hostname used to match node names.
 

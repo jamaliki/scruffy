@@ -86,6 +86,7 @@ function renderNode(name, nodeState, jobs, stale) {
   const free = new Set(nodeState.free?.gpu_ids || []);
   const unavailable = new Set(nodeState.unavailable_gpu_ids || []);
   const devices = new Map((nodeState.gpu_devices || []).map((device) => [device.slot, device]));
+  const sentinels = nodeState.gpu_holds || {};
   header.append(element("span", "node-free", stale ? "GPU availability unknown" : `${free.size} / ${gpuIds.length} GPUs free`));
   const rack = element("div", "gpu-rack");
   const owners = gpuOwners(nodeState);
@@ -93,10 +94,15 @@ function renderNode(name, nodeState, jobs, stale) {
     const jobId = owners.get(gpuId);
     const job = jobs.get(jobId);
     const project = job?.project_id || "default";
-    const device = devices.get(gpuId) || {slot: gpuId, status: "unknown"};
+    const sentinel = jobId ? sentinels[jobId] : undefined;
+    const holding = sentinel?.state === "holding";
+    const device = sentinel
+      ? {slot: gpuId, status: holding ? "quarantined" : "unknown", uuid: holding ? sentinel.uuid : null}
+      : devices.get(gpuId) || {slot: gpuId, status: "unknown"};
     const available = free.has(gpuId);
     let schedulerState = "unavailable", label = "UNAVAILABLE";
-    if (jobId) { schedulerState = "occupied"; label = job?.name || jobId || "ASSIGNED"; }
+    if (sentinel) { schedulerState = holding ? "stopped" : "parked"; label = holding ? "STOPPED" : sentinel.state === "parked" ? "PARKED" : "SEARCHING"; }
+    else if (jobId) { schedulerState = "occupied"; label = job?.name || jobId || "ASSIGNED"; }
     else if (unavailable.has(gpuId) && device.status === "quarantined") { schedulerState = "stopped"; label = "STOPPED"; }
     else if (unavailable.has(gpuId) && device.status === "healthy") { schedulerState = "node-held"; label = "NODE HELD"; }
     else if (unavailable.has(gpuId)) { schedulerState = "unknown"; label = "HEALTH UNKNOWN"; }
@@ -108,13 +114,15 @@ function renderNode(name, nodeState, jobs, stale) {
     tile.append(element("strong", "gpu-owner", label));
     tile.dataset.gpuNode = name;
     tile.dataset.gpuSlot = String(gpuId);
-    if (jobId) {
+    if (jobId && !sentinel) {
       tile.style.setProperty("--project-color", projectColor(project));
       tile.dataset.jobId = jobId || "";
       tile.classList.toggle("foreign", view.project !== "all" && project !== view.project);
     }
     const realId = device.uuid || "UUID not observed";
-    tile.title = `${realId} · PCI ${device.pci_bus_id || "unknown"}${jobId ? ` · ${job?.name || jobId} · ${project}` : ""}`;
+    tile.title = sentinel
+      ? `GPU hold ${sentinel.state} · ${holding ? `holding ${sentinel.uuid}` : `searching for ${sentinel.uuid}`} · ${jobId}`
+      : `${realId} · PCI ${device.pci_bus_id || "unknown"}${jobId ? ` · ${job?.name || jobId} · ${project}` : ""}`;
     rack.append(tile);
   }
   const capacity = nodeState.capacity || {};

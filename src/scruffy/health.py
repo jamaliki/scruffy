@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
@@ -15,6 +16,12 @@ GPU_ISOLATION_MODES = frozenset({"gpu", "node"})
 DEFAULT_BAD_SAMPLES_TO_QUARANTINE = 3
 DEFAULT_SAMPLE_STALE_SECONDS = 45
 MAX_FUTURE_SAMPLE_SKEW_SECONDS = 30
+# An operator quarantine enforced by a controller-owned sentinel step that
+# holds the physical device, instead of by withholding ledger slots.
+HOLD_ENFORCEMENT = "hold"
+_GPU_UUID_PATTERN = re.compile(
+    r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
 
 
 class HealthError(ValueError):
@@ -367,6 +374,34 @@ def ingest_health_sample(
     return transitions
 
 
+def canonical_gpu_uuid(value: object) -> str:
+    """Return a physical GPU UUID in ``nvidia-smi`` form, or raise."""
+
+    text = value.strip() if isinstance(value, str) else ""
+    canonical = f"GPU-{text[4:].lower()}" if text[:4].upper() == "GPU-" else ""
+    if _GPU_UUID_PATTERN.fullmatch(canonical) is None:
+        raise HealthError(
+            f"GPU uuid must look like GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, not {value!r}"
+        )
+    return canonical
+
+
+def _find_device(
+    node_state: object, uuid: str
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    devices = node_state.get("devices") if isinstance(node_state, dict) else None
+    if not isinstance(devices, dict):
+        return None, None
+    device = devices.get(uuid)
+    if isinstance(device, dict):
+        return uuid, device
+    wanted = uuid.lower()
+    for key, candidate in devices.items():
+        if isinstance(candidate, dict) and str(key).lower() == wanted:
+            return str(key), candidate
+    return None, None
+
+
 def set_quarantine(
     health: dict[str, Any],
     *,
@@ -375,38 +410,67 @@ def set_quarantine(
     quarantined: bool,
     at: str,
     reason: str | None = None,
+    enforcement: str | None = None,
 ) -> dict[str, Any]:
-    """Apply one explicit operator quarantine or clear and return its transition."""
+    """Apply one explicit operator quarantine or clear and return its transition.
+
+    With ``enforcement="hold"`` the controller enforces the quarantine by
+    holding the device with a sentinel step, so the device need not have been
+    sampled by a health monitor: an unknown device is recorded without a slot.
+    """
 
     if reason is not None and (
         not isinstance(reason, str) or not reason.strip() or len(reason) > 1024
     ):
         raise HealthError("quarantine reason must be 1-1024 characters")
+    if enforcement not in {None, HOLD_ENFORCEMENT}:
+        raise HealthError(f"unknown quarantine enforcement {enforcement!r}")
     node_state = health.get("nodes", {}).get(node)
-    device = node_state.get("devices", {}).get(uuid) if isinstance(node_state, dict) else None
-    if not isinstance(device, dict):
+    key, device = _find_device(node_state, uuid)
+    if device is None and quarantined and enforcement == HOLD_ENFORCEMENT:
+        key = canonical_gpu_uuid(uuid)
+        node_state = health.setdefault("nodes", {}).setdefault(node, {"devices": {}})
+        device = _new_device(
+            {"node": node, "slot": None, "uuid": key, "nvidia_index": None}
+        )
+        node_state.setdefault("devices", {})[key] = device
+    if device is None or key is None:
         raise HealthError(f"unknown GPU {uuid!r} on node {node!r}")
     previous = str(device.get("status", "unknown"))
+    held = device.get("enforcement") == HOLD_ENFORCEMENT
     if quarantined:
         device["status"] = "quarantined"
         device["quarantined_at"] = at
         device["quarantine_reason"] = [reason or "operator_quarantine"]
         device["quarantine_source"] = "operator"
+        if enforcement is None:
+            device.pop("enforcement", None)
+        else:
+            device["enforcement"] = enforcement
     else:
         device["quarantined_at"] = None
         device["quarantine_reason"] = None
         device["quarantine_source"] = None
         device["bad_samples"] = 0
         device["status"] = "healthy" if not device.get("last_reasons") else "suspect"
-    return {
+        device.pop("enforcement", None)
+        if held and device.get("last_sample_at") is None and isinstance(node_state, dict):
+            # Recorded only to be held; no monitor has ever observed it.
+            node_state["devices"].pop(key, None)
+            if not node_state["devices"] and len(node_state) == 1:
+                health["nodes"].pop(node, None)
+    transition = {
         "node": node,
-        "uuid": uuid,
+        "uuid": key,
         "slot": device.get("slot"),
         "from": previous,
         "to": device["status"],
         "reasons": device.get("quarantine_reason") or device.get("last_reasons") or [],
         "at": at,
     }
+    if (quarantined and enforcement) or (not quarantined and held):
+        transition["enforcement"] = HOLD_ENFORCEMENT
+    return transition
 
 
 def _reprobe_evidence(
@@ -507,6 +571,7 @@ def quarantined_nodes(health: Mapping[str, object]) -> frozenset[str]:
         if any(
             isinstance(device, Mapping)
             and device.get("status") == "quarantined"
+            and device.get("enforcement") != HOLD_ENFORCEMENT
             and (enforce_automatic or device.get("quarantine_source") == "operator")
             for device in devices
         ):
@@ -543,7 +608,15 @@ def unavailable_gpu_ids(
         if not isinstance(node_state, Mapping):
             continue
         raw_devices = node_state.get("devices")
-        devices = raw_devices.values() if isinstance(raw_devices, Mapping) else ()
+        # A held device is enforced by its sentinel step, not by withheld slots.
+        devices = [
+            device
+            for device in (raw_devices.values() if isinstance(raw_devices, Mapping) else ())
+            if not (
+                isinstance(device, Mapping)
+                and device.get("enforcement") == HOLD_ENFORCEMENT
+            )
+        ]
         quarantined = {
             device.get("uuid")
             for device in devices
@@ -606,6 +679,23 @@ def nodes_requiring_exact_gpu_binding(
     )
 
 
+def searching_hold_nodes(health: Mapping[str, object]) -> frozenset[str]:
+    """Return nodes whose GPU hold is searching for its device.
+
+    While a sentinel search runs, the node's free GPUs are withheld from other
+    GPU work so that the target cannot be placed under someone else's job.
+    """
+
+    holds = health.get("holds")
+    if not isinstance(holds, Mapping):
+        return frozenset()
+    return frozenset(
+        str(hold.get("node"))
+        for hold in holds.values()
+        if isinstance(hold, Mapping) and hold.get("state") == "searching"
+    )
+
+
 def _sample_is_stale(value: object, now: datetime, stale_seconds: float) -> bool:
     if not isinstance(value, str):
         return True
@@ -623,13 +713,16 @@ __all__ = [
     "DEFAULT_SAMPLE_STALE_SECONDS",
     "GPU_ISOLATION_MODES",
     "HEALTH_MODES",
+    "HOLD_ENFORCEMENT",
     "HealthError",
     "bind_health_incarnation",
+    "canonical_gpu_uuid",
     "empty_health_state",
     "ensure_health_state",
     "ingest_health_sample",
     "nodes_requiring_exact_gpu_binding",
     "reprobe_quarantine",
+    "searching_hold_nodes",
     "set_quarantine",
     "unavailable_gpu_ids",
 ]

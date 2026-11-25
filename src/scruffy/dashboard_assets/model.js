@@ -36,6 +36,7 @@ export function projectSummaries(snapshot) {
     return summaries.get(project);
   };
   const add = (job, lane) => {
+    if (job.system) return;
     const project = job.project_id || "default";
     const summary = summaryFor(project);
     if (!summary[lane].some((candidate) => candidate.id === job.id)) summary[lane].push(job);
@@ -48,7 +49,7 @@ export function projectSummaries(snapshot) {
   for (const node of Object.values(snapshot?.nodes || {})) {
     for (const [jobId, assignment] of Object.entries(node.assignments || {})) {
       const job = jobs.get(jobId);
-      if (!job) continue;
+      if (!job || job.system) continue;
       const project = job.project_id || "default";
       summaryFor(project).gpus += assignment.gpu_ids?.length || 0;
     }

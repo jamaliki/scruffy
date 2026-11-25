@@ -208,8 +208,8 @@ Every 10 seconds, one task on each node records:
 Use `--gpu-health off`, `observe`, or `enforce` when starting the controller.
 The default is `observe`: automatic failures become visible without changing
 placement. GPU isolation defaults to `gpu`, so an explicit `gpu-quarantine`
-withholds only the selected slot when Slurm can bind it exactly. Use
-`--gpu-isolation=node` for conservative whole-node withholding.
+stops only the selected GPU (see below). Use `--gpu-isolation=node` for
+conservative whole-node withholding.
 In `enforce`, three consecutive bad samples within the bounded sampling window
 make the affected UUID's quarantine sticky; inconclusive samples do not count,
 and missing or older-than-45-second samples fail closed. Samples more than 30
@@ -228,15 +228,38 @@ scruffy --root "$SCRUFFY_ROOT" gpu-reprobe gpu-3 GPU-...
 scruffy --root "$SCRUFFY_ROOT" gpu-clear gpu-3 GPU-...
 ```
 
-GPU worker steps request their ledger-selected physical IDs with an explicit
-Slurm GRES mask, and the worker verifies `SLURM_STEP_GPUS` before executing user
-code. Enforced or operator quarantine therefore marks the bad GPU `STOPPED`
-while healthy peers remain schedulable. Multi-node exact steps use one common
-slot set on every node; if that cannot be represented, Scruffy refuses the
-unsafe placement rather than risk the quarantined GPU. Use
-`--gpu-isolation=node` when whole-node withholding is the required fallback.
-Existing jobs are not killed automatically; their assignment stays owned until
-normal exit or explicit cancellation.
+With `--gpu-isolation=gpu` (the default) on Slurm, an operator
+`gpu-quarantine` of a GPU on a node of the primary allocation is enforced by
+holding the device, so it works with `--gpu-health off` and the GPU need not
+have been sampled. Slurm has no way to give a step inside an allocation one
+named device (`--gpu-bind=map_gpu` only orders the devices a step was already
+given, and GRES cannot name a device per step), so the controller submits
+one-GPU *sentinel* jobs, one per free GPU on that node, ahead of all user work.
+Each sentinel's worker reports the UUID Slurm bound it to. The sentinel on the
+target holds it until `gpu-clear`; the others park and are released as soon as
+the target is held, or on their own after ten minutes. While that search runs,
+the node's free GPUs are withheld from user jobs; afterwards every other GPU on
+the node is schedulable again. If a running job holds the target, the hold
+waits (`blocked_by`) without withholding anything and searches again when that
+job ends. Three sentinels that cannot identify their device, or a target that
+no GPU on the node reports, end the search in state `failed` until the GPU is
+quarantined again or cleared. Sentinels run in project `scruffy-system`, count
+against no project's fair share, cannot be cancelled by users, and are not
+evacuated. `gpus` shows the held slot as `stopped` with the target's UUID
+(parked sentinels as `parked`) and lists each hold's state, `summary` reports
+`gpu_holds`, and the dashboard draws `STOPPED` and `PARKED` tiles.
+
+Automatic quarantines, quarantines with `--gpu-isolation=node`, and operator
+quarantines recorded before this release keep the slot policy: GPU worker steps
+request their ledger-selected physical IDs with an explicit Slurm GRES mask,
+and the worker verifies `SLURM_STEP_GPUS` before executing user code. Enforced
+or operator quarantine therefore marks the bad GPU `STOPPED` while healthy
+peers remain schedulable. Multi-node exact steps use one common slot set on
+every node; if that cannot be represented, Scruffy refuses the unsafe
+placement rather than risk the quarantined GPU. Use `--gpu-isolation=node`
+when whole-node withholding is the required fallback. Existing jobs are not
+killed automatically; their assignment stays owned until normal exit or
+explicit cancellation.
 
 Latest samples are replaceable files under `health/samples/`; only status
 transitions and operator actions enter the durable journal. The dashboard makes

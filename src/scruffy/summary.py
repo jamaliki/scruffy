@@ -61,6 +61,7 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "id": job["id"],
         "project_id": job_project(job),
         "name": job.get("name"),
+        "system": job.get("system"),
         "state": job.get("state"),
         "reason": job.get("reason"),
         "error": job.get("error"),
@@ -433,6 +434,8 @@ def gpu_view(state: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(reservation, dict)
                 for gpu_id in reservation.get("gpu_ids", [])
             }
+            raw_holds = node.get("gpu_holds")
+            sentinels = raw_holds if isinstance(raw_holds, dict) else {}
             devices = node.get("gpu_devices", [])
             sampled_devices = devices if isinstance(devices, list) else []
             by_slot = {
@@ -448,7 +451,19 @@ def gpu_view(state: dict[str, Any]) -> dict[str, Any]:
                 device = copy.deepcopy(by_slot.get(slot, {"slot": slot, "status": "unknown"}))
                 owner = owners.get(slot)
                 status = device.get("status")
-                if owner:
+                sentinel = sentinels.get(owner) if owner else None
+                if isinstance(sentinel, dict):
+                    # Ledger slots are admission counters: a hold's sentinel
+                    # reports the physical device it holds, not this slot's.
+                    holding = sentinel.get("state") == "holding"
+                    scheduler_state = "stopped" if holding else "parked"
+                    device = {
+                        "slot": slot,
+                        "uuid": sentinel.get("uuid") if holding else None,
+                        "status": "quarantined" if holding else "unknown",
+                        "hold_state": sentinel.get("state"),
+                    }
+                elif owner:
                     scheduler_state = "assigned"
                 elif slot in unavailable and status == "quarantined":
                     scheduler_state = "stopped"
@@ -456,7 +471,7 @@ def gpu_view(state: dict[str, Any]) -> dict[str, Any]:
                     scheduler_state = "node_held"
                 elif slot in unavailable:
                     scheduler_state = "health_unknown"
-                elif status == "quarantined":
+                elif status == "quarantined" and device.get("enforcement") != "hold":
                     scheduler_state = "quarantined_observed"
                 elif slot in free:
                     scheduler_state = "free"
@@ -482,7 +497,33 @@ def gpu_view(state: dict[str, Any]) -> dict[str, Any]:
         if isinstance(state.get("gpu_health"), dict)
         else {},
         "gpus": rows,
+        "holds": gpu_hold_view(state),
     }
+
+
+def gpu_hold_view(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return each sentinel-enforced quarantine and its search state."""
+
+    health = state.get("gpu_health")
+    holds = health.get("holds") if isinstance(health, dict) else None
+    return [
+        {
+            key: copy.deepcopy(hold.get(key))
+            for key in (
+                "node",
+                "uuid",
+                "state",
+                "job_id",
+                "blocked_by",
+                "sentinels",
+                "failures",
+                "detail",
+                "changed_at",
+            )
+        }
+        for _, hold in sorted((holds or {}).items())
+        if isinstance(hold, dict)
+    ]
 
 
 def inspect_gpu(state: dict[str, Any], node: str, slot: int) -> dict[str, Any]:
@@ -663,6 +704,7 @@ def build_summary(
         "draining": bool(state.get("draining", False)),
         "launches_paused": bool(state.get("launches_paused", False)),
         "gpu_health": copy.deepcopy(state.get("gpu_health")),
+        "gpu_holds": gpu_hold_view(state),
         "counts": dict(sorted(counts.items())),
         "scheduler": scheduler_explanation({**state, "jobs": {job["id"]: job for job in jobs}}),
         "archived_jobs": sum(int(count) for count in archived_counts.values()),

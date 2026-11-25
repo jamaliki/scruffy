@@ -203,7 +203,11 @@ agents; reading does not consume events for anyone else. Use
   Do not launch out-of-band work on Scruffy's inventory.
 - The controller owns GPU health. `serve --gpu-health observe` records CUDA,
   thermal, and ECC state; `enforce` fails stale nodes closed and withholds a
-  quarantined GPU's whole node from new GPU work. Koochak may checkpoint/exit
+  quarantined GPU's whole node from new GPU work. On Slurm with `gpu`
+  isolation an operator quarantine is a hold (`gpu_holds.py`): controller-owned
+  one-GPU sentinel jobs (`system: "gpu_hold"`, project `scruffy-system`) find
+  the device by its reported UUID and hold it; they are placed first, count
+  against no project, and only the controller may cancel them. Koochak may checkpoint/exit
   but must not mutate the parent allocation when Scruffy variables are present.
 - `SCRUFFY_ROOT` must provide atomic rename and cluster-coherent `flock` across
   every node. Lustre `localflock` is not sufficient for a multi-node queue.

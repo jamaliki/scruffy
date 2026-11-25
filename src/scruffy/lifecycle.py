@@ -16,6 +16,7 @@ from ._compat import UTC
 from .health import (
     nodes_requiring_exact_gpu_binding,
     quarantined_nodes,
+    searching_hold_nodes,
     unavailable_gpu_ids,
 )
 from .leases import lease_accepts, lease_inventory, lease_remaining_seconds
@@ -25,6 +26,7 @@ from .models import (
     NodeReservation,
     QueuedJob,
     ResourceRequest,
+    is_system_job,
     job_project,
 )
 from .provenance import (
@@ -566,7 +568,10 @@ def start_job(
             for index, _ in enumerate(assignment.reservations)
         ]
         job["gpu_binding"] = (
-            "exact" if _requires_exact_gpu_binding(controller, assignment) else "count"
+            "exact"
+            if not is_system_job(job)
+            and _requires_exact_gpu_binding(controller, assignment)
+            else "count"
         )
 
     directory = job_directory(controller.root, job["id"])
@@ -775,6 +780,10 @@ def schedule(controller: Controller) -> None:
             for job in queued_images
         ]
         priority = {job.job_id: index for index, job in enumerate(queued)}
+        system = {image["id"] for image in queued_images if is_system_job(image)}
+        # While a GPU hold searches for its device, that node's free GPUs are
+        # kept for the hold's sentinels (see gpu_holds).
+        searching = searching_hold_nodes(controller.state.get("gpu_health") or {})
         now = time.time()
         best: tuple[int, QueuedJob, Assignment] | None = None
         for target in placement_targets(controller):
@@ -782,10 +791,12 @@ def schedule(controller: Controller) -> None:
             if target.lease is None:
                 candidates = queued[:limit]
             else:
+                # System jobs hold devices of the primary allocation only.
                 candidates = [
                     queued_job
                     for queued_job, image in zip(queued[:limit], queued_images[:limit])
-                    if lease_accepts(
+                    if queued_job.job_id not in system
+                    and lease_accepts(
                         target.lease,
                         queued_job.request,
                         job_project(image),
@@ -796,14 +807,35 @@ def schedule(controller: Controller) -> None:
                 ]
             if not candidates:
                 continue
-            choice = choose_first_fitting_job(
-                target.inventory,
-                target.assignments,
-                candidates,
-                target.unavailable,
-                exact_gpu_nodes=target.exact_gpu_nodes,
-                slurm_count_binding=controller.launcher == "slurm",
-            )
+            passes: list[tuple[list[QueuedJob], Mapping[str, Collection[int]]]] = [
+                (candidates, target.unavailable)
+            ]
+            if target.lease is None and searching:
+                withheld = {
+                    **target.unavailable,
+                    **{
+                        node.name: node.gpu_ids
+                        for node in target.inventory
+                        if node.name in searching
+                    },
+                }
+                passes = [
+                    ([job for job in candidates if job.job_id in system], target.unavailable),
+                    ([job for job in candidates if job.job_id not in system], withheld),
+                ]
+            choice = None
+            for group, unavailable in passes:
+                if group:
+                    choice = choose_first_fitting_job(
+                        target.inventory,
+                        target.assignments,
+                        group,
+                        unavailable,
+                        exact_gpu_nodes=target.exact_gpu_nodes,
+                        slurm_count_binding=controller.launcher == "slurm",
+                    )
+                if choice is not None:
+                    break
             if choice is None:
                 continue
             queued_job, assignment = choice

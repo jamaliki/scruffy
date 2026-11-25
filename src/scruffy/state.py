@@ -301,6 +301,17 @@ def refresh_nodes(
         for reservation in assignment.reservations:
             node = nodes[reservation.node]
             node["assignments"][assignment.job_id] = reservation.to_dict()
+    raw_holds = health_view.get("holds")
+    for hold in (raw_holds.values() if isinstance(raw_holds, dict) else ()):
+        node = nodes.get(hold.get("node")) if isinstance(hold, dict) else None
+        if node is None:
+            continue
+        for job_id, status in (hold.get("sentinels") or {}).items():
+            if job_id in node["assignments"]:
+                node.setdefault("gpu_holds", {})[job_id] = {
+                    "uuid": hold.get("uuid"),
+                    "state": status,
+                }
     state["nodes"] = nodes
     state["updated_at"] = utc_now()
 

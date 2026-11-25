@@ -18,6 +18,7 @@ from typing import Any
 
 from ._compat import UTC
 from .bulk import cancel_selector, selector_matches, selector_summary
+from .gpu_holds import advance_gpu_holds, arm_gpu_hold, hold_enforced, release_gpu_hold
 from .health import (
     GPU_ISOLATION_MODES,
     HEALTH_MODES,
@@ -60,6 +61,7 @@ from .models import (
     Assignment,
     NodeInventory,
     ResourceRequest,
+    is_system_job,
     job_priority,
     job_project,
     node_name_key,
@@ -1182,6 +1184,7 @@ def _evacuation_targets(
         if (
             job.get("state") != "running"
             or job_lease_id(job) is not None
+            or is_system_job(job)
             or not _evacuation_matches_scope(job, scope)
         ):
             # Evacuation belongs to the primary allocation's lifetime; a lease
@@ -2966,10 +2969,13 @@ def _start_bulk_cancel(
         (
             job
             for job in jobs.values()
-            if selector_matches(job, selector)
-            or (
-                job.get("cancel_request_id") == request_id
-                and selector_matches(job, unscoped)
+            if not is_system_job(job)
+            and (
+                selector_matches(job, selector)
+                or (
+                    job.get("cancel_request_id") == request_id
+                    and selector_matches(job, unscoped)
+                )
             )
         ),
         key=lambda job: (int(job.get("queue_order", 0)), str(job["id"])),
@@ -3108,7 +3114,17 @@ def _apply_command(
             # Submit returns only after its request is durable. If command
             # ingestion won a polling race, retain the cancel for next tick.
             return _finish_missing_cancel(controller, command, job_id)
-        if not request_cancellation(
+        if is_system_job(job):
+            emit(
+                controller,
+                "job.cancel_ignored",
+                data={
+                    "request_id": command.get("request_id"),
+                    "job_id": job_id,
+                    "reason": "system_job",
+                },
+            )
+        elif not request_cancellation(
             controller,
             job,
             str(command.get("request_id") or ""),
@@ -3194,6 +3210,14 @@ def _apply_command(
                     at=at,
                 )
             else:
+                # On Slurm with per-GPU isolation an operator quarantine is
+                # enforced by a sentinel step holding the device (gpu_holds),
+                # so it needs no monitor sample and withholds no other GPU.
+                enforcement = (
+                    "hold"
+                    if kind == "gpu.quarantine" and hold_enforced(controller, node)
+                    else None
+                )
                 transition = set_quarantine(
                     controller.state["gpu_health"],
                     node=node,
@@ -3205,7 +3229,12 @@ def _apply_command(
                         if isinstance(command.get("reason"), str)
                         else None
                     ),
+                    enforcement=enforcement,
                 )
+                if enforcement is not None:
+                    arm_gpu_hold(controller, node, transition["uuid"], at=at)
+                else:
+                    release_gpu_hold(controller, node, transition["uuid"])
         except HealthError as exc:
             emit(
                 controller,
@@ -3938,6 +3967,9 @@ def _apply_tick(controller: Controller) -> None:
             _recover_lost_workflow_jobs(controller)
         _maintain_health_monitor(controller)
         _ingest_gpu_health(controller)
+        # After poll_processes freed resources and read GPU identities, and
+        # before schedule(), so sentinels are queued ahead of user work.
+        advance_gpu_holds(controller)
         _ingest_reports(controller)
         # Replay can restore an armed operation and its exact publication
         # evidence without another report file being present.

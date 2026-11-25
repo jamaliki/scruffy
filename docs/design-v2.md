@@ -127,6 +127,28 @@ represented, Scruffy does not construct the unsafe placement. `node` isolation
 remains available as an explicit conservative fallback. Existing reservations
 remain owned and are not terminated implicitly.
 
+An operator quarantine under `gpu` isolation on a Slurm primary-allocation
+node is enforced differently, because slot masks cannot pin a physical device:
+inside an allocation Slurm picks a count-bound step's devices, `--gpu-bind`
+only orders devices a step already has, and GRES cannot name one device per
+step. The controller instead admits controller-owned one-GPU *sentinel* jobs
+(`system: "gpu_hold"`, project `scruffy-system`, placed before all user work,
+excluded from fair share, user cancellation, bulk cancellation, and
+evacuation). One sentinel is submitted per free GPU on the node at once, so
+together they cover every free device; each worker reports the UUID it was
+bound to. The sentinel on the target holds it until `gpu-clear`; the others
+park and are cancelled once the target is held (or exit on their own after ten
+minutes). Only while sentinels are being placed and identified are the node's
+free GPUs withheld from user jobs. A target under an identified running job
+waits without withholding until that job ends; a target that may be under an
+unidentified job waits until one of those jobs ends or is identified; three
+unidentifiable sentinels, 64 launches without a hold, or a target absent from
+every identified GPU end in `failed`. The hold record (`gpu_health.holds`) is
+journaled with the health image, so replay restores it with the sentinels it
+tracks; a sentinel admitted in a batch whose hold update was lost is adopted on
+the next tick. The quarantined device record carries `enforcement: "hold"` and
+withholds no slot.
+
 ### Workflow attempts
 
 `(project_id, workflow_id, task_id)` is a logical task identity. Every admitted
@@ -238,8 +260,10 @@ that fits each. A timed job fits a lease only if its time limit plus the
 pool's margin (120 seconds for attached leases) ends before the lease does. An
 untimed job may use an attached lease with no known end, or with more than
 `--drain-before-end-seconds` left, but never an elastic lease. A multi-node job
-must fit within one allocation. A node with an enforced GPU quarantine from
-the primary's health state is withheld from GPU work on leases as well.
+must fit within one allocation. A node with an enforced slot-policy GPU
+quarantine from the primary's health state is withheld from GPU work on leases
+as well; a held quarantine needs no such withholding, because the held device
+belongs to the primary allocation.
 
 The elastic autoscaler is a pure function of queued demand, lease records,
 pool backoff, and the user's Slurm GPU footprint. Each pass it:
