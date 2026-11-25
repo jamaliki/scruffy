@@ -85,6 +85,7 @@ class RunningProcess:
     last_absence_snapshot_at: float = 0.0
     last_accounting_snapshot_at: float = 0.0
     time_limit_deadline: float | None = None
+    gpu_identity_checked_at: float | None = None
 
 
 @dataclass(slots=True)

@@ -170,6 +170,22 @@ The controller's per-node GPU IDs remain deterministic admission slots, while
 Local mode remains cooperative. Scruffy trusts every process able to write
 `SCRUFFY_ROOT`; it is not a multi-user security boundary.
 
+Because Slurm, not Scruffy, picks the physical devices, each worker records
+the devices its step was bound to just before it starts the workload. A
+short-lived probe enumerates the step's visible devices through the CUDA
+driver, without creating a context, and writes their UUID, name, PCI bus ID,
+and driver index (the `/dev/nvidiaN` minor, which `SLURM_STEP_GPUS` and, on
+typical nodes, `nvidia-smi` number by) to `jobs/JOB_ID/gpu-identity-N.json`.
+The workload receives the UUIDs, in CUDA ordinal order, as
+`SCRUFFY_GPU_UUIDS`. The controller copies the records into the job as
+`gpu_devices` (one entry per device, with its node) within a few seconds of
+the start and records a failed or partial probe as `gpu_identity_error`.
+`scruffy status JOB_ID`, `summary`, and the MCP job views show `gpu_devices`;
+`scruffy running` lists a compact `gpus` entry per job; archived jobs keep
+both fields. The identity is reportable, not a launch contract: a probe
+failure never fails the job, and a job started by an older worker has no
+`gpu_devices`.
+
 ## GPU health and quarantine
 
 In Slurm mode Scruffy can own one allocation-wide, overlapping monitor step.
@@ -684,7 +700,8 @@ Workers receive controller-owned `SCRUFFY_ROOT`, `SCRUFFY_PROJECT`,
 `SCRUFFY_JOB_ID`, `SCRUFFY_EVENT_DIR`, `SCRUFFY_NODE`, `SCRUFFY_GPU_IDS`, and
 workflow/task/attempt identity. In Slurm mode, `SCRUFFY_GPU_IDS` is copied from
 the step's `CUDA_VISIBLE_DEVICES`; `SCRUFFY_SLURM_GPU_IDS` also exposes Slurm's
-global step IDs when available. `SCRUFFY_PROVENANCE_PATH` names a mode-0444
+global step IDs when available, and `SCRUFFY_GPU_UUIDS` the physical UUIDs of
+the bound devices when the worker's identity probe succeeded. `SCRUFFY_PROVENANCE_PATH` names a mode-0444
 launch record containing exact argv, cwd, resources, resolved dependency
 attempts, allocation, and scheduler reservation. Its sibling request and result
 records survive log and hot-state compaction; environment values are represented

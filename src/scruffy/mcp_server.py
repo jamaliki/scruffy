@@ -53,7 +53,13 @@ MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_LOG_RANGE_BYTES = 256 * 1024
 MAX_CANCEL_WAIT_SECONDS = 300
 QUIET_EVENT_KINDS = frozenset(
-    {"job.output", "workload.progress", "jobs.archived", "jobs.cancel_progress"}
+    {
+        "job.output",
+        "job.gpu_identified",
+        "workload.progress",
+        "jobs.archived",
+        "jobs.cancel_progress",
+    }
 )
 PROJECT_HEADER = "x-scruffy-project"
 

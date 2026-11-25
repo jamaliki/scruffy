@@ -578,8 +578,15 @@ result records under `provenance/JOB_ID/`. The launch record is injected as
 `SCRUFFY_PROVENANCE_PATH`; it contains exact argv, scheduler reservation,
 resource request, and concrete dependency attempts. `SCRUFFY_ASSIGNMENT_SHA256`
 identifies that reservation. In Slurm mode, `SCRUFFY_GPU_IDS` is the
-authoritative step-selected GPU visibility. Provenance stores an environment
-digest, not raw environment values.
+authoritative step-selected GPU visibility, and `SCRUFFY_GPU_UUIDS`, when the
+worker's identity probe succeeded, lists the physical UUIDs of those devices in
+CUDA ordinal order. Job views carry the same identity as `gpu_devices`, a list
+of `{node, uuid, name, index, cuda_index, pci_bus_id}` (`index` is the
+`/dev/nvidiaN` minor; the UUID is the authoritative identity), and
+`gpu_identity_error` when a probe failed or found the wrong number of devices;
+compact running views carry `gpus`, a list of `{node, index, uuid}`. Archived
+jobs keep both fields. A job started by an older worker has neither.
+Provenance stores an environment digest, not raw environment values.
 
 The controller numbers immutable task attempts but does not invent retries,
 dynamically fan out workflow tasks, or store artifact bytes. Clients submit

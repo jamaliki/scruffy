@@ -9,8 +9,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .gpu_identity import run_probe
 from .models import job_project
-from .storage import create_immutable_json
+from .storage import atomic_write_json, create_immutable_json, utc_now
 
 _SLURM_GPU_ENVIRONMENT = (
     "CUDA_DEVICE_ORDER",
@@ -25,6 +26,7 @@ _SLURM_GPU_ENVIRONMENT = (
 _SCRUFFY_GPU_ENVIRONMENT = (
     "SCRUFFY_ALLOCATION_INCARNATION_SHA256",
     "SCRUFFY_GPU_IDS",
+    "SCRUFFY_GPU_UUIDS",
     "SCRUFFY_PHYSICAL_GPU_IDS",
     "SCRUFFY_RESERVED_GPU_IDS",
     "SCRUFFY_RUNTIME_PLACEMENT",
@@ -151,6 +153,68 @@ def _publish_runtime_placement(
     return target, create_immutable_json(target, record)
 
 
+def _publish_gpu_identity(
+    root: str,
+    document: dict[str, Any],
+    placement: dict[str, Any],
+    record: dict[str, Any],
+) -> list[str]:
+    """Record the bound devices' physical identity; return their UUIDs.
+
+    Identity is reportable, not a placement contract: every failure is
+    recorded in the document (or, if even that fails, on stderr) and the job
+    still runs.
+    """
+
+    try:
+        index = next(
+            position
+            for position, item in enumerate(document["assignment"])
+            if item.get("node") == placement.get("node")
+        )
+        probe = run_probe(os.environ.copy())
+        devices = [
+            {
+                key: device.get(key)
+                for key in ("cuda_index", "uuid", "name", "pci_bus_id", "index")
+            }
+            for device in probe.get("devices", [])
+            if isinstance(device, dict)
+        ]
+        error = probe.get("error")
+        if not error and len(devices) != record["requested_gpus"]:
+            error = (
+                f"probe found {len(devices)} devices; "
+                f"the step requested {record['requested_gpus']}"
+            )
+        identity = {
+            "schema": 1,
+            "job_id": record["job_id"],
+            "node": record["node"],
+            "launch_token": document.get("launch_token"),
+            "slurm_job_id": record["slurm_job_id"],
+            "slurm_step_id": record["slurm_step_id"],
+            "slurm_step_gpus": record["slurm_step_gpus"],
+            "cuda_visible_devices": record["cuda_visible_devices"],
+            "recorded_at": utc_now(),
+            "devices": devices,
+            "error": str(error) if error else None,
+        }
+        target = Path(root) / "jobs" / record["job_id"] / f"gpu-identity-{index}.json"
+        atomic_write_json(target, identity)
+    except Exception as exc:  # noqa: BLE001 - identity must never fail the job
+        print(f"scruffy worker: GPU identity unavailable: {exc}", file=sys.stderr, flush=True)
+        return []
+    if identity["error"]:
+        print(
+            f"scruffy worker: GPU identity incomplete: {identity['error']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+    return [str(device["uuid"]) for device in devices]
+
+
 def current_node() -> str:
     return (
         os.environ.get("SCRUFFY_NODE")
@@ -274,6 +338,10 @@ def execute_assignment(source: Path) -> None:
         )
         environment["SCRUFFY_RUNTIME_PLACEMENT"] = str(runtime_placement)
         environment["SCRUFFY_RUNTIME_PLACEMENT_SHA256"] = placement_sha256
+        if record["requested_gpus"]:
+            uuids = _publish_gpu_identity(root, document, placement, record)
+            if uuids:
+                environment["SCRUFFY_GPU_UUIDS"] = ",".join(uuids)
     else:
         # Local development has no Slurm step to allocate devices. Keep using
         # the scheduler reservation, applied after submitted environment values.

@@ -103,6 +103,8 @@ def job_view(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]
         "runtime_placements": list(job.get("runtime_placements") or []),
         "runtime_placement_error": job.get("runtime_placement_error"),
         "runtime_placement_status": job.get("runtime_placement_status"),
+        "gpu_devices": copy.deepcopy(job.get("gpu_devices")),
+        "gpu_identity_error": job.get("gpu_identity_error"),
         "workload": workload,
         "progress_age_seconds": progress_age,
         "stdout": job.get("stdout"),
@@ -125,6 +127,13 @@ def job_identity(
     if include_elapsed:
         elapsed = view["elapsed_seconds"]
         result["elapsed_seconds"] = int(elapsed) if elapsed is not None else None
+        devices = view["gpu_devices"]
+        if isinstance(devices, list) and devices:
+            result["gpus"] = [
+                {key: device.get(key) for key in ("node", "index", "uuid")}
+                for device in devices
+                if isinstance(device, dict)
+            ]
     return result
 
 

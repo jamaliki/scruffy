@@ -213,6 +213,12 @@ agents; reading does not consume events for anyone else. Use
   workflow/task/attempt identity. In Slurm mode `SCRUFFY_GPU_IDS` comes from the
   step's `CUDA_VISIBLE_DEVICES`; authenticated placement and its digest are in
   `SCRUFFY_RUNTIME_PLACEMENT` and `SCRUFFY_RUNTIME_PLACEMENT_SHA256`.
+- A Slurm worker probes its step's devices through the CUDA driver (no context)
+  before exec, writes `jobs/JOB_ID/gpu-identity-N.json`, and exports
+  `SCRUFFY_GPU_UUIDS`. The controller copies the records into `gpu_devices`
+  (event `job.gpu_identified`, quiet for MCP waits) during the first ten
+  minutes and once more at finish; archived jobs keep it. Identity is
+  reportable only: a probe failure never fails a job.
 - Workload reports belong in `scruffy report` or `scruffy.publish_event`; keep
   detailed telemetry and artifact bytes in their normal stores. Reports from
   one controller tick are committed with one journal sync and snapshot.

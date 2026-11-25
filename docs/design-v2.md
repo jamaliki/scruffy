@@ -66,6 +66,15 @@ and sets `CUDA_VISIBLE_DEVICES`; the worker validates its count and preserves
 it. Scruffy's per-node GPU IDs are deterministic admission slots used to decide
 whether a request fits, not a second physical-device allocator.
 
+Because the slots are not physical devices, the worker reports which devices
+Slurm bound. Before exec it runs a context-free CUDA driver probe with the
+step's environment and writes `jobs/JOB_ID/gpu-identity-N.json` (UUID, name,
+PCI bus ID, and driver minor per device, plus the step and launch token). The
+controller copies those records into the job's `gpu_devices` with a
+`job.gpu_identified` event while the job runs, and once more when it finishes.
+The records are observations, not authority: they never fail a job, and the
+runtime placement record remains the launch contract.
+
 CPU-only work uses the same ledger with an empty GPU tuple. CPU and memory remain
 positive reservations, so CPU jobs can never consume node resources invisibly.
 Every mutation API requires an explicit GPU count; zero must be intentional.

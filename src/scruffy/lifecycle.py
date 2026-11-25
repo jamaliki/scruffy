@@ -57,12 +57,19 @@ from .storage import (
     atomic_write_json,
     job_directory,
     read_immutable_json,
+    read_json,
     utc_now,
 )
 from .workflows import AUTO_RECOVERY_REASONS, mark_retry_exhaustion
 
 MAX_MESSAGES_PER_TICK = 256
 RUNTIME_PLACEMENT_CONTRACT = 1
+# Workers record physical GPU identity just before exec. The controller looks
+# for those records at this interval during the window after a job starts; a
+# worker from an older release writes none, and the job simply has none.
+GPU_IDENTITY_POLL_SECONDS = 2.0
+GPU_IDENTITY_WINDOW_SECONDS = 600.0
+_GPU_DEVICE_KEYS = ("uuid", "name", "index", "cuda_index", "pci_bus_id")
 
 _RUNTIME_PLACEMENT_KEYS = {
     "schema",
@@ -948,6 +955,8 @@ def _finish_job(
     placement_error = None
     placement_status = None
     if controller.launcher == "slurm":
+        # A short job can end before the periodic check reads its identity.
+        _ingest_gpu_identity(controller, job, running, final=True)
         contract = job.get("runtime_placement_contract")
         if contract is None:
             placement_status = "legacy_unavailable"
@@ -1031,6 +1040,7 @@ def poll_processes(controller: Controller) -> None:
 
         if controller.launcher == "slurm":
             _poll_slurm_output(controller, job_id, running)
+            _ingest_gpu_identity(controller, controller.state["jobs"][job_id], running)
         returncode = running.process.poll() if running.process is not None else None
         pending_returncode = controller.state["jobs"][job_id].get(
             "pending_returncode"
@@ -1071,6 +1081,98 @@ def poll_processes(controller: Controller) -> None:
             reader.join(timeout=1)
         _finish_job(controller, job_id, running, returncode)
         del controller.running[job_id]
+
+
+def _gpu_identity_records(
+    controller: Controller, job: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]] | None:
+    """Return the devices and errors workers recorded, or None while one is missing."""
+
+    assignment = Assignment.from_dict(job["assignment"])
+    devices: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, reservation in enumerate(assignment.reservations):
+        source = controller.root / "jobs" / str(job["id"]) / f"gpu-identity-{index}.json"
+        if not source.exists():
+            return None
+        try:
+            document = read_json(source)
+        except StorageError as exc:
+            errors.append(f"{reservation.node}: {exc}")
+            continue
+        if (
+            not isinstance(document, dict)
+            or document.get("schema") != 1
+            or document.get("job_id") != job["id"]
+            or document.get("node") != reservation.node
+            or document.get("launch_token") != job.get("launch_token")
+            or not isinstance(document.get("devices"), list)
+        ):
+            errors.append(f"{reservation.node}: identity record differs from the launch")
+            continue
+        if document.get("error"):
+            errors.append(f"{reservation.node}: {document['error']}")
+        for device in document["devices"]:
+            if isinstance(device, dict) and isinstance(device.get("uuid"), str):
+                devices.append(
+                    {"node": reservation.node}
+                    | {key: device.get(key) for key in _GPU_DEVICE_KEYS}
+                )
+    return devices, errors
+
+
+def _ingest_gpu_identity(
+    controller: Controller,
+    job: dict[str, Any],
+    running: RunningProcess,
+    *,
+    final: bool = False,
+) -> None:
+    """Record the physical GPUs a Slurm job's workers reported, once.
+
+    Identity is reportable, not authority: Slurm chose the devices and the
+    runtime placement record remains the launch contract. A job whose worker
+    wrote no record, for example one launched by an older release, keeps no
+    ``gpu_devices``.
+    """
+
+    if (
+        controller.launcher != "slurm"
+        or "gpu_devices" in job
+        or job.get("runtime_placement_contract") != RUNTIME_PLACEMENT_CONTRACT
+        or not isinstance(job.get("assignment"), dict)
+        or not isinstance(job.get("started_at"), str)
+    ):
+        return
+    try:
+        assignment = Assignment.from_dict(job["assignment"])
+        if assignment.request.gpus_per_node == 0:
+            return
+        age = (
+            datetime.now(UTC) - datetime.fromisoformat(job["started_at"])
+        ).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return
+    now = time.monotonic()
+    if not final:
+        if age > GPU_IDENTITY_WINDOW_SECONDS or (
+            running.gpu_identity_checked_at is not None
+            and now - running.gpu_identity_checked_at < GPU_IDENTITY_POLL_SECONDS
+        ):
+            return
+        running.gpu_identity_checked_at = now
+    try:
+        records = _gpu_identity_records(controller, job)
+    except (KeyError, OSError, TypeError, ValueError):
+        return
+    if records is None:
+        return
+    devices, errors = records
+    job["gpu_devices"] = devices
+    if errors:
+        job["gpu_identity_error"] = "; ".join(errors)
+    if not final:
+        emit(controller, "job.gpu_identified", job=job)
 
 
 def _poll_slurm_output(

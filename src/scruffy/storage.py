@@ -662,6 +662,8 @@ _ARCHIVED_JOB_FIELDS = (
     "workflow_invalid",
     "project_id",
     "cancel_request_id",
+    "gpu_devices",
+    "gpu_identity_error",
 )
 
 
