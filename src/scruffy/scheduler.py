@@ -206,6 +206,7 @@ def request_can_ever_fit(
         len(node.gpu_ids) >= request.gpus_per_node
         and node.cpus >= request.cpus_per_node
         and node.memory_gb >= request.memory_gb_per_node
+        and request.allows_node(node.name)
         for node in nodes
     )
     return eligible >= request.nodes
@@ -213,7 +214,8 @@ def request_can_ever_fit(
 
 def _fits(node: NodeAvailability, request: ResourceRequest) -> bool:
     return (
-        len(node.gpu_ids) >= request.gpus_per_node
+        request.allows_node(node.name)
+        and len(node.gpu_ids) >= request.gpus_per_node
         and node.cpus >= request.cpus_per_node
         and node.memory_gb >= request.memory_gb_per_node
     )

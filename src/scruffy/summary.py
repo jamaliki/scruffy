@@ -229,8 +229,8 @@ def scheduler_explanation(state: dict[str, Any]) -> dict[str, Any]:
 
     jobs = [job for job in state.get("jobs", {}).values() if isinstance(job, dict)]
     free_nodes = [
-        node.get("free", {})
-        for node in state.get("nodes", {}).values()
+        (str(name), node.get("free", {}))
+        for name, node in state.get("nodes", {}).items()
         if isinstance(node, dict)
     ]
 
@@ -240,10 +240,11 @@ def scheduler_explanation(state: dict[str, Any]) -> dict[str, Any]:
         except (KeyError, ValueError):
             return False
         eligible = sum(
-            len(node.get("gpu_ids", [])) >= request.gpus_per_node
+            request.allows_node(name)
+            and len(node.get("gpu_ids", [])) >= request.gpus_per_node
             and int(node.get("cpus", 0) or 0) >= request.cpus_per_node
             and int(node.get("memory_gb", 0) or 0) >= request.memory_gb_per_node
-            for node in free_nodes
+            for name, node in free_nodes
         )
         return eligible >= request.nodes
 

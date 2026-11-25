@@ -74,6 +74,12 @@ Every mutation API requires an explicit GPU count; zero must be intentional.
 stores an absolute deadline at launch, reconstructs its remaining duration after
 a same-allocation restart, and terminates the job with reason `timeout`.
 
+`allowed_nodes` and `exclude_nodes` are optional placement constraints in the
+same immutable request. The pure scheduler filters candidate nodes by them
+before best fit, and the ever-fit check applies the same filter, so admission
+and placement agree. They are serialized only when set, which keeps every
+existing request digest unchanged.
+
 ### GPU health authority
 
 One controller-owned Slurm step overlaps all managed nodes and GPUs. Node-local

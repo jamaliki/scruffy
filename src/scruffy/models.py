@@ -19,6 +19,8 @@ TERMINAL_JOB_STATES = frozenset(
 )
 DEFAULT_PROJECT = "default"
 _PROJECT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_NODE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}\Z")
+MAX_NODE_CONSTRAINT_NAMES = 256
 
 
 class ModelError(ValueError):
@@ -42,6 +44,34 @@ def job_project(job: Mapping[str, object]) -> str:
     """Read a job's project while treating legacy records as ``default``."""
 
     return normalize_project_id(job.get("project_id"))
+
+
+def node_name_key(name: str) -> str:
+    """Return the case-insensitive short hostname used to match node names.
+
+    Inventories reject duplicate short names, so ``gpu-6`` and
+    ``gpu-6.cluster`` always identify the same node.
+    """
+
+    return name.lower().split(".", 1)[0]
+
+
+def _node_names(value: object, label: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ModelError(f"{label} must be a list of node names")
+    names = tuple(value)
+    if not names:
+        raise ModelError(f"{label} must name at least one node; omit it for no constraint")
+    if len(names) > MAX_NODE_CONSTRAINT_NAMES:
+        raise ModelError(f"{label} may name at most {MAX_NODE_CONSTRAINT_NAMES} nodes")
+    for name in names:
+        if not isinstance(name, str) or _NODE_NAME_PATTERN.fullmatch(name) is None:
+            raise ModelError(
+                f"{label} entries must be hostnames of letters, digits, '.', '_' or '-'"
+            )
+    if len({node_name_key(name) for name in names}) != len(names):
+        raise ModelError(f"{label} must not repeat a node")
+    return tuple(sorted(names))
 
 
 def _mapping(value: object, label: str) -> JsonObject:
@@ -170,6 +200,12 @@ class ResourceRequest:
     The optional time limit is an execution contract rather than a placement
     dimension, but keeping it in the immutable request makes retries and
     provenance unambiguous.
+
+    ``allowed_nodes`` and ``exclude_nodes`` are optional placement
+    constraints: when set, every selected node must be allowed and none may be
+    excluded. Names match case-insensitively by short hostname. Unset fields
+    are omitted from the serialized request, so requests without constraints
+    keep their identity digests.
     """
 
     nodes: int
@@ -177,6 +213,8 @@ class ResourceRequest:
     cpus_per_node: int
     memory_gb_per_node: int
     time_limit_seconds: int | None = None
+    allowed_nodes: tuple[str, ...] | None = None
+    exclude_nodes: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("nodes", "cpus_per_node", "memory_gb_per_node"):
@@ -196,9 +234,36 @@ class ResourceRequest:
                 "time_limit_seconds",
                 _positive_int(self.time_limit_seconds, "time_limit_seconds"),
             )
+        for field_name in ("allowed_nodes", "exclude_nodes"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _node_names(value, field_name))
+        if self.allowed_nodes is not None:
+            usable = [name for name in self.allowed_nodes if self.allows_node(name)]
+            if len(usable) < self.nodes:
+                raise ModelError(
+                    f"allowed_nodes leaves {len(usable)} usable nodes for a "
+                    f"{self.nodes}-node request"
+                )
 
-    def to_dict(self) -> dict[str, int]:
-        result = {
+    @property
+    def has_node_constraints(self) -> bool:
+        return self.allowed_nodes is not None or self.exclude_nodes is not None
+
+    def allows_node(self, name: str) -> bool:
+        """Return whether this request may place a reservation on ``name``."""
+
+        key = node_name_key(name)
+        if self.allowed_nodes is not None and key not in {
+            node_name_key(item) for item in self.allowed_nodes
+        }:
+            return False
+        return self.exclude_nodes is None or key not in {
+            node_name_key(item) for item in self.exclude_nodes
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
             "nodes": self.nodes,
             "gpus_per_node": self.gpus_per_node,
             "cpus_per_node": self.cpus_per_node,
@@ -206,14 +271,19 @@ class ResourceRequest:
         }
         if self.time_limit_seconds is not None:
             result["time_limit_seconds"] = self.time_limit_seconds
+        if self.allowed_nodes is not None:
+            result["allowed_nodes"] = list(self.allowed_nodes)
+        if self.exclude_nodes is not None:
+            result["exclude_nodes"] = list(self.exclude_nodes)
         return result
 
     @classmethod
     def from_dict(cls, value: object) -> ResourceRequest:
         data = _mapping(value, "resource request")
         required = {"nodes", "gpus_per_node", "cpus_per_node", "memory_gb_per_node"}
+        optional = {"time_limit_seconds", "allowed_nodes", "exclude_nodes"}
         missing = required - data.keys()
-        extra = data.keys() - (required | {"time_limit_seconds"})
+        extra = data.keys() - (required | optional)
         if missing or extra:
             details = []
             if missing:
@@ -221,12 +291,17 @@ class ResourceRequest:
             if extra:
                 details.append(f"unexpected {sorted(extra)!r}")
             raise ModelError(f"invalid resource request: {', '.join(details)}")
+        for field_name in ("allowed_nodes", "exclude_nodes"):
+            if field_name in data and data[field_name] is None:
+                raise ModelError(f"{field_name} must be omitted rather than null")
         return cls(
             nodes=data["nodes"],  # type: ignore[arg-type]
             gpus_per_node=data["gpus_per_node"],  # type: ignore[arg-type]
             cpus_per_node=data["cpus_per_node"],  # type: ignore[arg-type]
             memory_gb_per_node=data["memory_gb_per_node"],  # type: ignore[arg-type]
             time_limit_seconds=data.get("time_limit_seconds"),  # type: ignore[arg-type]
+            allowed_nodes=data.get("allowed_nodes"),  # type: ignore[arg-type]
+            exclude_nodes=data.get("exclude_nodes"),  # type: ignore[arg-type]
         )
 
 

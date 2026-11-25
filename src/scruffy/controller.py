@@ -61,6 +61,7 @@ from .models import (
     NodeInventory,
     ResourceRequest,
     job_project,
+    node_name_key,
     normalize_project_id,
     validate_inventory,
 )
@@ -640,6 +641,44 @@ def _capacity_can_ever_fit(
             if inventory and request_can_ever_fit(inventory, request):
                 return True
     return controller.hub
+
+
+def _unknown_constraint_nodes(controller: Controller, request: ResourceRequest) -> list[str]:
+    """Return node names a request constrains that this controller cannot see.
+
+    Allowed and excluded nodes must name the primary allocation or a live
+    lease, so a typo is rejected instead of silently never matching. A hub's
+    capacity is open-ended, and with lease pools a future elastic lease may
+    land on a node not seen yet, so excluding such a node is accepted.
+    """
+
+    if controller.hub or not request.has_node_constraints:
+        return []
+    known = {node_name_key(node.name) for node in controller.inventory}
+    for lease in controller.state.get("leases", {}).values():
+        if is_live(lease):
+            known.update(node_name_key(node.name) for node in lease_inventory(lease))
+    names = list(request.allowed_nodes or ())
+    settings = controller.lease_settings
+    if settings is None or not settings.pools:
+        names.extend(request.exclude_nodes or ())
+    return sorted(name for name in names if node_name_key(name) not in known)
+
+
+def _request_fit_error(
+    controller: Controller, request: ResourceRequest, project_id: str
+) -> tuple[str, str] | None:
+    """Return ``(reason, error)`` when a request can never be admitted."""
+
+    unknown = _unknown_constraint_nodes(controller, request)
+    if unknown:
+        return "unknown_nodes", f"request names nodes outside this allocation: {unknown!r}"
+    if not _capacity_can_ever_fit(controller, request, project_id):
+        return (
+            "request_cannot_fit",
+            "request cannot fit this allocation inventory or any lease pool",
+        )
+    return None
 
 
 def _reattach_slurm_jobs(controller: Controller, jobs: list[dict[str, Any]]) -> None:
@@ -2150,11 +2189,11 @@ def _initial_job_event(
     if job.get("state") == "rejected":
         return "job.rejected"
     request = ResourceRequest.from_dict(job["request"])
-    if not _capacity_can_ever_fit(controller, request, job_project(job)):
+    fit_error = _request_fit_error(controller, request, job_project(job))
+    if fit_error is not None:
         job["state"] = "rejected"
         job["finished_at"] = utc_now()
-        job["reason"] = "request_cannot_fit"
-        job["error"] = "request cannot fit this allocation inventory or any lease pool"
+        job["reason"], job["error"] = fit_error
         return "job.rejected"
     if job.get("workflow_id") is None:
         return "job.queued"
@@ -2329,6 +2368,17 @@ def _stage_atomic_submission(
 
     workflow_jobs = _resolution_workflow_jobs(candidate_state.values(), project_id, workflow_id)
     validate_workflows(workflow_jobs)
+    unknown = {
+        str(job["task_id"]): names
+        for job in staged
+        if (
+            names := _unknown_constraint_nodes(
+                controller, ResourceRequest.from_dict(job["request"])
+            )
+        )
+    }
+    if unknown:
+        raise ValueError(f"tasks name nodes outside this allocation: {unknown!r}")
     impossible = [
         str(job["task_id"])
         for job in staged

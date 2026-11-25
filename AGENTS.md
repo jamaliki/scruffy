@@ -85,6 +85,10 @@ agents; reading does not consume events for anyone else. Use
 - GPU count is mandatory. Use `--gpus-per-node 0` intentionally for CPU-only
   work; it still reserves its requested CPU and memory.
 - Use `--time-limit-seconds` for an authoritative, restart-safe per-job limit.
+- Use `--allowed-nodes NODE[,NODE...]` to place a job only on those nodes and
+  `--exclude-nodes NODE[,NODE...]` to keep it off them (workflow and Python
+  `resources.allowed_nodes` / `resources.exclude_nodes`). Names must belong to
+  the allocation or a live lease; a typo is rejected with `unknown_nodes`.
 - Prefer `validate-workflow` followed by `submit-workflow` for a complete DAG.
   Atomic workflow JSON contains `request_id`, `workflow_id`, and explicit
   `tasks`; either every task is admitted or none is.

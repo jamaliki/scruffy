@@ -495,10 +495,16 @@ def lease_accepts(
 
 
 def pool_accepts(pool: PoolConfig, request: ResourceRequest, project_id: str) -> bool:
-    """Return whether a fresh lease from this pool could ever run a job."""
+    """Return whether a fresh lease from this pool could ever run a job.
+
+    A fresh lease's node names are unknown until Slurm grants it, so a job
+    with an ``allowed_nodes`` list never drives a new lease. Excluded nodes
+    are enforced when the granted lease is placed on.
+    """
 
     return (
-        request.time_limit_seconds is not None
+        request.allowed_nodes is None
+        and request.time_limit_seconds is not None
         and request.time_limit_seconds + pool.time_margin_seconds <= pool.time_limit_seconds
         and job_project_allowed(pool.projects, project_id)
         and request_can_ever_fit(pool.virtual_inventory("shape"), request)

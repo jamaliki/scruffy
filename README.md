@@ -540,6 +540,23 @@ scruffy --root "$SCRUFFY_ROOT" submit \
   -- ./run_distributed.sh
 ```
 
+Optional node constraints are part of the resource request:
+`--allowed-nodes gpu-1,gpu-2` places the job only on those nodes and
+`--exclude-nodes gpu-6` keeps it off a node (both repeatable;
+`allowed_nodes` / `exclude_nodes` in `ResourceRequest`, workflow `resources`,
+and MCP `submit_job`). Names match by case-insensitive short hostname and must
+name a node of the allocation or a live lease, so a typo is rejected
+(`unknown_nodes`) instead of waiting forever; with lease pools configured an
+excluded node may also be one a future lease could land on. A request with an
+allow-list never drives a new elastic lease, whose nodes are unknown until
+granted. Unset constraints are omitted from the request, so existing request
+IDs and identity digests are unchanged.
+
+```bash
+scruffy --root "$SCRUFFY_ROOT" submit --gpus-per-node 1 \
+  --exclude-nodes gpu-6 -- python bench.py
+```
+
 The Python API uses the same JSON-compatible contracts:
 
 ```python

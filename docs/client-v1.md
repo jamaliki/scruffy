@@ -258,6 +258,18 @@ per GPU. Python callers provide an explicit `ResourceRequest`. The optional
 `time_limit_seconds` is an authoritative controller deadline, not workload
 metadata.
 
+The optional `allowed_nodes` and `exclude_nodes` lists in `resources` (CLI
+`--allowed-nodes`, `--exclude-nodes`; MCP `submit_job` parameters of the same
+names) constrain placement: every selected node must be allowed and none
+excluded. Lists are non-empty, unique by case-insensitive short hostname, and
+serialized sorted; an unset list is omitted, so unconstrained requests keep
+their identity digests. Admission rejects a request naming a node outside the
+primary allocation and live leases with reason `unknown_nodes` (a hub accepts
+any name; with lease pools an excluded name may be a future lease node), and a
+request whose allowed nodes cannot fit with `request_cannot_fit`. An allow-list
+never drives a new elastic lease. A controller older than this field rejects
+such a request as invalid rather than ignoring the constraint.
+
 `validate_workflow` and `submit_workflow` accept one complete DAG of at most 256
 tasks. Every task has explicit argv, absolute cwd, resources, and dependency
 objects. Validation rejects missing tasks, duplicate identities, cycles, and

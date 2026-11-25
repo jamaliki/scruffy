@@ -112,6 +112,15 @@ def _command(arguments: argparse.Namespace) -> list[str]:
     return command
 
 
+def _node_names(values: list[str]) -> list[str] | None:
+    """Flatten repeatable, comma-separated node options; empty means unset."""
+
+    names = [name.strip() for value in values for name in value.split(",")]
+    if any(not name for name in names):
+        raise ValueError("node lists must not contain empty names")
+    return names or None
+
+
 def _needs(values: list[str]) -> list[dict[str, str]]:
     dependencies: list[dict[str, str]] = []
     for value in values:
@@ -319,6 +328,8 @@ def _submit(arguments: argparse.Namespace) -> int:
             else arguments.memory_gb_per_node
         ),
         time_limit_seconds=arguments.time_limit_seconds,
+        allowed_nodes=_node_names(arguments.allowed_nodes),
+        exclude_nodes=_node_names(arguments.exclude_nodes),
     )
     result = submit_job(
         _root(arguments),
@@ -834,6 +845,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--time-limit-seconds",
         type=int,
         help="fail the job after this many execution seconds",
+    )
+    submit.add_argument(
+        "--allowed-nodes",
+        action="append",
+        default=[],
+        metavar="NODE[,NODE...]",
+        help="place only on these nodes (repeatable or comma-separated)",
+    )
+    submit.add_argument(
+        "--exclude-nodes",
+        action="append",
+        default=[],
+        metavar="NODE[,NODE...]",
+        help="never place on these nodes (repeatable or comma-separated)",
     )
     submit.add_argument("--cwd", help="worker directory; defaults to current directory")
     submit.add_argument(

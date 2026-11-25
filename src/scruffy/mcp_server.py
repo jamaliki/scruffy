@@ -580,6 +580,8 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
             "cpus_per_node",
             "memory_gb_per_node",
             "time_limit_seconds",
+            "allowed_nodes",
+            "exclude_nodes",
             "workflow_id",
             "task_id",
             "needs",
@@ -632,6 +634,8 @@ def _submit_job(root: Path, params: dict[str, Any], project_id: str | None) -> d
         cpus_per_node=(14 * gpus if gpus else 1) if cpus is None else cpus,
         memory_gb_per_node=(128 * gpus if gpus else 4) if memory is None else memory,
         time_limit_seconds=params.get("time_limit_seconds"),
+        allowed_nodes=params.get("allowed_nodes"),
+        exclude_nodes=params.get("exclude_nodes"),
     )
     return enqueue_job(
         root,
@@ -1151,6 +1155,8 @@ def create_server(
             cpus_per_node: int | None = None,
             memory_gb_per_node: int | None = None,
             time_limit_seconds: int | None = None,
+            allowed_nodes: list[str] | None = None,
+            exclude_nodes: list[str] | None = None,
             workflow_id: str | None = None,
             task_id: str | None = None,
             needs: list[dict[str, str]] | None = None,
@@ -1162,7 +1168,8 @@ def create_server(
 
             The call returns immediately without waiting for resources. Always
             reuse the same request_id and identical arguments when retrying an
-            uncertain call; Scruffy will deduplicate it safely.
+            uncertain call; Scruffy will deduplicate it safely. allowed_nodes
+            restricts placement to those nodes; exclude_nodes forbids them.
             """
 
             return await call(
@@ -1177,6 +1184,8 @@ def create_server(
                     "cpus_per_node": cpus_per_node,
                     "memory_gb_per_node": memory_gb_per_node,
                     "time_limit_seconds": time_limit_seconds,
+                    "allowed_nodes": allowed_nodes,
+                    "exclude_nodes": exclude_nodes,
                     "workflow_id": workflow_id,
                     "task_id": task_id,
                     "needs": needs,
